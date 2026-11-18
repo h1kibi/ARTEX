@@ -326,6 +326,7 @@ flowchart TB
     GUARD["guard / intercept　工具审批门"]
     ENR["enrich　DNS / HTTP 异步补全"]
     EXT["MCP · skills · memory · report"]
+    WD["Watchdog　运行看护"]
   end
 
   UI -->|HTTP| API
@@ -341,6 +342,9 @@ flowchart TB
   WK -->|"Bash / HTTP 全程留痕"| PROXY
   WK --> GUARD
   WK --> ENR
+  ENG --> WD
+  WD -->|"终止 intent"| ENG
+  WD --> DB
   PL -.-> EXT
   WK -.-> EXT
   MA -.-> EXT
@@ -353,7 +357,7 @@ flowchart TB
 | **engine** | 每任务一个 `plannerLoop` + N 个 worker goroutine；意图领取、超时/暂停/drain |
 | **agent** | goals / planner / worker / mainagent，`ToolSet` 把双图暴露成 LLM 工具 |
 | **db** | 双图的 Postgres 落地（pgx）；schema 随 `go:embed` 每次启动幂等建表 |
-| **支撑** | 记录型 MITM 代理、审批门、异步补全、MCP/技能/记忆/报告 |
+| **支撑** | 记录型 MITM 代理、审批门、异步补全、MCP/技能/记忆/报告、Watchdog 运行看护 |
 
 ### 双图架构：探索图 + 资产图
 
@@ -420,6 +424,79 @@ sequenceDiagram
   EV-->>P: 再次唤醒(闭环)
 ```
 
+### 运行看护（Watchdog）
+
+Watchdog 是独立于 planner/worker 的**运行看护层**：它不决定攻击方向，也不替代 Engine 的生命周期，只回答一个问题——**这个正在运行的 intent 是否还在有效推进？**
+
+它分成三层：
+
+| 层 | 作用 | 是否调用模型 |
+| --- | --- | --- |
+| **RunMonitor** | 记录每个 run 的阶段、心跳、最后一次有效写入、周期和计数 | 否 |
+| **Fast Path** | 每 5 秒执行固定规则：压力提示、Slow Path 入队、周期边界处理 | 否 |
+| **Slow Path** | 读取只读证据，输出 `continue / terminate / ask_user / provider_error` | 是，只读 Agent |
+
+三个控制面表各自独立：
+
+- `worker_runs`：运行中的实时阶段、心跳、周期和租约；
+- `watchdog_jobs`：Slow Path 判断队列，按 run + 周期唯一；
+- `watchdog_requests`：用户判断卡和 Watchdog 不可用卡。
+
+#### 有效推进与周期重置
+
+`record_fact`、`insert_assets`、`report_finding` 成功，或最终结果成功，都会被视为有效写入，并重置当前周期。这样持续产出事实、资产、漏洞的 Worker 不会被累计运行时间误杀。
+
+Fast Path 默认节奏：
+
+| 时间 | 动作 |
+| --- | --- |
+| 8 分钟 | 向 Worker 注入一次压力提示，只在下一次工具调用前生效 |
+| 10 分钟 | 组装最近执行证据，入队 Slow Path |
+| 20 分钟 | 进入周期状态机；必要时创建用户判断卡或终止 Worker |
+
+#### 周期状态机
+
+| 当前周期 | 绿灯 | 用户同意 | 用户拒绝 | 用户静默 |
+| --- | --- | --- | --- | --- |
+| C0 | 进入 C1 | 进入 C1 | `stopped` | 进入 C1（C0 是唯一静默默认同意阶段） |
+| C1 | 进入 C2 | 进入 C2 | `stopped` | `exhausted` |
+| C2 | 生成 C3 用户请求 | 进入 C3 | `stopped` | `exhausted` |
+| C3 及以后 | 生成下一周期请求 | 进入下一周期 | `stopped` | `exhausted` |
+
+Slow Path 要求终止时直接 `stopped`；没有绿灯、也没有用户请求（无信号）时按 `exhausted` 处理。只有 C0 的**用户请求静默**默认同意进入 C1。一个 run 的一个周期最多一张开放决策卡。
+
+#### 用户判断卡与不可用卡
+
+- 用户判断卡显示当前周期、目标周期 `C{n+1}`、默认规则、倒计时和运行现场；
+- 用户明确拒绝记为 `stopped`，静默默认终止记为 `exhausted`；
+- 卡片开放期间不再注入新的压力提示，也不创建新的 Slow Path；
+- 迟到的 Slow Path 结果只记为历史，不会作用到新周期；
+- Watchdog Agent 不可用时只维护一张任务级默认卡，关闭已有开放的 Worker 判断卡；系统审计当前只显示默认卡，历史记录仍保留在数据库；
+- Agent 自身超时、鉴权、额度、限流、5xx、网络错误进入不可用处理；模型 JSON 格式错误只重试，不误报为不可用。
+
+#### 终止与审计
+
+- 终止必须同时匹配 `run_id` 和当前周期，避免旧结果杀掉新运行；
+- 取消 Worker 后等待其停止写入，再写 `terminal_reason` 和 `watchdog_terminated` 活动；
+- 已登记的事实、资产、漏洞和执行记录保留；
+- Planner 收到终止事件，但不会自动重跑同一意图；用户可手动重跑；
+- 周期重置会清理该 run 的旧 Slow Path job，避免旧唯一键吞掉新周期判断；
+- 当前为**单实例运行模型**：任务删除/归档清理控制面数据，activity 审计保留。
+
+#### 配置
+
+| 键 | 默认值 | 说明 |
+| --- | --- | --- |
+| `watchdog_enabled` | `false` | 总开关，默认关闭 |
+| `watchdog_pressure_after_sec` | `480` | 压力提示 |
+| `watchdog_slow_path_after_sec` | `600` | Slow Path 入队 |
+| `watchdog_cycle_after_sec` | `1200` | 周期处理 |
+| `watchdog_agent_key` | `watchdog` | Slow Path 使用的只读 Agent |
+| `watchdog_agent_retry_sec` | `300` | 不可用自动重试间隔 |
+| `worker_run_seconds` | `0` | Watchdog 开启时 `0` 表示不限时，由任务截止时间约束；`>0` 显式覆盖 |
+
+配置位于「系统 -> 系统配置 -> 运行看护（Watchdog）」。系统审计页会展示压力提示、慢速判断、周期推进、用户判断、终止和供应商错误卡片；前端复用现有 `Alert`、`Badge`、`Button` 和设置 Card 组件。
+
 ### worker 间的过程级信息交换
 
 一次深入的探索里，很多有价值的观察（某个报错、某段响应、某个隐藏参数）出现在一个 worker 的**执行过程**中，却未必被写成正式 fact。为避免重复劳动、让链路上的 worker 能站在彼此的肩膀上，worker 具备**跨 work 检索过程**的能力：
@@ -465,17 +542,6 @@ flowchart TB
 
 ---
 
-## 交流群
-
-扫码关注微信公众号 **SecSentry**，在公众号后台私信即可入群交流。
-
-<div align="center">
-
-<img src="screenshots/wx.png" alt="微信公众号 SecSentry" width="480" />
-
-</div>
-
----
 ## 参考
 
 https://github.com/oritera/Cairn
