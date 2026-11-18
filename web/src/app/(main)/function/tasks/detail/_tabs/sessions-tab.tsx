@@ -141,10 +141,22 @@ function emptyState(): SessionState {
   };
 }
 
+// isSystemAudit is the one definition of what belongs in the 系统审计 lane:
+// platform-level LLM transitions plus the Watchdog/Provider control records.
+function isSystemAudit(a: Activity): boolean {
+  return (
+    a.worker === "system" ||
+    a.kind === "llm_switch" ||
+    a.kind === "llm_failover" ||
+    a.kind === "provider_error" ||
+    a.kind.startsWith("watchdog_")
+  );
+}
+
 // sessionKeyOf routes an activity to its stable session key. worker="planner" covers
 // BOTH the Goal Agent's round-0 decomposition and the Planner (single Plan session).
 function sessionKeyOf(a: Activity): string {
-  if (a.worker === "system" || a.kind === "llm_switch" || a.kind === "llm_failover") return "system";
+  if (isSystemAudit(a)) return "system";
   if (a.worker === "mainagent") return `main:${a.main_seg ?? 0}`; // one key per conversation segment
   if (a.worker === "planner") return "plan";
   if (a.intent_id) return `intent:${a.intent_id}`;
@@ -282,7 +294,7 @@ const SYSTEM_ID = "s-system";
 const SYSTEM_SESSION: Session = {
   id: SYSTEM_ID,
   role: "system",
-  title: "系统事件 · LLM 故障转移",
+  title: "系统事件 · 审计",
   status: "done",
   live: false,
   last_activity: "",
@@ -521,6 +533,10 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const [listOpen, setListOpen] = React.useState(false);
   // Per-session lazily-loaded caches, keyed by session_key (main | plan | intent:<id>).
   const [store, setStore] = React.useState<SessionStore>({});
+  // While the task-level default card is open, the system audit shows only that
+  // card; older watchdog_* / provider_error rows stay in storage and reappear
+  // after recovery. null means normal history.
+  const [watchdogUnavailableID, setWatchdogUnavailableID] = React.useState<number | null>(null);
   // Worker sessions derived from exploration intents (paged past the old 300 cap).
   const [intents, setIntents] = React.useState<TaskNode[]>([]);
   const [intentAssets, setIntentAssets] = React.useState<IntentAsset[]>([]);
@@ -681,12 +697,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
           for (;;) {
             const page = await api.activity(taskId, { since, limit: SYSTEM_SCAN_PAGE });
             if (reqTokenRef.current[key] !== token) return;
-            systemItems = mergeBySeq(
-              systemItems,
-              page.items.filter(
-                (item) => item.worker === "system" || item.kind === "llm_switch" || item.kind === "llm_failover",
-              ),
-            );
+            systemItems = mergeBySeq(systemItems, page.items.filter(isSystemAudit));
             if (page.items.length < SYSTEM_SCAN_PAGE || page.cursor <= since) break;
             since = page.cursor;
           }
@@ -1152,13 +1163,17 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   // For each worker session (intent), derive the display title from the intent
   // payload summary. Also store the full TaskNode for the hover-JSON tooltip.
   const sessionMeta = React.useMemo(() => {
-    const map = new Map<string, { title: string; json: unknown; deleted: boolean; deleteReason: string }>();
+    const map = new Map<
+      string,
+      { title: string; json: unknown; deleted: boolean; deleteReason: string; terminalReason: string }
+    >();
     for (const node of allIntents) {
       let title = `Intent ${node.id}`;
       let parsedPayload: unknown = node.payload;
       // 假删除:意图 state='deleted',删除原因在独立字段 delete_reason 上。
       const deleted = node.state === "deleted";
       const deleteReason = node.delete_reason ?? "";
+      const terminalReason = node.terminal_reason ?? "";
       if (node.payload) {
         try {
           const p = JSON.parse(node.payload);
@@ -1169,7 +1184,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
         }
       }
       const json = { ...node, payload: parsedPayload };
-      map.set(node.id, { title, json, deleted, deleteReason });
+      map.set(node.id, { title, json, deleted, deleteReason, terminalReason });
     }
     return map;
   }, [allIntents]);
@@ -1269,6 +1284,26 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const isMain = active.role === "mainagent";
   const isPlanner = active.role === "planner";
   const isSystem = active.role === "system";
+  React.useEffect(() => {
+    if (!isSystem) {
+      setWatchdogUnavailableID(null);
+      return;
+    }
+    let alive = true;
+    const load = () =>
+      api
+        .watchdogRequests(taskId, "open")
+        .then((rows) => {
+          if (alive) setWatchdogUnavailableID(rows.find((r) => r.kind === "watchdog_unavailable")?.id ?? null);
+        })
+        .catch(() => undefined);
+    void load();
+    const timer = setInterval(load, 5000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [isSystem, taskId]);
   const activeKey = keyForSession(active);
   const activeState = store[activeKey];
   // A main turn is serialized per task (chat lock), so "busy" is task-wide: while any
@@ -1337,7 +1372,14 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     // same SSE stream (worker="mainagent") as every agent step — no client-side
     // optimistic echo, hence no fabricated seq that could collide with real DB ids.
     if (isMain) return items;
-    if (isPlanner || isSystem) return items;
+    if (isPlanner) return items;
+    if (isSystem) {
+      if (!watchdogUnavailableID) return items;
+      return items.filter(
+        (item) =>
+          item.kind === "watchdog_unavailable" && item.metadata?.watchdog?.request_id === watchdogUnavailableID,
+      );
+    }
     // Worker session: the intent leads the transcript as a right-aligned "user"-style
     // message (the task handed to this worker), followed by its execution steps.
     const intentTitle = sessionMeta.get(active.id)?.title ?? active.title;
@@ -1362,6 +1404,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     active.source_task_id,
     active.inherited,
     sessionMeta,
+    watchdogUnavailableID,
   ]);
 
   // seq of this session's most-recent TodoWrite call — for the Todo popover.
@@ -1834,6 +1877,21 @@ export function SessionsTab({ taskId }: { taskId: string }) {
             </div>
             {(() => {
               const dm = active.role === "worker" ? sessionMeta.get(active.id) : undefined;
+              if (!dm?.terminalReason || dm.deleted) return null;
+              return (
+                <div className="flex items-start gap-2 border-b border-amber-500/30 bg-amber-500/5 px-4 py-2.5 text-xs">
+                  <ShieldAlertIcon className="mt-0.5 size-3.5 shrink-0 text-amber-600" />
+                  <div className="min-w-0">
+                    <span className="font-medium text-amber-700 dark:text-amber-400">
+                      Watchdog 已结束本次运行
+                    </span>
+                    <p className="mt-1 break-words text-foreground">{dm.terminalReason}</p>
+                  </div>
+                </div>
+              );
+            })()}
+            {(() => {
+              const dm = active.role === "worker" ? sessionMeta.get(active.id) : undefined;
               if (!dm?.deleted) return null;
               return (
                 <div className="flex items-start gap-2 border-b border-destructive/30 bg-destructive/5 px-4 py-2.5 text-xs">
@@ -1900,6 +1958,8 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                     taskId={taskId}
                     chat={isMain}
                     focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined}
+                    onOpenIntent={(intentId) => setActiveId(intentId)}
+                    onChanged={() => loadSession(activeKey)}
                   />
                 ) : (
                   <div className="pl-9 text-xs text-muted-foreground">

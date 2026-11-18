@@ -75,6 +75,7 @@ func (s *Server) orchestrationTools() []actool.CoreTool {
 		s.toolListWorkerTraces(),
 		s.toolSearchWorkerTraces(),
 		s.toolGetTaskNodeDetail(),
+		s.toolGetWorkerHealth(),
 		s.toolUpdateFindingReport(),
 		s.toolGetFindingTraffic(),
 		s.toolBindFindingTraffic(),
@@ -473,15 +474,24 @@ func (s *Server) deriveTaskStatus(t *Task) string {
 func (s *Server) seedOrchestrationTools() {
 	// task-op + platform tools default-bind to the built-in Auto agent (它天生用来
 	// 操作平台)。SeedTool 首插入生效;老库已 seed 的行由 seedAutoDefaultBindings 补绑。
-	autoAgents, _ := json.Marshal([]string{"auto"})
+	watchdogTools := map[string]bool{}
+	for _, name := range watchdogReadToolNames {
+		watchdogTools[name] = true
+	}
 	for _, t := range s.orchestrationTools() {
 		schema, _ := json.Marshal(t.InputSchema())
-		bindings := autoAgents
+		agents := []string{"auto"}
+		if watchdogTools[t.Name()] {
+			agents = append(agents, "watchdog")
+		}
+		bindings, _ := json.Marshal(agents)
 		if t.Name() == "bind_finding_traffic" {
 			bindings = json.RawMessage(`["reporter"]`)
 		}
 		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, bindings)
 	}
+	s.seedWatchdogToolBindings()
+	autoAgents, _ := json.Marshal([]string{"auto"})
 	for _, t := range s.platformTools() {
 		schema, _ := json.Marshal(t.InputSchema())
 		_ = s.m.PG().SeedTool(t.Name(), t.Description(), schema, autoAgents)
@@ -892,6 +902,21 @@ func (s *Server) seedWorkerReadbackRebind() {
 	}); err != nil {
 		log.Printf("[worker] 回看/详情工具补绑失败: %v", err)
 		return // 出错则不落 flag，下次启动重试
+	}
+	_ = s.m.pg.SetSetting(flag, "true")
+}
+
+// seedWatchdogToolBindings gives existing DBs the read-only tool set once. Fresh
+// DBs already get the binding from SeedTool; the flag keeps a user who later
+// unbinds a tool from having it silently re-added on every start.
+func (s *Server) seedWatchdogToolBindings() {
+	const flag = "watchdog_tool_bindings_v1"
+	if v, _, _ := s.m.pg.GetSetting(flag); v == "true" {
+		return
+	}
+	if err := s.m.pg.AddAgentToToolBinding("watchdog", watchdogReadToolNames); err != nil {
+		log.Printf("[watchdog] 工具绑定失败: %v", err)
+		return // 不回填 flag，下次启动重试
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
 }

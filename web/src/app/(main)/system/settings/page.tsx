@@ -2,7 +2,15 @@
 
 import * as React from "react";
 
-import { CpuIcon, FlaskConicalIcon, KeyboardIcon, RadioTowerIcon, SearchIcon, ShieldAlertIcon } from "lucide-react";
+import {
+  CpuIcon,
+  FlaskConicalIcon,
+  GaugeIcon,
+  KeyboardIcon,
+  RadioTowerIcon,
+  SearchIcon,
+  ShieldAlertIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -43,6 +51,15 @@ export default function SystemSettingsPage() {
   const [injectWorker, setInjectWorker] = React.useState(true);
   // 实验功能:noa 上下文压缩(默认关)。
   const [noaCompaction, setNoaCompaction] = React.useState(false);
+  // 运行看护（Watchdog）。生产默认关，阈值以秒为单位，480/600/1200 对应 8/10/20 分钟。
+  const [watchdogEnabled, setWatchdogEnabled] = React.useState(false);
+  const [watchdogPressure, setWatchdogPressure] = React.useState("480");
+  const [watchdogSlow, setWatchdogSlow] = React.useState("600");
+  const [watchdogCycle, setWatchdogCycle] = React.useState("1200");
+  const [watchdogAgentKey, setWatchdogAgentKey] = React.useState("watchdog");
+  const [watchdogRetry, setWatchdogRetry] = React.useState("300");
+  const [workerRunSeconds, setWorkerRunSeconds] = React.useState("0");
+  const [savingWatchdog, setSavingWatchdog] = React.useState(false);
   // 纯前端偏好：不走 /api/settings，直接读写 localStorage。
   const sendMode = useChatSendMode();
 
@@ -60,6 +77,13 @@ export default function SystemSettingsPage() {
     setInjectPlanner(s.constraints_inject_planner !== false);
     setInjectWorker(s.constraints_inject_worker !== false);
     setNoaCompaction(!!s.noa_compaction);
+    setWatchdogEnabled(!!s.watchdog_enabled);
+    setWatchdogPressure(String(s.watchdog_pressure_after_sec ?? 480));
+    setWatchdogSlow(String(s.watchdog_slow_path_after_sec ?? 600));
+    setWatchdogCycle(String(s.watchdog_cycle_after_sec ?? 1200));
+    setWatchdogAgentKey(s.watchdog_agent_key ?? "watchdog");
+    setWatchdogRetry(String(s.watchdog_agent_retry_sec ?? 300));
+    setWorkerRunSeconds(String(s.worker_run_seconds ?? 0));
   }, []);
 
   const saveWorkers = () => {
@@ -161,6 +185,56 @@ export default function SystemSettingsPage() {
         setNoaCompaction(!v); // revert on failure
         toast.error(`保存失败：${(e as Error).message}`);
       });
+  };
+
+  const toggleWatchdog = (v: boolean) => {
+    setWatchdogEnabled(v); // optimistic
+    api
+      .setSettings({ watchdog_enabled: v })
+      .then((s) => {
+        apply(s);
+        toast.success(v ? "已开启运行看护" : "已关闭运行看护");
+      })
+      .catch((e) => {
+        setWatchdogEnabled(!v);
+        toast.error(`保存失败：${(e as Error).message}`);
+      });
+  };
+
+  const saveWatchdog = () => {
+    const pressure = Number(watchdogPressure);
+    const slow = Number(watchdogSlow);
+    const cycle = Number(watchdogCycle);
+    const retry = Number(watchdogRetry);
+    const runSeconds = Number(workerRunSeconds);
+    if (![pressure, slow, cycle, retry, runSeconds].every((n) => Number.isInteger(n) && n >= 0)) {
+      toast.error("阈值必须是非负整数");
+      return;
+    }
+    if (!(pressure > 0 && slow > pressure && cycle > slow)) {
+      toast.error("阈值必须满足：压力提示 < 慢速判断 < 周期处理");
+      return;
+    }
+    if (retry <= 0) {
+      toast.error("Watchdog Agent 重试间隔必须大于 0");
+      return;
+    }
+    setSavingWatchdog(true);
+    api
+      .setSettings({
+        watchdog_pressure_after_sec: pressure,
+        watchdog_slow_path_after_sec: slow,
+        watchdog_cycle_after_sec: cycle,
+        watchdog_agent_key: watchdogAgentKey.trim(),
+        watchdog_agent_retry_sec: retry,
+        worker_run_seconds: runSeconds,
+      })
+      .then((s) => {
+        apply(s);
+        toast.success("已保存运行看护配置（对之后启动的运行生效）");
+      })
+      .catch((e) => toast.error(`保存失败：${(e as Error).message}`))
+      .finally(() => setSavingWatchdog(false));
   };
 
   // Persist a web-search patch (enable and/or backend). Optimistic with refetch.
@@ -672,6 +746,119 @@ export default function SystemSettingsPage() {
               />
               <Button onClick={saveWorkers} disabled={!loaded || savingWorkers}>
                 保存
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <GaugeIcon className="size-4" />
+              运行看护（Watchdog）
+            </CardTitle>
+            <CardDescription>
+              默认关闭。开启后默认在 8 分钟没有有效写入时收到压力提示、10 分钟进入慢速判断、20
+              分钟按周期规则推进或终止；阈值可在下方修改。有效写入会重置周期；任务暂停、删除、收尾和供应商错误期间不执行看护动作。
+              <br />
+              慢速判断使用只读 Agent，不执行命令、不改任务图；判断结果先写入系统审计，终止动作由引擎完成。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3">
+            <div className="flex items-center justify-between gap-4">
+              <Label htmlFor="watchdog-enabled" className="text-sm font-normal text-muted-foreground">
+                {watchdogEnabled ? "已开启 · 按阈值执行看护" : "已关闭 · 仅记录运行状态"}
+              </Label>
+              <Switch
+                id="watchdog-enabled"
+                checked={watchdogEnabled}
+                disabled={!loaded}
+                onCheckedChange={toggleWatchdog}
+              />
+            </div>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+              <div className="grid gap-1">
+                <Label htmlFor="watchdog-pressure" className="text-xs text-muted-foreground">
+                  压力提示（秒）
+                </Label>
+                <Input
+                  id="watchdog-pressure"
+                  type="number"
+                  min={1}
+                  value={watchdogPressure}
+                  disabled={!loaded || savingWatchdog}
+                  onChange={(e) => setWatchdogPressure(e.target.value)}
+                />
+              </div>
+              <div className="grid gap-1">
+                <Label htmlFor="watchdog-slow" className="text-xs text-muted-foreground">
+                  慢速判断（秒）
+                </Label>
+                <Input
+                  id="watchdog-slow"
+                  type="number"
+                  min={1}
+                  value={watchdogSlow}
+                  disabled={!loaded || savingWatchdog}
+                  onChange={(e) => setWatchdogSlow(e.target.value)}
+                />
+              </div>
+              <div className="grid gap-1">
+                <Label htmlFor="watchdog-cycle" className="text-xs text-muted-foreground">
+                  周期处理（秒）
+                </Label>
+                <Input
+                  id="watchdog-cycle"
+                  type="number"
+                  min={1}
+                  value={watchdogCycle}
+                  disabled={!loaded || savingWatchdog}
+                  onChange={(e) => setWatchdogCycle(e.target.value)}
+                />
+              </div>
+            </div>
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <div className="grid gap-1">
+                <Label htmlFor="watchdog-agent" className="text-xs text-muted-foreground">
+                  Watchdog Agent key
+                </Label>
+                <Input
+                  id="watchdog-agent"
+                  value={watchdogAgentKey}
+                  disabled={!loaded || savingWatchdog}
+                  onChange={(e) => setWatchdogAgentKey(e.target.value)}
+                />
+              </div>
+              <div className="grid gap-1">
+                <Label htmlFor="watchdog-retry" className="text-xs text-muted-foreground">
+                  不可用重试（秒）
+                </Label>
+                <Input
+                  id="watchdog-retry"
+                  type="number"
+                  min={1}
+                  value={watchdogRetry}
+                  disabled={!loaded || savingWatchdog}
+                  onChange={(e) => setWatchdogRetry(e.target.value)}
+                />
+              </div>
+            </div>
+            <div className="grid gap-1">
+              <Label htmlFor="watchdog-worker-run" className="text-xs text-muted-foreground">
+                Worker 单次运行时限（秒，0=开启看护时不限时、由任务截止时间约束；&gt;0 显式覆盖）
+              </Label>
+              <Input
+                id="watchdog-worker-run"
+                type="number"
+                min={0}
+                value={workerRunSeconds}
+                disabled={!loaded || savingWatchdog}
+                onChange={(e) => setWorkerRunSeconds(e.target.value)}
+              />
+            </div>
+            <div>
+              <Button onClick={saveWatchdog} disabled={!loaded || savingWatchdog}>
+                {savingWatchdog ? "保存中…" : "保存看护配置"}
               </Button>
             </div>
           </CardContent>

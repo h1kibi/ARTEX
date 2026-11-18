@@ -102,6 +102,8 @@ import type {
   TrafficResp,
   UpdateCheck,
   UsageStats,
+  WatchdogRequest,
+  WatchdogRun,
   WorkspaceFile,
   WorkspaceListing,
 } from "@/lib/types";
@@ -730,6 +732,16 @@ export const api = {
     }));
   },
   activityDetail: (id: number, task?: string) => get<{ detail: string }>(`/exploration/activity/${id}${tq(task)}`),
+  // 运行看护：实时阶段与周期状态，以及系统审计里的用户判断卡片。
+  watchdogRuns: (taskId: string) =>
+    get<{ runs: WatchdogRun[] }>(`/watchdog/runs?task_id=${encodeURIComponent(taskId)}`).then((r) => arr(r.runs)),
+  watchdogRequests: (taskId: string, status = "") =>
+    get<{ requests: WatchdogRequest[] }>(
+      `/watchdog/requests?task_id=${encodeURIComponent(taskId)}${status ? `&status=${encodeURIComponent(status)}` : ""}`,
+    ).then((r) => arr(r.requests)),
+  watchdogDecide: (id: number, answer: "continue" | "stop", reason = "") =>
+    post<WatchdogRequest>(`/watchdog/requests/${id}/decision`, { answer, reason }),
+  watchdogRetry: (id: number) => post<WatchdogRequest>(`/watchdog/requests/${id}/retry`, {}),
   // Reverse-paginated session history. session = "main" | "plan" | "intent:<id>".
   // before=0 → latest page; before=<id> → the older page ending before that id.
   // snapshotCursor is the TASK-level max id at query time — open the task SSE at

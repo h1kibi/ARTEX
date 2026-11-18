@@ -567,7 +567,11 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	wk.SetNonStreaming(workerRuntime.nonStreaming) // 按任务当前激活 profile 的流式开关(每轮读)
 	wk.SetMaxTokens(workerRuntime.maxTokens)       // 同上,输出上限也跟随当前激活 profile
 	wk.SetNoaEnabled(s.m.NoaCompactionEnabled)     // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
-	wk.SetRunTimeout(time.Duration(s.agentRunSeconds("worker")) * time.Second)
+	// Watchdog 开启时，worker_run_seconds=0 不再原样沿用 Worker 的 1200 秒默认值：
+	// 改为不限时，让用户可连续批准 C4、C5；显式配置仍优先，任务级截止时间会在
+	// run 内继续夹逼这个值。
+	workerRunSecs := watchdogWorkerRunSeconds(s.agentRunSeconds("worker"), s.watchdogConfig())
+	wk.SetRunTimeout(time.Duration(workerRunSecs) * time.Second)
 	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
@@ -594,7 +598,9 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	main.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	main.SetWebSearch(s.webSearchFor("mainagent"))
-	main.SetSteerWork(s.engine.SteerWork) // steer_work：人对运行中 work 实时纠偏
+	main.SetSteerWork(func(intentID int64, msg string) error {
+		return s.engine.SteerWorkFrom(intentID, "mainagent", msg)
+	}) // steer_work：人对运行中 work 实时纠偏，来源标记为主 Agent
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
 		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main,

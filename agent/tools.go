@@ -537,6 +537,10 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 						m["pct"] = cov.Pct
 					}
 				}
+				if scope := compactTaskScope(t.as, t.taskID); len(scope) > 0 {
+					m["scope"] = scope
+					m["scope_count"] = len(scope)
+				}
 			}
 			if hosts, err := t.as.HostsByTaskWithSources(t.taskID); err == nil {
 				// 只给主机总数，不再把 host 列表平铺进 graph_overview（大范围任务里那是每轮
@@ -547,6 +551,75 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 				out["coverage"] = m
 			}
 		}
+	}
+	return out
+}
+
+// compactTaskScope renders the task's own scope rows for the coverage block. A
+// company reference is expanded into its company_scope rules and keywords so the
+// planner sees the authorization boundary without a second tool call; the same
+// keyword is also retained in the rule list, matching the company scope view.
+func compactTaskScope(as *db.AssetStore, taskID int64) []map[string]any {
+	if as == nil || taskID <= 0 {
+		return nil
+	}
+	rows, err := as.ListTaskScope(taskID)
+	if err != nil || len(rows) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		entry := map[string]any{"kind": row.Kind, "source": row.Source}
+		if row.CompanyID != nil {
+			entry["company_id"] = *row.CompanyID
+		}
+		if row.CompanyName != "" {
+			entry["company_name"] = row.CompanyName
+		}
+		switch {
+		case row.Domain != "":
+			entry["value"] = row.Domain
+		case row.Net != "":
+			entry["value"] = row.Net
+		case row.Value != "":
+			entry["value"] = row.Value
+		}
+		if row.Reason != "" {
+			entry["reason"] = row.Reason
+		}
+		if row.CompanyID != nil && as.Companies() != nil {
+			if rules, err := as.Companies().GetScope(*row.CompanyID); err == nil && len(rules) > 0 {
+				companyScope := make([]map[string]any, 0, len(rules))
+				var keywords []string
+				for _, rule := range rules {
+					// Show the human-entered ICP/keyword text; domains and networks
+					// use their normalized form. A single IP is stored as /32 or
+					// /128 CIDR, but the scope view should read as the address.
+					value := rule.Raw
+					switch rule.Kind {
+					case "domain":
+						value = rule.Domain
+					case "ip":
+						value = strings.TrimSuffix(strings.TrimSuffix(rule.Net, "/128"), "/32")
+					case "cidr":
+						value = rule.Net
+					}
+					if value == "" {
+						value = rule.Value
+					}
+					if value == "" {
+						value = rule.Raw
+					}
+					companyScope = append(companyScope, map[string]any{"kind": rule.Kind, "value": value})
+					if rule.Kind == "keyword" {
+						keywords = append(keywords, value)
+					}
+				}
+				entry["company_scope"] = companyScope
+				entry["company_keywords"] = keywords
+			}
+		}
+		out = append(out, entry)
 	}
 	return out
 }

@@ -1200,7 +1200,11 @@ export default function ChatPage() {
   // conversation agents: custom agents + conversational built-ins (role=assistant,
   // e.g. Auto / 渗透测试). The orchestration built-ins (goals/planner/mainagent/worker)
   // are task-specific and stay hidden from the chat page.
-  const chatAgents = React.useMemo(() => agents.filter((a) => !a.builtin || a.role === "assistant"), [agents]);
+  // Watchdog 是平台内部判断角色，只由 Slow Path 服务调用，不进入聊天页。
+  const chatAgents = React.useMemo(
+    () => agents.filter((a) => a.key !== "watchdog" && (!a.builtin || a.role === "assistant")),
+    [agents],
+  );
   const agentFilterOptions = React.useMemo(() => {
     const counts = new Map<string, number>();
     for (const conversation of convs) {

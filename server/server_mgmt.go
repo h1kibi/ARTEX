@@ -15,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"text/template"
@@ -173,6 +174,7 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 			// PostgreSQL is already gone. Complete runtime teardown and return the
 			// auditable counts together with the post-commit cleanup warning.
 			s.engine.StopTask(id)
+			s.removeWatchdogTask(id)
 			s.taskAgentMu.Lock()
 			delete(s.taskAgents, id)
 			s.taskAgentMu.Unlock()
@@ -187,6 +189,7 @@ func (s *Server) pgDeleteTask(w http.ResponseWriter, r *http.Request) {
 	// resolve it. Now stop and join every task-owned Engine goroutine and clear its
 	// lifecycle maps before releasing the delete barrier.
 	s.engine.StopTask(id)
+	s.removeWatchdogTask(id)
 	s.taskAgentMu.Lock()
 	delete(s.taskAgents, id)
 	s.taskAgentMu.Unlock()
@@ -1283,6 +1286,31 @@ func skillNameFromFrontmatter(md []byte) string {
 	return ""
 }
 
+// renameInstalledSkill renames the staged skill directory into place. Windows can
+// transiently deny renaming a directory immediately after creating Chinese-named
+// children while an indexer/AV scanner holds a handle; retry briefly instead of
+// failing an otherwise valid upload. A real destination conflict is not retried.
+func renameInstalledSkill(tmp, dst string) error {
+	var err error
+	for attempt := range 6 {
+		err = os.Rename(tmp, dst)
+		if err == nil {
+			return nil
+		}
+		if runtime.GOOS != "windows" {
+			return err
+		}
+		if _, statErr := os.Stat(dst); statErr == nil {
+			return err
+		}
+		if !os.IsPermission(err) && !strings.Contains(strings.ToLower(err.Error()), "access is denied") {
+			return err
+		}
+		time.Sleep(time.Duration(25<<attempt) * time.Millisecond)
+	}
+	return err
+}
+
 // fsUploadSkill installs a skill from an uploaded .zip. The archive must contain a
 // SKILL.md (at the root or under a single top-level dir); the skill name is taken
 // from that file's `name:` frontmatter (falling back to the top dir / zip name).
@@ -1434,7 +1462,7 @@ func (s *Server) fsUploadSkill(w http.ResponseWriter, r *http.Request) {
 	if overwrite {
 		_ = os.RemoveAll(skillPath)
 	}
-	if err := os.Rename(tmp, skillPath); err != nil {
+	if err := renameInstalledSkill(tmp, skillPath); err != nil {
 		writeErr(w, 500, "安装失败："+err.Error())
 		return
 	}
@@ -1536,7 +1564,9 @@ func skillRelPath(file string) (string, string) {
 	if clean == "." || filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") {
 		return "", "invalid path"
 	}
-	return clean, ""
+	// API paths are slash-separated on every platform; Windows filepath.Clean
+	// would otherwise turn scripts/run.py into scripts\run.py.
+	return filepath.ToSlash(clean), ""
 }
 
 // walkSkillFiles returns all files under root (relative to root), sorted,
@@ -1554,6 +1584,7 @@ func walkSkillFiles(root string) ([]string, error) {
 		if relErr != nil || rel == "." {
 			return nil
 		}
+		rel = filepath.ToSlash(rel)
 		if d.IsDir() {
 			entries = append(entries, rel+"/")
 		} else {

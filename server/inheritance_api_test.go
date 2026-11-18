@@ -52,7 +52,12 @@ func TestInheritedActivityDetailAndRelationDeletion(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s := New(context.Background(), m, t.TempDir(), t.TempDir(), t.TempDir())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
+	// Stop task loops before TempDir cleanup so transcript writes cannot race
+	// the Windows directory removal.
+	defer stopAllServerTasks(s, m)
 	token, err := signJWT(s.jwtKey)
 	if err != nil {
 		t.Fatal(err)

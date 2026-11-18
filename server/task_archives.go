@@ -231,6 +231,7 @@ func (s *Server) archiveTask(job *pgdb.TaskArchive) (runErr error) {
 		_ = s.m.pg.AppendTaskArchiveWarning(job.ID, warning)
 	}
 	s.engine.StopTask(taskID)
+	s.removeWatchdogTask(taskID)
 	s.taskAgentMu.Lock()
 	delete(s.taskAgents, taskID)
 	s.taskAgentMu.Unlock()

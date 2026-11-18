@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/intercept"
@@ -155,6 +156,9 @@ func renderPlannerTodos(items []actool.Todo) string {
 //	"goal_edited"  — the human edited a goal from 总览的目标管理 (OldGoal→NewGoal 文本).
 //	"cancelled" — the human deleted intent IntentID (Detail = 删除原因). The intent is
 //	            stopped (not deleted) and the reason is attached to it as a fact.
+//	"watchdog_terminated" — Fast Path terminated intent IntentID. Summary is the
+//	            final state (stopped/exhausted), Detail is the reason, and the
+//	            remaining fields carry the write counts and last output snapshot.
 type TriggerEvent struct {
 	Kind     string
 	IntentID int64
@@ -164,6 +168,17 @@ type TriggerEvent struct {
 	OldGoal  string   // Kind=="goal_edited" 专用：修改前的目标文本
 	NewGoal  string   // Kind=="goal_edited" 专用：修改后的目标文本
 	Hints    []string // Kind=="hint" 专用：本次 add_hint 新增的提示文本（1 条或多条）
+	// Kind=="watchdog_terminated" 专用：终止结算的现场。Summary 是终态
+	// （stopped/exhausted），Detail 是终止原因。
+	Worker           string
+	CycleNo          int
+	LastOutputAt     time.Time
+	Phase            string
+	Facts            int
+	Assets           int
+	Findings         int
+	RecentStep       string // 最近一条非 usage 活动摘要
+	RecentToolResult string // 最近一条 tool_result 摘要
 }
 
 // renderTriggers spells out the change(s) that fired this round: for a finished
@@ -203,6 +218,25 @@ func renderTriggers(ts *db.ExplorationStore, evs []TriggerEvent) string {
 				sm = intentSummary(ts, ev.IntentID)
 			}
 			b.WriteString(fmt.Sprintf("\n- 意图 #%d 由用户删除，意图内容是：%s、删除原因是：%s。该意图已删除（不再执行）；请据此重新规划。", ev.IntentID, sm, ev.Detail))
+		case "watchdog_terminated":
+			lastOutput := "无"
+			if !ev.LastOutputAt.IsZero() {
+				lastOutput = ev.LastOutputAt.Format("2006-01-02 15:04:05")
+			}
+			cycle := ""
+			if ev.CycleNo > 0 {
+				cycle = fmt.Sprintf("当前周期：C%d。", ev.CycleNo)
+			}
+			recent := ""
+			if ev.RecentStep != "" {
+				recent += "最近步骤：" + ev.RecentStep + "。"
+			}
+			if ev.RecentToolResult != "" {
+				recent += "最近工具结果：" + ev.RecentToolResult + "。"
+			}
+			b.WriteString(fmt.Sprintf("\n- 意图 #%d（%s）被 Watchdog 终止。%s终止原因：%s。终止状态：%s。最后一次有效写入：%s。最近阶段：%s。%s已写入事实：%d，已写入资产：%d，已登记漏洞：%d。请读取执行过程，判断是否重新派发、换一种打法或封住该方向；不要自动重跑同一条意图。",
+				ev.IntentID, intentSummary(ts, ev.IntentID), cycle, ev.Detail, ev.Summary,
+				lastOutput, ev.Phase, recent, ev.Facts, ev.Assets, ev.Findings))
 		default: // "done"
 			b.WriteString(fmt.Sprintf("\n- 意图 #%d（%s）的 worker 结束，输出结论：%s", ev.IntentID, intentSummary(ts, ev.IntentID), workerOutput(ts, ev.IntentID)))
 			if fids := factIDsYielded(ts, ev.IntentID); fids != "" {

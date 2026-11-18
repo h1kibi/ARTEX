@@ -22,6 +22,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ApprovalDetail } from "@/components/approval-records";
+import { WatchdogCard } from "@/components/watchdog-card";
 import type { Activity, InterceptPending } from "@/lib/types";
 
 // ---- per-agent lane color (planner + work#1/#2/#3 …) ---------------------------
@@ -82,7 +83,8 @@ type Group =
   | { type: "round"; key: number; label: string }
   | { type: "tool"; key: number; worker: string; use?: Activity; result?: Activity }
   | { type: "msg"; key: number; worker: string; steps: Activity[] }
-  | { type: "intercept"; key: number; step: Activity };
+  | { type: "intercept"; key: number; step: Activity }
+  | { type: "watchdog"; key: number; step: Activity };
 
 function groupSteps(steps: Activity[], chat: boolean): Group[] {
   const out: Group[] = [];
@@ -95,6 +97,10 @@ function groupSteps(steps: Activity[], chat: boolean): Group[] {
     }
     if (s.kind === "intercept_request") {
       out.push({ type: "intercept", key: s.seq, step: s });
+      continue;
+    }
+    if (s.kind.startsWith("watchdog_") || s.kind === "provider_error") {
+      out.push({ type: "watchdog", key: s.seq, step: s });
       continue;
     }
     if (s.kind === "user" || s.kind === "intent") {
@@ -682,12 +688,16 @@ function ExecView({
   chat,
   fetchDetail,
   focusedSeq,
+  onOpenIntent,
+  onChanged,
 }: {
   activity: Activity[];
   taskId?: string;
   chat?: boolean;
   fetchDetail?: (seq: number) => Promise<string>;
   focusedSeq?: number;
+  onOpenIntent?: (intentId: string) => void;
+  onChanged?: () => void;
 }) {
   const showWorker = new Set(activity.map((a) => a.worker)).size > 1;
   // default detail fetcher: the task-scoped activity endpoint. The chat page passes
@@ -719,6 +729,17 @@ function ExecView({
           />
         ) : g.type === "intercept" ? (
           <InterceptCard key={"ic" + g.key} step={g.step} getDetail={getDetail} />
+        ) : g.type === "watchdog" ? (
+          taskId ? (
+            <WatchdogCard
+              key={"wd" + g.key}
+              activity={g.step}
+              taskId={taskId}
+              fetchDetail={getDetail}
+              onOpenIntent={onOpenIntent}
+              onChanged={onChanged}
+            />
+          ) : null
         ) : (
           <MessageBlock key={"m" + g.key} group={g} getDetail={getDetail} showWorker={showWorker} />
         ),
@@ -737,6 +758,8 @@ export function Transcript({
   chat,
   fetchDetail,
   focusedSeq,
+  onOpenIntent,
+  onChanged,
 }: {
   activity: Activity[];
   live?: boolean;
@@ -744,6 +767,8 @@ export function Transcript({
   chat?: boolean;
   fetchDetail?: (seq: number) => Promise<string>;
   focusedSeq?: number;
+  onOpenIntent?: (intentId: string) => void;
+  onChanged?: () => void;
 }) {
   const transcriptRef = React.useRef<HTMLDivElement>(null);
   const [focusPadding, setFocusPadding] = React.useState(0);
@@ -759,7 +784,15 @@ export function Transcript({
   }, [focusedSeq]);
   return (
     <div ref={transcriptRef} className="flex flex-col gap-1" style={focusPadding ? { paddingBlock: focusPadding } : undefined}>
-      <ExecView activity={activity} taskId={taskId} chat={chat} fetchDetail={fetchDetail} focusedSeq={focusedSeq} />
+      <ExecView
+        activity={activity}
+        taskId={taskId}
+        chat={chat}
+        fetchDetail={fetchDetail}
+        focusedSeq={focusedSeq}
+        onOpenIntent={onOpenIntent}
+        onChanged={onChanged}
+      />
       {live && (
         <div className="flex items-center gap-2 pl-2 pt-1 text-xs text-muted-foreground">
           <span className="flex gap-1">

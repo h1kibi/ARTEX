@@ -195,6 +195,9 @@ CREATE TABLE IF NOT EXISTS exploration_nodes (
 ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS blocked_reason TEXT;
 -- 意图假删除(soft delete):state='deleted' 时,delete_reason 记用户填写的删除原因。
 ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS delete_reason TEXT;
+-- Watchdog 终止原因：intent 因空转/循环/脱离意图/周期预算结束而停止时写入。
+-- 与 blocked_reason、delete_reason 分开，三种终态的原因互不覆盖；重跑时清空。
+ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS terminal_reason TEXT;
 -- cold-digest (§2.3/§5.3): content_version bumps on any change that could alter a
 -- digest body (summary/state/confidence); cold_since_round stamps the planner round
 -- a node most recently went from "has a live downstream branch" to none (NULL = hot).
@@ -1384,3 +1387,114 @@ CREATE INDEX IF NOT EXISTS idx_notification_deliveries_batch
     ON notification_deliveries(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
     ON notification_deliveries(channel_id, id DESC);
+
+-- =====================================================================
+-- N. 运行看护（Watchdog）
+--
+-- 三层刻意分开，职责不重叠：
+--   worker_runs       每个运行中 intent 的实时阶段/心跳/周期（可过期、可清理）
+--   watchdog_jobs     10 分钟触发的 Slow Path 判断队列（同一 run 同一周期唯一）
+--   watchdog_requests 用户判断卡片 + Watchdog 不可用卡片（条件更新，不物理删除）
+--
+-- 都不与 activity 合并：activity 是只追加的执行事实，这三张表是有状态、会
+-- 条件更新、会被清理的控制面数据。任务删除/归档时按 task_id 清理。
+-- =====================================================================
+
+CREATE TABLE IF NOT EXISTS worker_runs (
+    id                BIGSERIAL PRIMARY KEY,
+    task_id           TEXT NOT NULL,
+    intent_id         BIGINT NOT NULL,
+    run_id            TEXT NOT NULL,
+    worker_name       TEXT NOT NULL,
+    -- idle | llm | tool | approval | paused | settling
+    phase             TEXT NOT NULL DEFAULT 'idle',
+    phase_started_at  TIMESTAMPTZ,
+    heartbeat_at      TIMESTAMPTZ,
+    last_event_at     TIMESTAMPTZ,
+    last_output_at    TIMESTAMPTZ,
+    cycle_start       TIMESTAMPTZ,
+    cycle_no          INTEGER NOT NULL DEFAULT 0,
+    pressure_sent     BOOLEAN NOT NULL DEFAULT false,
+    -- none | queued | running | done | failed | stale
+    slow_path_state   TEXT NOT NULL DEFAULT 'none',
+    -- none | open | answered | expired
+    decision_state    TEXT NOT NULL DEFAULT 'none',
+    -- 租约只用于判断一行是否仍由活进程维护；活进程每个 Fast Path 周期刷新。
+    -- 进程重启/崩溃后，租约过期的行会被清理。worker 本身无法被另一个进程接管。
+    lease_until       TIMESTAMPTZ,
+    -- running | finished | abandoned
+    state             TEXT NOT NULL DEFAULT 'running',
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_worker_runs_run ON worker_runs(run_id);
+CREATE INDEX IF NOT EXISTS idx_worker_runs_task_state ON worker_runs(task_id, state);
+CREATE INDEX IF NOT EXISTS idx_worker_runs_lease ON worker_runs(lease_until);
+DROP TRIGGER IF EXISTS trg_worker_runs_upd ON worker_runs;
+CREATE TRIGGER trg_worker_runs_upd BEFORE UPDATE ON worker_runs
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE IF NOT EXISTS watchdog_jobs (
+    id             BIGSERIAL PRIMARY KEY,
+    task_id        TEXT NOT NULL,
+    intent_id      BIGINT NOT NULL,
+    run_id         TEXT NOT NULL,
+    cycle_no       INTEGER NOT NULL,
+    cycle_start    TIMESTAMPTZ,
+    -- queued | running | done | failed | stale
+    status         TEXT NOT NULL DEFAULT 'queued',
+    snapshot       JSONB NOT NULL DEFAULT '{}',
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT NOT NULL DEFAULT '',
+    next_retry_at  TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- 同一 run 的同一周期只允许一次 Slow Path 判断；重试更新同一行。
+CREATE UNIQUE INDEX IF NOT EXISTS ux_watchdog_jobs_cycle ON watchdog_jobs(run_id, cycle_no);
+CREATE INDEX IF NOT EXISTS idx_watchdog_jobs_status_retry ON watchdog_jobs(status, next_retry_at);
+CREATE INDEX IF NOT EXISTS idx_watchdog_jobs_task ON watchdog_jobs(task_id, intent_id, run_id);
+DROP TRIGGER IF EXISTS trg_watchdog_jobs_upd ON watchdog_jobs;
+CREATE TRIGGER trg_watchdog_jobs_upd BEFORE UPDATE ON watchdog_jobs
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE IF NOT EXISTS watchdog_requests (
+    id                BIGSERIAL PRIMARY KEY,
+    task_id           TEXT NOT NULL,
+    intent_id         BIGINT,
+    run_id            TEXT,
+    cycle_no          INTEGER NOT NULL DEFAULT 0,
+    -- watchdog_ask | watchdog_unavailable
+    kind              TEXT NOT NULL,
+    -- open | answered | expired | superseded | cancelled
+    status            TEXT NOT NULL DEFAULT 'open',
+    question          TEXT NOT NULL DEFAULT '',
+    evidence          JSONB NOT NULL DEFAULT '{}',
+    options           JSONB NOT NULL DEFAULT '[]',
+    answer            TEXT NOT NULL DEFAULT '',
+    answer_reason     TEXT NOT NULL DEFAULT '',
+    answered_at       TIMESTAMPTZ,
+    deadline_at       TIMESTAMPTZ,
+    hard_deadline_at  TIMESTAMPTZ,
+    alert_count       INTEGER NOT NULL DEFAULT 0,
+    first_alert_at    TIMESTAMPTZ,
+    last_alert_at     TIMESTAMPTZ,
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    last_error        TEXT NOT NULL DEFAULT '',
+    next_retry_at     TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+-- 一个 worker 的一个周期最多一张开放决策卡片。
+CREATE UNIQUE INDEX IF NOT EXISTS ux_watchdog_requests_open_ask
+    ON watchdog_requests(run_id, cycle_no)
+    WHERE status = 'open' AND kind = 'watchdog_ask';
+-- 一个任务同一时间最多一张开放不可用卡片；后续告警更新这一行。
+CREATE UNIQUE INDEX IF NOT EXISTS ux_watchdog_requests_open_unavailable
+    ON watchdog_requests(task_id)
+    WHERE status = 'open' AND kind = 'watchdog_unavailable';
+CREATE INDEX IF NOT EXISTS idx_watchdog_requests_task_status
+    ON watchdog_requests(task_id, status);
+DROP TRIGGER IF EXISTS trg_watchdog_requests_upd ON watchdog_requests;
+CREATE TRIGGER trg_watchdog_requests_upd BEFORE UPDATE ON watchdog_requests
+    FOR EACH ROW EXECUTE FUNCTION set_updated_at();

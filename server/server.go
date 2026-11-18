@@ -119,6 +119,10 @@ type Server struct {
 	archiveWake chan struct{}
 	archiveWG   sync.WaitGroup
 	side        *sideQuestionState
+
+	// watchdog is the Fast Path + Slow Path runtime. It exists even while the
+	// setting is disabled so worker_runs and the API stay available.
+	watchdog *watchdogRuntime
 }
 
 // provEntry is a cached provider + its config for one LLM profile id.
@@ -152,6 +156,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
+	s.watchdog = newWatchdogRuntime(s, time.Now)
+	s.engine.SetRunMonitor(s.watchdog.monitor)
+	s.watchdog.monitor.SetCycleResetHook(s.watchdogOnCycleReset)
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
 	s.applyRetryPolicy()
@@ -256,6 +263,7 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
 	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
+	s.watchdog.Run(s.ctx)
 	return s
 }
 
@@ -263,6 +271,12 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 // including the side-question checkpoint publisher installed during startup.
 func (s *Server) restoreTaskRuntimes() {
 	m := s.m
+	// A worker goroutine cannot survive a process restart: clear the live run
+	// table, re-queue jobs that were mid-flight, and expire cards whose run is
+	// gone. Historical requests stay for audit.
+	if err := m.pg.RecoverWatchdogOnStartup(s.ctx); err != nil {
+		log.Printf("[watchdog] 启动恢复失败: %v", err)
+	}
 	// reload tasks persisted on disk so the task list survives a restart, and
 	// restore persisted paused state (so a task paused before restart stays paused).
 	for _, t := range m.LoadExisting() {
@@ -790,6 +804,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/traffic/all", s.deleteAllTraffic)
 	mux.HandleFunc("GET /api/traffic/exchange", s.getTrafficExchange)
 	mux.HandleFunc("GET /api/traffic/blob", s.getTrafficBlob)
+	// 运行看护：实时运行状态与用户判断卡片。卡片接口只返回任务内数据，
+	// 不暴露不可用卡片的 worker/queue 细节。
+	mux.HandleFunc("GET /api/watchdog/runs", s.watchdogRuns)
+	mux.HandleFunc("GET /api/watchdog/requests", s.watchdogRequests)
+	mux.HandleFunc("POST /api/watchdog/requests/{id}/decision", s.watchdogDecide)
+	mux.HandleFunc("POST /api/watchdog/requests/{id}/retry", s.watchdogRetry)
 	mux.HandleFunc("GET /api/commands", s.pgListCommands)
 	mux.HandleFunc("GET /api/commands/stats", s.pgToolStats) // 按工具聚合调用次数
 	mux.HandleFunc("GET /api/llm/records", s.pgListLLMRecords)
@@ -3289,7 +3309,7 @@ func (s *Server) settingsPayload() map[string]any {
 	if concLimit == 0 {
 		concLimit = defaultConcurrencyLimit // 关闭时也回显一个合理默认值给 UI
 	}
-	return map[string]any{
+	out := map[string]any{
 		"traffic_capture":          s.m.TrafficEnabled(),
 		"agent_traffic_binding":    s.m.pg.GetBool(settingAgentTrafficBinding, false),
 		"llm_record":               s.m.LLMRecordEnabled(),
@@ -3319,6 +3339,10 @@ func (s *Server) settingsPayload() map[string]any {
 		"notify_public_base_url":     notifyPublicBaseURL(s.m.pg),
 		"notify_digest_interval_min": notifyDigestIntervalMin(s.m.pg),
 	}
+	for key, value := range s.watchdogSettingsPayload() {
+		out[key] = value
+	}
+	return out
 }
 
 // notifyPublicBaseURL 读推送回链用的外部地址。
@@ -3390,10 +3414,38 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		NotifyEnabled    *bool   `json:"notify_enabled"`
 		NotifyBaseURL    *string `json:"notify_public_base_url"`
 		NotifyDigestMins *int    `json:"notify_digest_interval_min"`
+		// Watchdog 配置。阈值只在这里校验一次，运行期直接使用已归一的值。
+		WatchdogEnabled     *bool   `json:"watchdog_enabled"`
+		WatchdogPressureSec *int    `json:"watchdog_pressure_after_sec"`
+		WatchdogSlowPathSec *int    `json:"watchdog_slow_path_after_sec"`
+		WatchdogCycleSec    *int    `json:"watchdog_cycle_after_sec"`
+		WatchdogAgentKey    *string `json:"watchdog_agent_key"`
+		WatchdogAgentRetry  *int    `json:"watchdog_agent_retry_sec"`
+		WorkerRunSeconds    *int    `json:"worker_run_seconds"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
+	}
+	watchdogChanged := req.WatchdogEnabled != nil || req.WatchdogPressureSec != nil || req.WatchdogSlowPathSec != nil ||
+		req.WatchdogCycleSec != nil || req.WatchdogAgentKey != nil || req.WatchdogAgentRetry != nil ||
+		req.WorkerRunSeconds != nil
+	if watchdogChanged {
+		if err := s.applyWatchdogSettings(watchdogSettingsPatch{
+			Enabled:     req.WatchdogEnabled,
+			PressureSec: req.WatchdogPressureSec,
+			SlowPathSec: req.WatchdogSlowPathSec,
+			CycleSec:    req.WatchdogCycleSec,
+			AgentKey:    req.WatchdogAgentKey,
+			AgentRetry:  req.WatchdogAgentRetry,
+			WorkerRun:   req.WorkerRunSeconds,
+		}); err != nil {
+			writeErr(w, 400, err.Error())
+			return
+		}
+		// worker_run_seconds 只在构造任务 agent bundle 时读取；丢弃缓存让下一次运行
+		// 用新阈值。正在执行的 run 保持原预算，避免中途改变已承诺的时限。
+		s.invalidateTaskAgents()
 	}
 	if req.ConstraintsInjectPlanner != nil {
 		if err := s.m.pg.SetBool(settingConstraintsInjectPlanner, *req.ConstraintsInjectPlanner); err != nil {

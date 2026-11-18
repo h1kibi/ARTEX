@@ -1850,6 +1850,19 @@ func (t *Task) NotifyCancelled(intentID int64, summary, reason string) {
 	t.Notify()
 }
 
+// NotifyWatchdogTerminated records that Watchdog stopped one worker and wakes
+// the planner. The event carries the settled state, reason and write counts so
+// the next planning round can decide without re-reading the whole trace.
+func (t *Task) NotifyWatchdogTerminated(ev agent.TriggerEvent) {
+	if ev.Kind != "watchdog_terminated" || ev.IntentID <= 0 {
+		return
+	}
+	t.trigMu.Lock()
+	t.pendingTriggers = append(t.pendingTriggers, ev)
+	t.trigMu.Unlock()
+	t.Notify()
+}
+
 // drainTriggers returns and clears the trigger events accumulated since the last round.
 func (t *Task) drainTriggers() []agent.TriggerEvent {
 	t.trigMu.Lock()

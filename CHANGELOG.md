@@ -4,6 +4,30 @@
 
 ## [Unreleased]
 
+### 运行看护（Watchdog）
+
+#### 新增的功能
+
+- **新增每个运行中 Worker 的运行监控**：`worker_runs` 记录阶段（模型 / 工具 / 审批 / 暂停 / 收尾）、心跳、最后事件、最后一次有效写入、当前周期、Slow Path 状态和租约；`GET /api/watchdog/runs?task_id=` 返回实时状态。有效写入（`record_fact` / `insert_assets` / `report_finding` 成功、最终结果成功）会重置周期。
+- **新增 8 / 10 / 20 分钟 Fast Path**：8 分钟向 Worker 注入压力提示，10 分钟把 Slow Path 快照入队，20 分钟按周期表推进或终止。压力提示来源标记为 `watchdog`，只在下一次工具调用前生效，不重启、不暂停 Worker，审批等待、用户决策卡 open/待应用、任务暂停 / 删除 / 收尾期间跳过。决策卡开放期间不创建新的 Slow Path，迟到的 Slow Path 终止结果只记为历史，不作用到当前运行。
+- **压力提示与心跳语义修正**：Fast Path 每 5 秒刷新 `worker_runs` 的同时同步刷新内存心跳，长工具调用期间 API 和 Watchdog Agent 快照不再显示旧心跳；`worker_run_seconds=0` 在 Watchdog 开启时为不限时，由任务截止时间约束，避免用户连续批准 C4、C5 时被固定周期截断；显式配置仍优先。判断卡写入失败或不可用卡片抑制建卡时，C1/C2/C3+ 在当前周期边界终止，不依赖下一次 5 秒检查。
+- **新增周期状态机**：C0 是唯一静默默认同意的阶段；C1 及以后静默默认终止；C1 同意进入 C2，C2 同意进入 C3，C3 及以后同意进入下一周期；C2 自动绿灯止步并生成 C3 用户请求；C3 及以后每周期生成一次用户请求。一个 run 的一个周期最多一张开放决策卡片。
+- **新增只读 Watchdog Agent**：独立运行器只装配 `get_worker_health`、探索图 / 证据 / 执行过程的只读工具，不装配命令行、文件写入、MCP、自定义工具和技能。提示词要求只输出 JSON 分类（continue / terminate / ask_user / provider_error），并校验分类与建议动作的对应关系。
+- **新增 Slow Path 队列与不可用卡片**：`watchdog_jobs` 按 run + 周期唯一，服务异步消费；单次判断有轮数与墙钟上限，失败保留任务并按配置间隔重试；Watchdog Agent 不可用时只维护一张任务级卡片，展示累积报告数、最早 / 最新告警和自动重试时间，提供 Try again。Watchdog Agent 自身超时、鉴权 / 额度 / 限流 / 5xx / 网络错误进入不可用处理；模型输出 JSON 格式错误只作为失败重试。不可用时关闭已有开放的 worker 判断卡，系统审计只显示当前默认卡片；历史 `watchdog_*` / `provider_error` 记录保留在数据库，恢复后重新显示。
+- **新增用户判断卡片**：`GET /api/watchdog/requests`、`POST /api/watchdog/requests/{id}/decision`、`POST /api/watchdog/requests/{id}/retry`；选择使用条件更新，重复提交返回 409，过期请求只记录不生效。用户明确拒绝统一为 `stopped`，静默默认终止为 `exhausted`；静默结果在卡片上显示“默认结果”，不冒充“用户选择”；C2/C3+ 卡片同时显示同意后的目标周期。系统审计识别 `watchdog_*` 与 `provider_error`，卡片支持继续、终止、查看意图和重跑。
+- **新增 Watchdog 终止**：Fast Path 按 run ID 校验后取消当前 work，等待 Worker 停止写入，写入 `terminal_reason` 和 `watchdog_terminated` 活动，通知 Planner 并保留已登记的事实、资产、漏洞与执行记录。终止后 intent 标记为已停止或预算耗尽，不自动回到待领取，也不自动重跑。
+- **新增供应商错误审计**：模型错误收场时按额度 / 鉴权 / 限流 / 服务端 / 网络 / 超时 / 配置链耗尽分类写入 `provider_error` 活动；这类错误不进入 Slow Path，不生成 Watchdog 用户判断卡片，恢复仍由任务模型链和现有排队逻辑负责。
+
+#### 设计说明
+
+- Fast Path 只做固定规则与计时，Slow Path 只做语义判断，执行动作仍由 Engine 完成；Watchdog Agent 没有任何终止或写图权限。
+- 终止请求同时携带 `run_id` 与周期现场，旧 run / 旧周期的结果只能标记过期，不能作用到新运行。
+- `worker_runs`、`watchdog_jobs`、`watchdog_requests` 都是控制面数据，任务删除 / 归档时随任务清理；进程重启时清理残留运行记录、重新排队未完成判断、过期旧卡片。
+
+#### 配置
+
+`watchdog_enabled` 默认关闭；另外提供 `watchdog_pressure_after_sec`、`watchdog_slow_path_after_sec`、`watchdog_cycle_after_sec`、`watchdog_agent_key`、`watchdog_agent_retry_sec` 和 `worker_run_seconds`。`worker_run_seconds=0` 表示开启 Watchdog 时不限时，由任务截止时间约束；>0 的显式值优先。生产默认保持关闭，自动化测试和人类验收通过设置页或 `/api/settings` 打开。
+
 ## [0.3.15] - 2026-10-07
 
 ### 拦截

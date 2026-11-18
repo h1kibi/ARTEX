@@ -178,6 +178,7 @@ type builtinAgent struct {
 	vars                  []promptVar
 	interactiveShell      bool // 建行时的默认交互式 shell 开关；ON CONFLICT 不覆盖用户后续手动开关
 	runSeconds            *int // 建行时的单次 run 墙钟上限(秒)；nil=用种子默认(1200)，0=不限时
+	maxTurns              *int // 建行时的 max_turns；nil=库默认(0，不限)
 }
 
 type promptVar struct{ name, desc, example, source string }
@@ -193,24 +194,27 @@ var builtinAgents = []builtinAgent{
 		{"EngagementDescription", "任务描述（测试对象/背景）", "测试 example.com 站点", "exploration"},
 		// Now 是全局 runtime 变量(见 server.globalPromptVars),不再在各 agent 目录里
 		// 重复定义,否则 withGlobalVars 追加时会与全局项撞名。
-	}, false, nil},
+	}, false, nil, nil},
 	{"planner", "规划", "planner", "读取态势、判定目标，只在确有未覆盖的新方向时补充探索意图（每任务一个规划循环）。", []promptVar{
 		{"Goal", "任务总目标", "拿下 example.com 的管理员权限", "exploration"},
 		{"AssetSummary", "资产计数/类型分布摘要(可选)", "domain:3 ip:5 site:2", "distilled"},
-	}, false, nil},
+	}, false, nil, nil},
 	{"mainagent", "主", "main", "人机接口：观察进展，把人的意图落成 hint 或高优先级意图。", []promptVar{
 		{"Goal", "当前任务目标", "拿下 example.com 的管理员权限", "exploration"},
 		{"AssetSummary", "开局态势摘要(可选)", "domain:3 ip:5", "distilled"},
 		{"FindingsSummary", "已确认漏洞摘要(可选)", "high:1 medium:2", "distilled"},
-	}, false, nil},
+	}, false, nil, nil},
 	{"worker", "执行", "worker", "领取一条意图执行，把发现的事实/漏洞写回知识图谱后停止。", []promptVar{
 		{"ProxyAddr", "记录代理地址(驱动 if 双文案)", "127.0.0.1:8080", "runtime"},
 		{"WorkerName", "worker 自我标识(可选)", "worker-1", "runtime"},
-	}, false, nil},
+	}, false, nil, nil},
 	// Auto:内置「平台操作」agent。不参与渗透编排循环,经对话页驱动,用工具操作平台。
-	{"auto", "Auto", "assistant", "平台操作助手：用工具管理任务(建/看/暂停/给提示)与资产，并可创建/修改 skill、自定义工具、MCP。", nil, false, nil},
+	{"auto", "Auto", "assistant", "平台操作助手：用工具管理任务(建/看/暂停/给提示)与资产，并可创建/修改 skill、自定义工具、MCP。", nil, false, nil, nil},
 	// 渗透测试:内置「独立渗透」agent。经对话页驱动,一人从侦察到收尾走完整条渗透链,自己规划自己执行自己验证。默认开启交互式 shell。
-	{"pentest", "渗透测试", "assistant", "独立渗透 agent：一人从侦察→找攻击面→深入利用→验证→收尾走完整条链，自己规划、自己执行、自己对抗式验证。", nil, true, intp(0)},
+	{"pentest", "渗透测试", "assistant", "独立渗透 agent：一人从侦察→找攻击面→深入利用→验证→收尾走完整条链，自己规划、自己执行、自己对抗式验证。", nil, true, intp(0), nil},
+	// Watchdog:独立判断运行中的 worker 是否仍在有效推进。只读工具、短预算、不进入聊天页；
+	// 它的输出由 Slow Path 服务解析成分类，执行动作仍由 Engine 完成。
+	{"watchdog", "看护", "assistant", "运行看护：读取 worker 健康状态、执行记录和工具输出，判断继续、终止、交给用户或供应商错误。", nil, false, intp(120), intp(6)},
 }
 
 // seedBuiltins inserts the fixed built-in agents and their variable catalog (idempotent).
@@ -218,10 +222,10 @@ func (d *DB) seedBuiltins() error {
 	for _, a := range builtinAgents {
 		var agentID int64
 		err := d.QueryRow(`
-INSERT INTO agents(key, name, description, role, builtin, enabled, interactive_shell, run_seconds)
-VALUES ($1, $2, NULLIF($3,''), $4, true, true, $5, COALESCE($6, 1200))
+INSERT INTO agents(key, name, description, role, builtin, enabled, interactive_shell, run_seconds, max_turns)
+VALUES ($1, $2, NULLIF($3,''), $4, true, true, $5, COALESCE($6, 1200), COALESCE($7, 0))
 ON CONFLICT (key) DO UPDATE SET name = EXCLUDED.name, description = EXCLUDED.description
-RETURNING id`, a.key, a.name, a.desc, a.role, a.interactiveShell, a.runSeconds).Scan(&agentID)
+RETURNING id`, a.key, a.name, a.desc, a.role, a.interactiveShell, a.runSeconds, a.maxTurns).Scan(&agentID)
 		if err != nil {
 			return fmt.Errorf("agent %s: %w", a.key, err)
 		}

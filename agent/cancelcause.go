@@ -12,6 +12,10 @@ type AbortCause struct {
 	Code  string
 	Short string
 	Text  string
+	// TerminalState is set only for control paths that choose the intent's final
+	// state themselves (currently Watchdog termination). Empty means the caller's
+	// normal settlement branch decides.
+	TerminalState string
 }
 
 func (c *AbortCause) Error() string { return c.Text }
@@ -49,6 +53,10 @@ var (
 		"用户删除了正在运行的 Worker。本次调用被取消；Worker 退出写入区后，服务端按用户选择的删除模式处理该意图——假删除仅标记为已删除并保留全部产出，真删除会级联移除该意图及仅由它支撑的下游节点")
 	AbortWorkFinished = cause("work_finished", "Worker 已正常结束并释放 context",
 		"Worker 已正常结束，引擎在 detachWork 中释放其 context 资源。这不是运行中断；若它出现在中断消息中，说明取消与收场事件发生了竞态")
+	AbortKilledByWatchdog = cause("killed_by_watchdog", "Watchdog 判断该意图不应继续",
+		"Watchdog 判定该意图存在空转、循环、脱离意图或违反要求，Fast Path 已终止本次运行；已写入的事实、资产和漏洞保留，终止原因写入 terminal_reason")
+	AbortWatchdogCycleEnded = cause("watchdog_cycle_ended", "Watchdog 周期预算结束",
+		"该意图的 20 分钟周期在用户静默或没有继续依据时结束，Fast Path 已终止本次运行；已写入的事实、资产和漏洞保留")
 	AbortPausedRaceGuard = cause("paused_race_guard", "任务暂停期间拒绝启动新运行",
 		"任务处于暂停状态时，引擎拒绝发出新的执行 context，用于防止 claim 与暂停之间的竞态导致 Worker 继续启动；已领取的意图会退回 frontier")
 
@@ -66,6 +74,28 @@ var (
 	AbortRunHardTimeout = cause("run_hard_timeout", "单次运行的硬超时兜底已触发",
 		"单次运行超过软墙钟预算及额外宽限，说明模型请求或某个工具长时间没有返回，导致正常的回合边界收尾无法执行。请重点检查中断前最后一个未返回的工具调用")
 )
+
+// WatchdogTermination builds a named cause carrying both the human-visible
+// reason and the final intent state chosen by the Fast Path. The Engine reads
+// these fields when settling the run; the activity trace reads the same cause
+// through AbortReason.
+func WatchdogTermination(reason, terminalState string) *AbortCause {
+	c := *AbortKilledByWatchdog
+	c.Text = reason
+	c.TerminalState = terminalState
+	return &c
+}
+
+// WatchdogCycleEnded is the budget-ended variant: the worker was not doing
+// anything provably wrong, its current cycle simply ran out of user consent or
+// continuation evidence. The intent settles as exhausted, matching the existing
+// max-turns/timeout semantics.
+func WatchdogCycleEnded(reason string) *AbortCause {
+	c := *AbortWatchdogCycleEnded
+	c.Text = reason
+	c.TerminalState = "exhausted"
+	return &c
+}
 
 // AbortReason resolves the named cause attached to a cancelled run context.
 func AbortReason(ctx context.Context) (code, short, text string, ok bool) {

@@ -332,16 +332,27 @@ func TestCompanyScopeAttribution(t *testing.T) {
 	})
 
 	uniq := startMax + 1
-	root := fmt.Sprintf("scopetest%d.com", uniq)
+	stamp := time.Now().UnixNano()
+	root := fmt.Sprintf("scopetest%d-%d.com", uniq, stamp)
 	sub := "api." + root
-	ipIn := "198.51.100.9"
-	ipOut := "203.0.113.9"
-	outDomain := fmt.Sprintf("other%d.net", uniq)
+	// Fixed addresses/domains can already belong to an earlier test's company
+	// (assets and scope rules are global, not per-test). Derive fresh names and a
+	// /24 so insert-time attribution always starts from an unattributed asset.
+	n := int(stamp % 200)
+	cidr := fmt.Sprintf("198.18.%d.0/24", n)
+	ipIn := fmt.Sprintf("198.18.%d.9", n)
+	ipOut := fmt.Sprintf("203.0.113.%d", n+1)
+	outDomain := fmt.Sprintf("other%d-%d.net", uniq, stamp)
 
-	cid, _, err := cs.UpsertCompany(fmt.Sprintf("ScopeCo %d", uniq), "")
+	cid, _, err := cs.UpsertCompany(fmt.Sprintf("ScopeCo %d-%d", uniq, stamp), "")
 	if err != nil {
 		t.Fatalf("UpsertCompany: %v", err)
 	}
+	t.Cleanup(func() {
+		_ = cs.DeleteCompany(cid)
+		_, _ = d.Exec(`DELETE FROM assets WHERE id > $1`, startMax)
+		d.Close()
+	})
 
 	// a pre-existing asset (inserted BEFORE any scope) — must be back-filled.
 	preID, err := as.UpsertSubdomain(UpsertSubdomainReq{Domain: sub})
@@ -354,7 +365,7 @@ func TestCompanyScopeAttribution(t *testing.T) {
 		t.Fatalf("pre-scope asset should be unattributed, got %v", *preCompanyID)
 	}
 
-	cs.AddScope(cid, []string{root, "198.51.100.0/24"}, "unit test")
+	cs.AddScope(cid, []string{root, cidr}, "unit test")
 
 	mustCid := func(id int64, want int64, label string) {
 		var cID *int64

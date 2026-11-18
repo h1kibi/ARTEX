@@ -16,6 +16,7 @@ import (
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/harness"
 	"github.com/Autumn-27/norma/llm"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -94,7 +95,8 @@ type Engine struct {
 	m        *Manager
 	debounce time.Duration
 
-	bc *Broadcaster // live activity pub/sub (SSE)
+	bc      *Broadcaster // live activity pub/sub (SSE)
+	monitor *RunMonitor  // per-intent live phases/cycles (nil in lightweight tests)
 
 	started  sync.Map // taskID -> bool, so Run is idempotent per task
 	lastAct  sync.Map // taskID -> int64 unix, last planner/worker activity (heartbeat)
@@ -132,7 +134,7 @@ type Engine struct {
 	// id). The worker's PreToolUse hook drains it before its next tool call and hands
 	// the message to the model (blocking that call) so it re-plans — no kill needed.
 	steerMu  sync.Mutex
-	steerBox map[int64][]string
+	steerBox map[int64][]steerMessage
 
 	plannerRound sync.Map // taskID -> int, planner round counter (for UI round separators)
 
@@ -162,7 +164,11 @@ type taskRuntime struct {
 type workExecution struct {
 	cancel context.CancelCauseFunc
 	done   chan error
-	action string // user action: pause | cancel
+	action string // user action: pause | cancel | watchdog
+	runID  string // stable run identity; a stale Watchdog action must not hit a newer run
+	// watchdogResult is filled by runIntent before it signals done, so the caller
+	// that asked for termination can return the settled state and write counts.
+	watchdogResult *TerminationResult
 }
 
 // nextPlannerRound returns the next planner round number for a task (1-based).
@@ -177,6 +183,9 @@ func (e *Engine) nextPlannerRound(taskID string) int {
 // for it (a long worker.Execute would otherwise keep going until it finishes).
 func (e *Engine) Pause(taskID string, cause error) {
 	e.paused.Store(taskID, true)
+	if e.monitor != nil {
+		e.monitor.PauseTask(taskID)
+	}
 	e.cancelExec(taskID, cause)
 }
 
@@ -192,6 +201,9 @@ func (e *Engine) BeginDelete(taskID string) bool {
 	}
 	e.paused.Store(taskID, true)
 	e.deleteMu.Unlock()
+	if e.monitor != nil {
+		e.monitor.SettlingTask(taskID)
+	}
 	e.cancelExec(taskID, agent.AbortTaskDeleted)
 	return true
 }
@@ -259,6 +271,9 @@ func (e *Engine) StopTask(taskID string) {
 	if rt != nil {
 		rt.wg.Wait()
 	}
+	if e.monitor != nil {
+		e.monitor.FinishTask(taskID, db.WorkerRunStateAbandoned)
+	}
 
 	e.execMu.Lock()
 	if cancel := e.execCancel[taskID]; cancel != nil {
@@ -316,6 +331,9 @@ func (e *Engine) Resume(t *Task) {
 		return
 	}
 	e.paused.Delete(t.ID)
+	if e.monitor != nil {
+		e.monitor.ResumeTask(t.ID)
+	}
 	t.Notify()
 }
 
@@ -389,14 +407,24 @@ func (e *Engine) touch(taskID string) { e.lastAct.Store(taskID, time.Now().Unix(
 func NewEngine(m *Manager) *Engine {
 	return &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
 		execCancel: map[string]context.CancelCauseFunc{}, execCtx: map[string]context.Context{},
-		work: map[int64]*workExecution{}, steerBox: map[int64][]string{},
+		work: map[int64]*workExecution{}, steerBox: map[int64][]steerMessage{},
 		runtimes: map[string]*taskRuntime{}}
 }
 
+// SetRunMonitor installs the per-intent run monitor. Called once at server
+// construction, before any task loop starts; lightweight tests may leave it nil.
+func (e *Engine) SetRunMonitor(m *RunMonitor) { e.monitor = m }
+
 // registerWork records the cancel for the work currently running intentID.
 func (e *Engine) registerWork(intentID int64, cancel context.CancelCauseFunc) {
+	e.registerWorkRun(intentID, "", cancel)
+}
+
+// registerWorkRun is registerWork with the run identity Watchdog uses to reject
+// a stale termination aimed at an earlier run of the same intent.
+func (e *Engine) registerWorkRun(intentID int64, runID string, cancel context.CancelCauseFunc) {
 	e.workMu.Lock()
-	e.work[intentID] = &workExecution{cancel: cancel, done: make(chan error, 1)}
+	e.work[intentID] = &workExecution{cancel: cancel, done: make(chan error, 1), runID: runID}
 	e.workMu.Unlock()
 }
 
@@ -491,8 +519,49 @@ func transitionIntentState(store *db.ExplorationStore, intentID int64, expected,
 // planner's steer_work tool). The worker delivers it before its next tool call and
 // re-plans — no kill. Errors if no work is currently running that intent.
 func (e *Engine) SteerWork(intentID int64, msg string) error {
+	return e.SteerWorkFrom(intentID, "planner", msg)
+}
+
+// steerMessage carries who injected a course-correction. The source decides the
+// prefix rendered before the next tool call; a Watchdog pressure prompt must not
+// masquerade as a planner instruction.
+type steerMessage struct {
+	Text   string
+	Source string
+}
+
+func steerPrefix(source string) string {
+	switch source {
+	case "mainagent":
+		return "【主 Agent 指令】"
+	case "watchdog":
+		return "【Watchdog 产出提示】"
+	default:
+		return "【规划者实时纠偏】"
+	}
+}
+
+func steerSuffix(source string) string {
+	switch source {
+	case "mainagent":
+		return "\n（这是主 Agent 对本意图的即时指令；本次工具调用未执行，请据此调整下一步。）"
+	case "watchdog":
+		return "\n（这是平台看护对本意图的运行提示，不改变授权范围；本次工具调用未执行，请据此调整下一步。）"
+	default:
+		return "\n（这是规划者对本意图的即时指令；本次工具调用未执行，请据此调整下一步。若与你当前打算冲突，以此为准。）"
+	}
+}
+
+// SteerWorkFrom queues a course-correction tagged with its source (planner,
+// mainagent or watchdog). The worker drains it before its next tool call.
+func (e *Engine) SteerWorkFrom(intentID int64, source, msg string) error {
 	if strings.TrimSpace(msg) == "" {
 		return fmt.Errorf("纠偏消息不能为空")
+	}
+	switch source {
+	case "planner", "mainagent", "watchdog":
+	default:
+		return fmt.Errorf("不支持的调整来源 %q", source)
 	}
 	e.workMu.Lock()
 	running := e.work[intentID] != nil
@@ -501,18 +570,18 @@ func (e *Engine) SteerWork(intentID int64, msg string) error {
 		return fmt.Errorf("意图 %d 当前没有运行中的 work（可能已结束或未被领取）", intentID)
 	}
 	e.steerMu.Lock()
-	e.steerBox[intentID] = append(e.steerBox[intentID], msg)
+	e.steerBox[intentID] = append(e.steerBox[intentID], steerMessage{Text: msg, Source: source})
 	e.steerMu.Unlock()
 	return nil
 }
 
 // drainSteer pops the oldest queued steering message for intentID (FIFO), if any.
-func (e *Engine) drainSteer(intentID int64) (string, bool) {
+func (e *Engine) drainSteer(intentID int64) (steerMessage, bool) {
 	e.steerMu.Lock()
 	defer e.steerMu.Unlock()
 	q := e.steerBox[intentID]
 	if len(q) == 0 {
-		return "", false
+		return steerMessage{}, false
 	}
 	msg := q[0]
 	if len(q) == 1 {
@@ -530,7 +599,7 @@ func (e *Engine) drainSteer(intentID int64) (string, bool) {
 // 它同时负责「空转回合」的续跑，见 Stop。
 type steerHooks struct {
 	inner harness.HookRunner
-	drain func() (string, bool)
+	drain func() (steerMessage, bool)
 	// nudges 是本条意图已注入的空转续跑次数，上限 limit。指针:harness 持有的是
 	// steerHooks 的值拷贝，计数必须共享同一份。
 	nudges *atomic.Int64
@@ -577,8 +646,7 @@ func isThinkingOnlyTurn(messages []llm.Message) bool {
 
 func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
 	if msg, ok := h.drain(); ok {
-		return true, "【规划者实时纠偏】" + msg +
-			"\n（这是规划者对本意图的即时指令；本次工具调用未执行，请据此调整下一步。若与你当前打算冲突，以此为准。）", nil
+		return true, steerPrefix(msg.Source) + msg.Text + steerSuffix(msg.Source), nil
 	}
 	if h.inner != nil {
 		return h.inner.PreToolUse(ctx, name, input)
@@ -920,6 +988,9 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 			return
 		default:
 		}
+		if e.monitor != nil {
+			e.monitor.HeartbeatTask(t.ID)
+		}
 		_, worker := e.snapshotFor(t)
 		if worker == nil {
 			if sleepCtx(ctx, 1500*time.Millisecond) {
@@ -983,7 +1054,6 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	hasChatMessage := message != ""
 	e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 	e.touch(t.ID)
-	emit := func(r db.Activity) { e.emitActivity(t, r) }
 	ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
 	if ectx.Err() != nil || e.IsDeleting(t.ID) {
 		if err := transitionIntentState(t.Store, intent.ID, "running", "open"); err != nil {
@@ -991,9 +1061,20 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		}
 		return true
 	}
+	runID := "run-" + uuid.NewString()
+	emit := func(r db.Activity) {
+		e.emitActivity(t, r)
+		if e.monitor != nil {
+			e.monitor.Observe(runID, r)
+		}
+	}
+	if e.monitor != nil {
+		e.monitor.Register(t.ID, intent.ID, runID, name)
+		defer e.monitor.Finish(runID, db.WorkerRunStateFinished)
+	}
 	// per-work child context so the planner's kill_work can stop just this work.
 	workCtx, workCancel := context.WithCancelCause(ectx)
-	e.registerWork(intent.ID, workCancel)
+	e.registerWorkRun(intent.ID, runID, workCancel)
 	// wrap the guard hooks so steer_work can inject a mid-run course-correction
 	// for THIS intent (drained before the worker's next tool call).
 	iid := intent.ID
@@ -1008,12 +1089,15 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// 重跑一轮不该把额度清零重来。
 	hooks := steerHooks{
 		inner:  t.Guard.Hooks(),
-		drain:  func() (string, bool) { return e.drainSteer(iid) },
+		drain:  func() (steerMessage, bool) { return e.drainSteer(iid) },
 		nudges: &atomic.Int64{},
 		limit:  e.emptyTurnNudgeLimit(),
 		label:  label,
 	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	if e.monitor != nil {
+		e.monitor.Phase(runID, db.WorkerRunPhaseLLM, "")
+	}
 	e.BeginLLMCall(t.ID)
 	var reason harness.TerminalReason
 	var wrote agent.WriteCounts
@@ -1024,6 +1108,14 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
 	}
 	e.EndLLMCall(t.ID)
+	// Provider failures during the retry/backoff window are not Watchdog stalls.
+	// Mark the hot-path state immediately; the final provider_error audit is still
+	// emitted only after the configured retry chain is exhausted.
+	if e.monitor != nil && retryableWorkerModelError(reason, err) {
+		if kind := classifyProviderError(err); kind != "" {
+			e.monitor.SetProviderError(runID, kind)
+		}
+	}
 	// model_error 收场 → 额外重跑几次（退避后再试）。仅在意图仍属本 work、任务
 	// 未暂停/未终止/未取消【且未进入收尾】时重试；否则让位给对应分支处理(收尾期不
 	// 再重试,避免退避挤占其他 worker 的优雅收尾窗口)。
@@ -1035,6 +1127,9 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 			name, t.ID, intent.ID, retryBackoff, attempt, maxRetries)
 		if sleepCtx(workCtx, retryBackoff) {
 			break // 退避期间被取消（终止/暂停）→ 交给下方分支处理
+		}
+		if e.monitor != nil {
+			e.monitor.Phase(runID, db.WorkerRunPhaseLLM, "")
 		}
 		e.BeginLLMCall(t.ID)
 		if hasChatMessage {
@@ -1051,6 +1146,16 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// work would be wrongly marked stopped.
 	workCause := context.Cause(workCtx)
 	killed := workCtx.Err() != nil && ectx.Err() == nil
+	if wd := watchdogAbortCause(workCause); wd != nil {
+		_, settled := e.settleWatchdogTermination(t, name, intent, runID, wd)
+		_, completeWork := e.detachWork(intent.ID)
+		if !settled {
+			completeWork(fmt.Errorf("%w: 意图 %d 终止时状态已被其他路径修改", errWorkControlConflict, intent.ID))
+		} else {
+			completeWork(nil)
+		}
+		return true
+	}
 	action, completeWork := e.detachWork(intent.ID)
 	// A caller may stop waiting and release its in-memory reservation before the
 	// agent honors cancellation. The named context cause remains authoritative and
@@ -1129,6 +1234,22 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	if err != nil {
 		log.Printf("[worker %s] intent %d: %v", name, intent.ID, err)
+		// Only the model-error terminal reason denotes a provider failure. A tool
+		// error whose text happens to mention "timeout" or "status 500" belongs to
+		// the target, not to the LLM chain.
+		if kind := classifyProviderError(err); kind != "" && reason == harness.ReasonModelError {
+			if e.monitor != nil {
+				e.monitor.SetProviderError(runID, kind)
+			}
+			e.emitActivity(t, db.Activity{
+				Worker: "system", Kind: "provider_error", IsError: true,
+				Summary: fmt.Sprintf("%s：%s", providerErrorSummary(kind), firstLine(err.Error(), 200)),
+				Detail:  err.Error(),
+				Metadata: marshalWatchdogMetadata(watchdogAudit{
+					ProviderKind: kind, State: "blocked", Phase: "llm", Reason: err.Error(),
+				}),
+			})
+		}
 	}
 	// terminal分流：撞步数上限 ≠ 完成。max_turns→exhausted（规划者据此知道这个方向
 	// 试过但没真正做完、需换角度，而非当成已覆盖永久跳过）；出错→blocked；正常→done。

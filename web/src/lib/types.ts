@@ -422,6 +422,7 @@ export interface TaskNode {
   source_task_id?: string;
   inherited?: boolean;
   delete_reason?: string; // 意图假删除(state='deleted')时的删除原因
+  terminal_reason?: string; // Watchdog 终止/周期预算结束的原因
 }
 
 // 播报板一页:按创建顺序分页的节点 + 这一页涉及的边 + 边另一端的节点(refs,按 id 索引),
@@ -627,7 +628,15 @@ export type ActivityKind =
   | "usage" // live cumulative token usage (per model turn); not rendered
   | "llm_switch" // automatic/manual task-level LLM switch
   | "llm_failover" // task-level provider switch / chain exhaustion audit event
-  | "intercept_request"; // user-approval request from the intercept layer
+  | "intercept_request" // user-approval request from the intercept layer
+  | "watchdog_pressure" // Fast Path injected the 8-minute pressure prompt
+  | "watchdog_cycle" // a worker's cycle advanced or a request was generated
+  | "watchdog_report" // Slow Path judgment summary and evidence
+  | "watchdog_ask" // a user decision card is open
+  | "watchdog_unavailable" // Watchdog Agent is unavailable; its queue is retained
+  | "watchdog_decision" // the user's choice on a decision card
+  | "watchdog_terminated" // Fast Path terminated one worker
+  | "provider_error"; // final provider failure after the task model chain gave up
 
 // ChatAttachment 是一次上传的文件:path 相对该会话/任务工作目录(即 agent 的 CWD)。
 export interface ChatAttachment {
@@ -650,6 +659,7 @@ export interface Activity {
   detail?: string;
   metadata?: {
     llm_transition?: LLMTransition;
+    watchdog?: WatchdogActivityMeta;
   };
   source_task_id?: string;
   inherited?: boolean;
@@ -659,6 +669,80 @@ export interface Activity {
   output_tokens?: number;
   cache_read_tokens?: number;
   cache_write_tokens?: number;
+}
+
+// WatchdogActivityMeta is the structured payload attached to watchdog_* and
+// provider_error activities. It is intentionally small: the summary/detail carry
+// the human-readable text, this only drives the card fields.
+export interface WatchdogActivityMeta {
+  classification?: string; // continue | terminate | ask_user | provider_error
+  cycle_no?: number;
+  state?: string; // stopped | exhausted | blocked | answer value
+  reason?: string;
+  last_output_at?: string;
+  phase?: string;
+  facts?: number;
+  assets?: number;
+  findings?: number;
+  request_id?: number;
+  alert_count?: number;
+  provider_kind?: string;
+  evidence?: string[];
+}
+
+export interface WatchdogRun {
+  task_id: string;
+  intent_id: number;
+  run_id: string;
+  worker_name: string;
+  phase: string; // idle | llm | tool | approval | paused | settling
+  phase_started_at?: string;
+  heartbeat_at?: string;
+  last_event_at?: string;
+  last_output_at?: string;
+  cycle_start?: string;
+  cycle_no: number;
+  pressure_sent: boolean;
+  slow_path_state: string; // none | queued | running | done | failed | stale
+  decision_state: string; // none | open | answered | expired
+  state: string;
+  tool?: string;
+  facts: number;
+  assets: number;
+  findings: number;
+  provider_error?: string;
+  slow_path_class?: string;
+  slow_path_summary?: string;
+}
+
+// WatchdogRequest is one system-audit card. watchdog_ask carries the user
+// decision fields; watchdog_unavailable carries only the queue aggregates.
+export interface WatchdogRequest {
+  id: number;
+  task_id: string;
+  intent_id?: number;
+  run_id?: string;
+  cycle_no: number;
+  kind: "watchdog_ask" | "watchdog_unavailable";
+  status: "open" | "answered" | "expired" | "superseded" | "cancelled";
+  question: string;
+  evidence?: Record<string, unknown>;
+  options?: string[];
+  answer?: string;
+  answer_reason?: string;
+  answered_at?: string;
+  deadline_at?: string;
+  hard_deadline_at?: string;
+  default_rule?: "c0_continue" | "c1_plus_terminate";
+  alert_count?: number;
+  first_alert_at?: string;
+  last_alert_at?: string;
+  auto_retry_sec?: number;
+  next_retry_at?: string;
+  attempts?: number;
+  last_error?: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface LLMAuditProfile {
@@ -947,6 +1031,14 @@ export interface Settings {
   notify_enabled?: boolean; // 推送总开关，默认开；用于维护期一键止血
   notify_public_base_url?: string; // 漏洞详情回链的外部访问地址；空=消息不带回链
   notify_digest_interval_min?: number; // 汇总模式周期（分钟），默认 30
+  // ---- 运行看护（Watchdog）----
+  watchdog_enabled?: boolean; // 生产默认关；打开后启用 8/10/20 分钟规则与 Slow Path
+  watchdog_pressure_after_sec?: number; // 8 分钟压力提示
+  watchdog_slow_path_after_sec?: number; // 10 分钟慢速判断
+  watchdog_cycle_after_sec?: number; // 20 分钟周期处理
+  watchdog_agent_key?: string; // 慢速判断使用的 Agent key，默认 watchdog
+  watchdog_agent_retry_sec?: number; // Agent 不可用后的自动重试间隔，默认 300
+  worker_run_seconds?: number; // >0 时覆盖 worker 单次运行时限；0=沿用 Agent 配置
 }
 
 // ---- 漏洞 IM 推送 ----

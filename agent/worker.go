@@ -148,6 +148,10 @@ func (w *Worker) SetRunTimeout(run time.Duration) {
 	w.runTimeout = run
 }
 
+// RunTimeout returns the effective per-intent wall-clock budget. Zero means
+// unlimited, which is what Watchdog uses when worker_run_seconds=0.
+func (w *Worker) RunTimeout() time.Duration { return w.runTimeout }
+
 // settleWrapUpPrompt is injected by the SDK settlement phase when a worker hits its
 // turn/time budget: stop probing, write back what was found, then end with a
 // plain-text one-liner (which becomes this run's displayed result).

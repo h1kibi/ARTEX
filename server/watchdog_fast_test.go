@@ -1,0 +1,514 @@
+package server
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/db"
+)
+
+func TestDecideCycleTable(t *testing.T) {
+	cases := []struct {
+		name         string
+		cycle        int
+		signal       cycleSignal
+		answer       cycleAnswer
+		action       cycleAction
+		next         int
+		terminal     string
+		defaultRule  string
+		requestCycle bool
+	}{
+		{"C0 绿灯进入 C1", 0, cycleSignalGreen, cycleAnswerNone, cycleActionNext, 1, "", "", false},
+		{"C0 用户请求静默默认同意", 0, cycleSignalAsk, cycleAnswerNone, cycleActionNext, 1, "", "", false},
+		{"C0 用户同意进入 C1", 0, cycleSignalAsk, cycleAnswerYes, cycleActionNext, 1, "", "", false},
+		{"C0 用户拒绝终止", 0, cycleSignalAsk, cycleAnswerNo, cycleActionTerminate, 0, "stopped", "", false},
+		{"C0 慢速终止", 0, cycleSignalTerminate, cycleAnswerNone, cycleActionTerminate, 0, "stopped", "", false},
+		{"C0 无信号终止", 0, cycleSignalNone, cycleAnswerNone, cycleActionTerminate, 0, "exhausted", "", false},
+		{"C1 绿灯进入 C2", 1, cycleSignalGreen, cycleAnswerNone, cycleActionNext, 2, "", "", false},
+		{"C1 用户同意进入 C2", 1, cycleSignalAsk, cycleAnswerYes, cycleActionNext, 2, "", "", false},
+		{"C1 用户静默终止", 1, cycleSignalAsk, cycleAnswerNone, cycleActionTerminate, 0, "exhausted", "", false},
+		{"C1 用户拒绝终止", 1, cycleSignalAsk, cycleAnswerNo, cycleActionTerminate, 0, "stopped", "", false},
+		{"C1 慢速终止", 1, cycleSignalTerminate, cycleAnswerNone, cycleActionTerminate, 0, "stopped", "", false},
+		{"C1 无信号终止", 1, cycleSignalNone, cycleAnswerNone, cycleActionTerminate, 0, "exhausted", "", false},
+		{"C2 绿灯止步生成 C3 请求", 2, cycleSignalGreen, cycleAnswerNone, cycleActionRequest, 3, "", "c1_plus_terminate", true},
+		{"C2 用户同意进入 C3", 2, cycleSignalAsk, cycleAnswerYes, cycleActionNext, 3, "", "", false},
+		{"C2 用户静默终止", 2, cycleSignalAsk, cycleAnswerNone, cycleActionTerminate, 0, "exhausted", "", false},
+		{"C2 用户拒绝终止", 2, cycleSignalAsk, cycleAnswerNo, cycleActionTerminate, 0, "stopped", "", false},
+		{"C2 慢速终止", 2, cycleSignalTerminate, cycleAnswerNone, cycleActionTerminate, 0, "stopped", "", false},
+		{"C2 无信号终止", 2, cycleSignalNone, cycleAnswerNone, cycleActionTerminate, 0, "exhausted", "", false},
+		{"C3 绿灯生成下一周期请求", 3, cycleSignalGreen, cycleAnswerNone, cycleActionRequest, 4, "", "c1_plus_terminate", true},
+		{"C3 用户同意进入 C4", 3, cycleSignalAsk, cycleAnswerYes, cycleActionNext, 4, "", "", false},
+		{"C3 用户静默终止", 3, cycleSignalAsk, cycleAnswerNone, cycleActionTerminate, 0, "exhausted", "", false},
+		{"C3 用户拒绝终止", 3, cycleSignalAsk, cycleAnswerNo, cycleActionTerminate, 0, "stopped", "", false},
+		{"C3 慢速终止", 3, cycleSignalTerminate, cycleAnswerNone, cycleActionTerminate, 0, "stopped", "", false},
+		{"C3 无信号终止", 3, cycleSignalNone, cycleAnswerNone, cycleActionTerminate, 0, "exhausted", "", false},
+		{"C5 绿灯生成下一周期请求", 5, cycleSignalGreen, cycleAnswerNone, cycleActionRequest, 6, "", "c1_plus_terminate", true},
+		{"C5 用户同意进入 C6", 5, cycleSignalAsk, cycleAnswerYes, cycleActionNext, 6, "", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := decideCycle(tc.cycle, tc.signal, tc.answer)
+			if got.Action != tc.action || got.NextCycle != tc.next || got.TerminalState != tc.terminal {
+				t.Fatalf("decision=%+v want action=%s next=%d terminal=%s", got, tc.action, tc.next, tc.terminal)
+			}
+			if tc.defaultRule != "" && got.DefaultRule != tc.defaultRule {
+				t.Fatalf("default rule=%q want %q", got.DefaultRule, tc.defaultRule)
+			}
+			if tc.requestCycle && got.RequestKind == "" {
+				t.Fatal("request action missing request kind")
+			}
+		})
+	}
+}
+
+func TestWatchdogFastPressureOnceAndSlowPathQueue(t *testing.T) {
+	m, task, intent := testWatchdogTask(t)
+	now := time.Now()
+	s := newAdmissionTestServer(m, nil)
+	s.watchdog = newWatchdogRuntime(s, func() time.Time { return now })
+	monitor := s.watchdog.monitor
+	s.engine.SetRunMonitor(monitor)
+	keys := []string{settingWatchdogEnabled, settingWatchdogPressureSec, settingWatchdogSlowPathSec, settingWatchdogCycleSec}
+	previous := map[string]string{}
+	present := map[string]bool{}
+	for _, key := range keys {
+		if old, ok, _ := m.pg.GetSetting(key); ok {
+			previous[key], present[key] = old, true
+		}
+	}
+	t.Cleanup(func() {
+		for _, key := range keys {
+			if present[key] {
+				_ = m.pg.SetSetting(key, previous[key])
+			} else {
+				_, _ = m.pg.Exec(`DELETE FROM settings WHERE key=$1`, key)
+			}
+		}
+	})
+	for key, value := range map[string]string{
+		settingWatchdogEnabled:     "true",
+		settingWatchdogPressureSec: "1",
+		settingWatchdogSlowPathSec: "2",
+		settingWatchdogCycleSec:    "10",
+	} {
+		if err := m.pg.SetSetting(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runID := "run-fast-pressure"
+	monitor.Register(task.ID, intent.ID, runID, "work#1")
+	_, cancel := context.WithCancelCause(context.Background())
+	s.engine.registerWorkRun(intent.ID, runID, cancel)
+	defer func() {
+		_, complete := s.engine.detachWork(intent.ID)
+		complete(nil)
+	}()
+
+	now = now.Add(2 * time.Second)
+	if cfg := s.watchdogConfig(); !cfg.Enabled {
+		t.Fatalf("watchdog config not enabled: %+v", cfg)
+	}
+	if snap := monitor.Lookup(intent.ID); snap == nil || !snap.CycleStart.Equal(now.Add(-2*time.Second)) {
+		t.Fatalf("pre-tick snapshot=%+v", snap)
+	}
+	s.watchdog.fast.Tick(context.Background())
+	msg, ok := s.engine.drainSteer(intent.ID)
+	if !ok || msg.Source != "watchdog" || msg.Text != watchdogPressureText {
+		t.Fatalf("pressure steer=%+v ok=%v snap=%+v", msg, ok, monitor.Lookup(intent.ID))
+	}
+	if snap := monitor.Lookup(intent.ID); snap == nil || !snap.PressureSent || snap.SlowPathState != db.SlowPathQueued {
+		t.Fatalf("run after pressure=%+v", snap)
+	}
+	s.watchdog.fast.Tick(context.Background())
+	if _, ok := s.engine.drainSteer(intent.ID); ok {
+		t.Fatal("pressure prompt was delivered twice in one cycle")
+	}
+	job, err := m.pg.WatchdogJobByCycle(context.Background(), runID, 0)
+	if err != nil || job == nil {
+		t.Fatalf("slow path job=%+v err=%v", job, err)
+	}
+}
+
+func TestWatchdogCycleResetReleasesJobKey(t *testing.T) {
+	m, task, intent := testWatchdogTask(t)
+	now := time.Now()
+	s := newAdmissionTestServer(m, nil)
+	s.watchdog = newWatchdogRuntime(s, func() time.Time { return now })
+	monitor := s.watchdog.monitor
+	s.engine.SetRunMonitor(monitor)
+	monitor.SetCycleResetHook(s.watchdogOnCycleReset)
+	runID := "run-cycle-reset"
+	monitor.Register(task.ID, intent.ID, runID, "work#1")
+	start := now
+	job := &db.WatchdogJob{TaskID: task.ID, IntentID: intent.ID, RunID: runID, CycleNo: 0,
+		CycleStart: &start, Snapshot: []byte(`{"summary":"old cycle"}`)}
+	if _, _, err := m.pg.EnqueueWatchdogJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	monitor.SetSlowPath(runID, db.SlowPathQueued, "", "", nil, 0)
+	// An effective write resets the run to a fresh C0 at a new start. The old
+	// (run, cycle) row must be removed, or the new 10-minute job is suppressed.
+	now = now.Add(time.Minute)
+	monitor.Observe(runID, db.Activity{Kind: "tool_result", Tool: "record_fact", Detail: `{"id":1}`})
+	if old, err := m.pg.WatchdogJobByCycle(context.Background(), runID, 0); err != nil || old != nil {
+		t.Fatalf("old cycle job survived reset: %+v err=%v", old, err)
+	}
+	newStart := now
+	newJob := &db.WatchdogJob{TaskID: task.ID, IntentID: intent.ID, RunID: runID, CycleNo: 0,
+		CycleStart: &newStart, Snapshot: []byte(`{"summary":"new cycle"}`)}
+	if _, created, err := m.pg.EnqueueWatchdogJob(context.Background(), newJob); err != nil || !created {
+		t.Fatalf("new cycle job was suppressed: created=%v err=%v", created, err)
+	}
+}
+
+func TestWatchdogFastSkipsPressureAndSlowPathWhileDecisionOpen(t *testing.T) {
+	m, task, intent := testWatchdogTask(t)
+	now := time.Now()
+	s := newAdmissionTestServer(m, nil)
+	s.watchdog = newWatchdogRuntime(s, func() time.Time { return now })
+	monitor := s.watchdog.monitor
+	s.engine.SetRunMonitor(monitor)
+	keys := []string{settingWatchdogEnabled, settingWatchdogPressureSec, settingWatchdogSlowPathSec, settingWatchdogCycleSec}
+	previous := map[string]string{}
+	present := map[string]bool{}
+	for _, key := range keys {
+		if old, ok, _ := m.pg.GetSetting(key); ok {
+			previous[key], present[key] = old, true
+		}
+	}
+	t.Cleanup(func() {
+		for _, key := range keys {
+			if present[key] {
+				_ = m.pg.SetSetting(key, previous[key])
+			} else {
+				_, _ = m.pg.Exec(`DELETE FROM settings WHERE key=$1`, key)
+			}
+		}
+	})
+	for key, value := range map[string]string{
+		settingWatchdogEnabled:     "true",
+		settingWatchdogPressureSec: "1",
+		settingWatchdogSlowPathSec: "2",
+		settingWatchdogCycleSec:    "10",
+	} {
+		if err := m.pg.SetSetting(key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	runID := "run-decision-open"
+	monitor.Register(task.ID, intent.ID, runID, "work#1")
+	_, cancel := context.WithCancelCause(context.Background())
+	s.engine.registerWorkRun(intent.ID, runID, cancel)
+	defer func() {
+		_, complete := s.engine.detachWork(intent.ID)
+		complete(nil)
+	}()
+	monitor.SetCycle(runID, 0, now, false, db.SlowPathNone, db.WatchdogDecisionOpen)
+
+	now = now.Add(3 * time.Second)
+	s.watchdog.fast.Tick(context.Background())
+	if _, ok := s.engine.drainSteer(intent.ID); ok {
+		t.Fatal("pressure prompt was injected while a decision card was open")
+	}
+	if job, err := m.pg.WatchdogJobByCycle(context.Background(), runID, 0); err != nil || job != nil {
+		t.Fatalf("slow path job was created while a decision card was open: %+v err=%v", job, err)
+	}
+
+	monitor.SetDecisionState(runID, db.WatchdogDecisionAnswered)
+	now = now.Add(3 * time.Second)
+	s.watchdog.fast.Tick(context.Background())
+	if _, ok := s.engine.drainSteer(intent.ID); ok {
+		t.Fatal("pressure prompt was injected while a decision was pending")
+	}
+	if job, err := m.pg.WatchdogJobByCycle(context.Background(), runID, 0); err != nil || job != nil {
+		t.Fatalf("slow path job was created while a decision was pending: %+v err=%v", job, err)
+	}
+
+	for _, cycle := range []int{2, 3} {
+		monitor.SetCycle(runID, cycle, now, false, db.SlowPathNone, db.WatchdogDecisionOpen)
+		now = now.Add(3 * time.Second)
+		s.watchdog.fast.Tick(context.Background())
+		if _, ok := s.engine.drainSteer(intent.ID); ok {
+			t.Fatalf("C%d pressure prompt was injected while a decision card was open", cycle)
+		}
+		if job, err := m.pg.WatchdogJobByCycle(context.Background(), runID, cycle); err != nil || job != nil {
+			t.Fatalf("C%d slow path job was created while a decision card was open: %+v err=%v", cycle, job, err)
+		}
+	}
+}
+
+func TestWatchdogUnavailableAtCycleBoundaryAppliesDefault(t *testing.T) {
+	cases := []struct {
+		name       string
+		cycle      int
+		slowClass  string
+		wantCycle  int
+		terminated bool
+	}{
+		{"C0 ask_user silently enters C1", 0, "ask_user", 1, false},
+		{"C1 ask_user terminates on silence", 1, "ask_user", 1, true},
+		{"C2 green cannot ask, terminates", 2, "continue", 2, true},
+		{"C3 green cannot ask, terminates", 3, "continue", 3, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m, task, intent := testWatchdogTask(t)
+			now := time.Now()
+			s := newAdmissionTestServer(m, nil)
+			s.watchdog = newWatchdogRuntime(s, func() time.Time { return now })
+			monitor := s.watchdog.monitor
+			s.engine.SetRunMonitor(monitor)
+			runID := "run-unavailable-boundary"
+			monitor.Register(task.ID, intent.ID, runID, "work#1")
+			monitor.SetCycle(runID, tc.cycle, now, false, db.SlowPathNone, db.WatchdogDecisionNone)
+			monitor.SetSlowPath(runID, db.SlowPathDone, tc.slowClass, "fixture", nil, tc.cycle)
+			if _, err := m.pg.CreateOrUpdateWatchdogUnavailable(t.Context(), task.ID,
+				"Watchdog Agent 不可用", 1, &now, &now, &now); err != nil {
+				t.Fatal(err)
+			}
+			workCtx, cancel := context.WithCancelCause(context.Background())
+			s.engine.registerWorkRun(intent.ID, runID, cancel)
+			done := make(chan struct{})
+			if tc.terminated {
+				go func() {
+					defer close(done)
+					<-workCtx.Done()
+					cause, _ := context.Cause(workCtx).(*agent.AbortCause)
+					if cause != nil {
+						s.engine.settleWatchdogTermination(task, "work#1", intent, runID, cause)
+					}
+					_, complete := s.engine.detachWork(intent.ID)
+					complete(nil)
+				}()
+			} else {
+				defer func() {
+					cancel(nil)
+					_, complete := s.engine.detachWork(intent.ID)
+					complete(nil)
+				}()
+			}
+
+			snap := monitor.Lookup(intent.ID)
+			if snap == nil {
+				t.Fatal("run disappeared")
+			}
+			cfg := watchdogConfig{Enabled: true, CycleAfter: 20 * time.Minute, AgentRetry: time.Minute}
+			s.watchdog.fast.processCycle(t.Context(), task, *snap, cfg)
+
+			if tc.terminated {
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("cycle boundary did not settle the worker")
+				}
+				node, err := task.Store.GetNode(intent.ID)
+				if err != nil || node == nil || node.State != "exhausted" {
+					t.Fatalf("terminated intent=%+v err=%v, want exhausted", node, err)
+				}
+			} else if got := monitor.Lookup(intent.ID); got == nil || got.CycleNo != tc.wantCycle {
+				t.Fatalf("C0 silent consent cycle=%+v, want C%d", got, tc.wantCycle)
+			}
+			if ask, err := m.pg.OpenWatchdogAsk(t.Context(), runID, tc.cycle); err != nil || ask != nil {
+				t.Fatalf("ask was created while unavailable: %+v err=%v", ask, err)
+			}
+		})
+	}
+}
+
+func TestWatchdogAskWriteFailureTerminatesAtBoundary(t *testing.T) {
+	m, task, intent := testWatchdogTask(t)
+	now := time.Now()
+	s := newAdmissionTestServer(m, nil)
+	s.watchdog = newWatchdogRuntime(s, func() time.Time { return now })
+	monitor := s.watchdog.monitor
+	s.engine.SetRunMonitor(monitor)
+	runID := "run-ask-write-failure"
+	monitor.Register(task.ID, intent.ID, runID, "work#1")
+	monitor.SetCycle(runID, 1, now, false, db.SlowPathNone, db.WatchdogDecisionNone)
+	monitor.SetSlowPath(runID, db.SlowPathDone, "ask_user", "needs a decision", nil, 1)
+
+	funcName := "artex_test_fail_watchdog_ask"
+	if _, err := m.pg.Exec(`CREATE OR REPLACE FUNCTION ` + funcName + `() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'forced watchdog request failure'; END $$`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.pg.Exec(`CREATE TRIGGER ` + funcName + ` BEFORE INSERT ON watchdog_requests FOR EACH ROW WHEN (NEW.task_id = '` + task.ID + `') EXECUTE FUNCTION ` + funcName + `()`); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = m.pg.Exec(`DROP TRIGGER IF EXISTS ` + funcName + ` ON watchdog_requests`)
+		_, _ = m.pg.Exec(`DROP FUNCTION IF EXISTS ` + funcName + `()`)
+	})
+
+	workCtx, cancel := context.WithCancelCause(context.Background())
+	s.engine.registerWorkRun(intent.ID, runID, cancel)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-workCtx.Done()
+		cause, _ := context.Cause(workCtx).(*agent.AbortCause)
+		if cause != nil {
+			s.engine.settleWatchdogTermination(task, "work#1", intent, runID, cause)
+		}
+		_, complete := s.engine.detachWork(intent.ID)
+		complete(nil)
+	}()
+
+	snap := monitor.Lookup(intent.ID)
+	if snap == nil {
+		t.Fatal("run disappeared")
+	}
+	cfg := watchdogConfig{Enabled: true, CycleAfter: 20 * time.Minute, AgentRetry: time.Minute}
+	s.watchdog.fast.processCycle(t.Context(), task, *snap, cfg)
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ask write failure did not settle the worker at the boundary")
+	}
+	node, err := task.Store.GetNode(intent.ID)
+	if err != nil || node == nil || node.State != "exhausted" {
+		t.Fatalf("terminated intent=%+v err=%v, want exhausted", node, err)
+	}
+}
+
+func TestWatchdogFastDoesNotCreateAskWhileUnavailable(t *testing.T) {
+	m, task, intent := testWatchdogTask(t)
+	now := time.Now()
+	s := newAdmissionTestServer(m, nil)
+	s.watchdog = newWatchdogRuntime(s, func() time.Time { return now })
+	monitor := s.watchdog.monitor
+	s.engine.SetRunMonitor(monitor)
+	runID := "run-unavailable-ask"
+	monitor.Register(task.ID, intent.ID, runID, "work#1")
+	if _, err := m.pg.CreateOrUpdateWatchdogUnavailable(t.Context(), task.ID,
+		"Watchdog Agent 不可用", 1, &now, &now, &now); err != nil {
+		t.Fatal(err)
+	}
+	cfg := watchdogConfig{Enabled: true, CycleAfter: 20 * time.Minute, AgentRetry: time.Minute}
+	snap := monitor.Lookup(intent.ID)
+	if snap == nil {
+		t.Fatal("run disappeared")
+	}
+	s.watchdog.fast.createAsk(t.Context(), task, *snap, cfg, true)
+	if card, err := m.pg.OpenWatchdogAsk(t.Context(), runID, 0); err != nil || card != nil {
+		t.Fatalf("ask was created while the default card was open: %+v err=%v", card, err)
+	}
+}
+
+func TestWatchdogFastCycleAdvanceThenAsk(t *testing.T) {
+	m, task, intent := testWatchdogTask(t)
+	now := time.Now()
+	s := newAdmissionTestServer(m, nil)
+	s.watchdog = newWatchdogRuntime(s, func() time.Time { return now })
+	monitor := s.watchdog.monitor
+	s.engine.SetRunMonitor(monitor)
+	cfg := watchdogConfig{
+		Enabled: true, PressureAfter: time.Minute, SlowPathAfter: 2 * time.Minute,
+		CycleAfter: 3 * time.Minute, AgentKey: "watchdog", AgentRetry: time.Minute,
+	}
+	runID := "run-fast-cycle"
+	monitor.Register(task.ID, intent.ID, runID, "work#1")
+
+	for want := 1; want <= 2; want++ {
+		monitor.SetSlowPath(runID, db.SlowPathDone, "continue", "still useful", nil, want-1)
+		now = now.Add(3 * time.Minute)
+		snap := monitor.Lookup(intent.ID)
+		if snap == nil {
+			t.Fatal("run disappeared")
+		}
+		s.watchdog.fast.processCycle(context.Background(), task, *snap, cfg)
+		got := monitor.Lookup(intent.ID)
+		if got == nil || got.CycleNo != want {
+			t.Fatalf("after cycle %d snapshot=%+v", want, got)
+		}
+	}
+	monitor.SetSlowPath(runID, db.SlowPathDone, "continue", "still useful", nil, 2)
+	now = now.Add(3 * time.Minute)
+	snap := monitor.Lookup(intent.ID)
+	s.watchdog.fast.processCycle(context.Background(), task, *snap, cfg)
+	card, err := m.pg.OpenWatchdogAsk(context.Background(), runID, 2)
+	if err != nil || card == nil {
+		t.Fatalf("C2 green did not create a C3 request: %+v err=%v", card, err)
+	}
+	if card.Question == "" || card.CycleNo != 2 {
+		t.Fatalf("request shape=%+v", card)
+	}
+	if got := monitor.Lookup(intent.ID); got == nil || got.DecisionState != db.WatchdogDecisionOpen {
+		t.Fatalf("decision state=%+v", got)
+	}
+}
+
+func TestWatchdogFastMidCycleAskKeepsCycleBoundary(t *testing.T) {
+	m, task, intent := testWatchdogTask(t)
+	clock := time.Now()
+	s := newAdmissionTestServer(m, nil)
+	s.watchdog = newWatchdogRuntime(s, func() time.Time { return clock })
+	monitor := s.watchdog.monitor
+	s.engine.SetRunMonitor(monitor)
+	runID := "run-mid-ask"
+	monitor.Register(task.ID, intent.ID, runID, "work#1")
+	cycleStart := monitor.Lookup(intent.ID).CycleStart
+	cfg := watchdogConfig{Enabled: true, CycleAfter: 20 * time.Minute, AgentRetry: time.Minute}
+	clock = clock.Add(10 * time.Minute)
+	snap := monitor.Lookup(intent.ID)
+	s.watchdog.fast.createAsk(t.Context(), task, *snap, cfg, false)
+
+	card, err := s.m.pg.OpenWatchdogAsk(t.Context(), runID, 0)
+	if err != nil || card == nil {
+		t.Fatalf("ask card=%+v err=%v", card, err)
+	}
+	wantDeadline := cycleStart.Add(cfg.CycleAfter)
+	if card.DeadlineAt == nil || card.DeadlineAt.Sub(wantDeadline).Abs() > time.Millisecond {
+		t.Fatalf("deadline=%v want %v", card.DeadlineAt, wantDeadline)
+	}
+	got := monitor.Lookup(intent.ID)
+	if got == nil || got.CycleNo != 0 || !got.CycleStart.Equal(cycleStart) || got.DecisionState != db.WatchdogDecisionOpen {
+		t.Fatalf("mid-cycle ask moved the cycle: %+v", got)
+	}
+}
+
+func TestWatchdogFastProviderErrorDoesNotAsk(t *testing.T) {
+	m, task, intent := testWatchdogTask(t)
+	clock := time.Now()
+	s := newAdmissionTestServer(m, nil)
+	s.watchdog = newWatchdogRuntime(s, func() time.Time { return clock })
+	monitor := s.watchdog.monitor
+	s.engine.SetRunMonitor(monitor)
+	runID := "run-provider"
+	monitor.Register(task.ID, intent.ID, runID, "work#1")
+	monitor.SetSlowPath(runID, db.SlowPathDone, "provider_error", "quota exhausted", nil, 0)
+	clock = clock.Add(2 * time.Minute)
+	snap := monitor.Lookup(intent.ID)
+	s.watchdog.fast.processCycle(t.Context(), task, *snap, watchdogConfig{Enabled: true, CycleAfter: time.Minute})
+	if card, err := m.pg.OpenWatchdogAsk(t.Context(), runID, 0); err != nil || card != nil {
+		t.Fatalf("provider error created a user request: %+v err=%v", card, err)
+	}
+	got := monitor.Lookup(intent.ID)
+	if got == nil || got.State != db.WorkerRunStateRunning || !got.CycleStart.Equal(clock) {
+		t.Fatalf("provider error did not reset the cycle: %+v", got)
+	}
+}
+
+func TestWatchdogC0ConsentReasonIsNotSilentDefault(t *testing.T) {
+	got := decideCycle(0, cycleSignalAsk, cycleAnswerYes)
+	if got.Action != cycleActionNext || got.NextCycle != 1 {
+		t.Fatalf("C0 consent decision=%+v", got)
+	}
+	if got.Reason != "用户明确同意进入 C1" {
+		t.Fatalf("C0 consent reason=%q, want explicit user consent", got.Reason)
+	}
+}
+
+func TestWatchdogDefaultRule(t *testing.T) {
+	if got := watchdogDefaultRule(0); got != "c0_continue" {
+		t.Fatalf("C0 rule=%q", got)
+	}
+	for _, cycle := range []int{1, 2, 3, 9} {
+		if got := watchdogDefaultRule(cycle); got != "c1_plus_terminate" {
+			t.Fatalf("C%d rule=%q", cycle, got)
+		}
+	}
+}

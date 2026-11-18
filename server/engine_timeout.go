@@ -185,6 +185,9 @@ func (e *Engine) settleTask(ctx context.Context, t *Task) {
 	if !e.markSettling(t.ID) {
 		return
 	}
+	if e.monitor != nil {
+		e.monitor.SettlingTask(t.ID)
+	}
 	log.Printf("[deadline] task %s 到达超时上限,进入收尾时序", t.ID)
 
 	// ④ 等在跑 worker/planner drain(在跑 run 因夹逼的 MaxDuration 自行进收尾);

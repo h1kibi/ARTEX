@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -106,6 +107,12 @@ func (s *Store) writeBody(r io.Reader, expectedLength int64, expectedHash string
 	}
 	if err = os.Rename(f.Name(), path); err != nil {
 		return "", err
+	}
+	if runtime.GOOS == "windows" {
+		// Windows rejects fsync on a directory handle with ERROR_ACCESS_DENIED.
+		// The file itself was synced above; directory metadata durability is not
+		// available through this API on Windows.
+		return hash, nil
 	}
 	d, err := os.Open(filepath.Dir(path))
 	if err != nil {
