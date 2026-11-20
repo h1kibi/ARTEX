@@ -1,0 +1,18 @@
+name: norma
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: false
+      - name: Test full norma fork
+        working-directory: third_party/norma
+        run: go test ./...

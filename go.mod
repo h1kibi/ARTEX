@@ -3,7 +3,7 @@ module github.com/Autumn-27/artex
 go 1.26.3
 
 require (
-	github.com/Autumn-27/norma v0.4.3
+	github.com/Autumn-27/norma v0.4.4
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
@@ -60,3 +60,7 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+// norma is forked locally to carry the external-settlement request API used by
+// the Watchdog termination path (see third_party/norma/README-fork.md).
+replace github.com/Autumn-27/norma => ./third_party/norma
