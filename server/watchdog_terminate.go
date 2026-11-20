@@ -123,32 +123,44 @@ func (e *Engine) terminateWork(ctx context.Context, intentID int64, runID, reaso
 		return out, fmt.Errorf("%w: 意图 %d 正在执行 %s 操作", errWorkControlConflict, intentID, run.action)
 	}
 	run.action = "watchdog"
+	run.watchdogReason = reason
+	run.watchdogState = terminalState
 	done := run.done
+	settle := run.settle
 	var cause error
 	if terminalState == "exhausted" {
 		cause = agent.WatchdogCycleEnded(reason)
 	} else {
 		cause = agent.WatchdogTermination(reason, terminalState)
 	}
-	run.cancel(cause)
 	e.workMu.Unlock()
+
+	// Prefer the SDK settlement path: the worker gets its configured wrap-up
+	// rounds and can checkpoint already-confirmed facts/assets/findings before
+	// the intent is closed. Only a timeout falls back to cancelling the context.
+	if settle != nil && settle(reason) {
+		timer := time.NewTimer(watchdogSettlementWait)
+		select {
+		case err := <-done:
+			timer.Stop()
+			return e.terminationResult(intentID, run, err)
+		case <-ctx.Done():
+			timer.Stop()
+			// The caller stopped waiting; still stop the run so it cannot keep
+			// settling forever. A later read observes the settled state.
+			run.cancel(cause)
+			return out, fmt.Errorf("等待意图 %d 收尾: %w", intentID, ctx.Err())
+		case <-timer.C:
+			// Wrap-up window elapsed: force the hard-cancel path below.
+		}
+	}
+	run.cancel(cause)
 
 	timer := time.NewTimer(workControlWaitTimeout)
 	defer timer.Stop()
 	select {
 	case err := <-done:
-		if err != nil {
-			return out, err
-		}
-		e.workMu.Lock()
-		if run.watchdogResult != nil {
-			out = *run.watchdogResult
-		}
-		e.workMu.Unlock()
-		if out.IntentID == 0 {
-			return out, fmt.Errorf("意图 %d 已结束，但没有返回终止结果", intentID)
-		}
-		return out, nil
+		return e.terminationResult(intentID, run, err)
 	case <-ctx.Done():
 		e.releaseWorkControl(intentID, run, "watchdog")
 		return out, fmt.Errorf("等待意图 %d 终止: %w", intentID, ctx.Err())
@@ -156,6 +168,41 @@ func (e *Engine) terminateWork(ctx context.Context, intentID int64, runID, reaso
 		e.releaseWorkControl(intentID, run, "watchdog")
 		return out, fmt.Errorf("等待意图 %d 终止: %w", intentID, context.DeadlineExceeded)
 	}
+}
+
+// terminationResult reads the settled outcome a runIntent stored before
+// signalling done. The writer and this reader share workMu, so the pointer
+// remains valid even after detachWork removed the map entry.
+func (e *Engine) terminationResult(intentID int64, run *workExecution, err error) (TerminationResult, error) {
+	if err != nil {
+		return TerminationResult{}, err
+	}
+	var out TerminationResult
+	e.workMu.Lock()
+	if run.watchdogResult != nil {
+		out = *run.watchdogResult
+	}
+	e.workMu.Unlock()
+	if out.IntentID == 0 {
+		return out, fmt.Errorf("意图 %d 已结束，但没有返回终止结果", intentID)
+	}
+	return out, nil
+}
+
+// takeWatchdogTermination reports the termination a settlement request left on
+// the work handle. The run context stays live on this path, so runIntent uses
+// the recorded reason instead of an AbortCause.
+func (e *Engine) takeWatchdogTermination(intentID int64, runID string) (reason, state string, ok bool) {
+	e.workMu.Lock()
+	defer e.workMu.Unlock()
+	run := e.work[intentID]
+	if run == nil || (runID != "" && run.runID != runID) {
+		return "", "", false
+	}
+	if run.watchdogReason == "" && run.watchdogState == "" {
+		return "", "", false
+	}
+	return run.watchdogReason, run.watchdogState, true
 }
 
 // setWatchdogResult stores the settled result on the live work handle before
@@ -198,21 +245,21 @@ func watchdogRecentEvidence(t *Task, intentID int64) (step, toolResult string) {
 // settleWatchdogTermination is the runIntent branch for watchdog cancellation.
 // It commits terminal_reason and the system audit record before detachWork, so
 // the caller that is waiting on done can return a complete result.
-func (e *Engine) settleWatchdogTermination(t *Task, name string, intent *db.Node, runID string, cause *agent.AbortCause) (TerminationResult, bool) {
-	state := cause.TerminalState
+func (e *Engine) settleWatchdogTermination(t *Task, name string, intent *db.Node, runID, reason, terminalState string) (TerminationResult, bool) {
+	state := terminalState
 	if state != "stopped" && state != "exhausted" {
 		state = "stopped"
 	}
-	changed, err := t.Store.CompareAndSetIntentStateWithReason(intent.ID, "running", state, cause.Text)
+	changed, err := t.Store.CompareAndSetIntentStateWithReason(intent.ID, "running", state, reason)
 	if err != nil {
 		log.Printf("[watchdog] task %s 意图 #%d 写入终止状态失败: %v", t.ID, intent.ID, err)
 	}
 	if !changed {
 		log.Printf("[watchdog] task %s 意图 #%d 终止时状态已被其他路径修改", t.ID, intent.ID)
-		return TerminationResult{IntentID: intent.ID, RunID: runID, State: state, Reason: cause.Text}, false
+		return TerminationResult{IntentID: intent.ID, RunID: runID, State: state, Reason: reason}, false
 	}
 	result := TerminationResult{
-		IntentID: intent.ID, RunID: runID, State: state, Reason: cause.Text,
+		IntentID: intent.ID, RunID: runID, State: state, Reason: reason,
 	}
 	if e.monitor != nil {
 		if snap := e.monitor.LookupRun(runID); snap != nil {
@@ -225,12 +272,12 @@ func (e *Engine) settleWatchdogTermination(t *Task, name string, intent *db.Node
 		}
 	}
 	recentStep, recentToolResult := watchdogRecentEvidence(t, intent.ID)
-	summary := fmt.Sprintf("Watchdog 终止意图 #%d（%s）：%s", intent.ID, state, cause.Text)
+	summary := fmt.Sprintf("Watchdog 终止意图 #%d（%s）：%s", intent.ID, state, reason)
 	activity := e.emitActivity(t, db.Activity{
 		Worker: "system", Kind: "watchdog_terminated", NodeID: &intent.ID,
-		Summary: summary, Detail: cause.Text,
+		Summary: summary, Detail: reason,
 		Metadata: marshalWatchdogMetadata(watchdogAudit{
-			State: state, Reason: cause.Text, LastOutputAt: result.LastOutputAt,
+			State: state, Reason: reason, LastOutputAt: result.LastOutputAt,
 			CycleNo: result.CycleNo, Phase: result.Phase,
 			Facts: result.Facts, Assets: result.Assets, Findings: result.Findings,
 		}),
@@ -238,7 +285,7 @@ func (e *Engine) settleWatchdogTermination(t *Task, name string, intent *db.Node
 	result.ActivityID = activity.ID
 	e.setWatchdogResult(intent.ID, runID, result)
 	t.NotifyWatchdogTerminated(agent.TriggerEvent{
-		Kind: "watchdog_terminated", IntentID: intent.ID, Detail: cause.Text,
+		Kind: "watchdog_terminated", IntentID: intent.ID, Detail: reason,
 		Summary: state, Worker: name, CycleNo: result.CycleNo,
 		LastOutputAt: result.LastOutputAt, Phase: result.Phase,
 		Facts: result.Facts, Assets: result.Assets, Findings: result.Findings,

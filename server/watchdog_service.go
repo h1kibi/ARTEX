@@ -20,16 +20,30 @@ type watchdogService struct {
 	monitor *RunMonitor
 	now     func() time.Time
 	wake    chan struct{}
+	// arbitrationCh carries worker resource-request judgments. It is separate
+	// from Slow Path jobs: the two have different prompts and cooldowns.
+	arbitrationCh chan PeerArbitration
 }
 
 func newWatchdogService(s *Server, monitor *RunMonitor) *watchdogService {
-	return &watchdogService{s: s, monitor: monitor, now: time.Now, wake: make(chan struct{}, 1)}
+	return &watchdogService{s: s, monitor: monitor, now: time.Now, wake: make(chan struct{}, 1),
+		arbitrationCh: make(chan PeerArbitration, 16)}
 }
 
 // Run consumes jobs until the server context is cancelled. The ticker also
 // re-checks failed jobs after their next_retry_at; the wake channel lets the
 // unavailable card's Try again bypass that wait.
 func (w *watchdogService) Run(ctx context.Context) {
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case req := <-w.arbitrationCh:
+				w.runPeerArbitration(ctx, req)
+			}
+		}
+	}()
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {

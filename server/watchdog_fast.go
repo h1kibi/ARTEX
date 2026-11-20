@@ -13,7 +13,7 @@ import (
 // Fast Path 只做固定规则与计时：8 分钟压力提示、10 分钟创建 Slow Path 任务、
 // 20 分钟按周期表推进或终止。语义判断全部交给 Slow Path；Fast Path 执行结果，
 // 不调用模型。
-const watchdogPressureText = "你8分钟就做了这些工作？再没有有效进展就把你关了！"
+const watchdogPressureText = "你到现在就做了这些工作？再没有有效进展将终止本次运行。请立即将已确认的有效进展、事实、资产或发现写回；不要编造未验证的内容。"
 
 type cycleSignal string
 
@@ -58,11 +58,16 @@ type cycleDecision struct {
 	TerminalState string
 }
 
-// decideCycle implements the施工方案 §7.2 table. C0 is the only cycle where an
-// unanswered user request silently consents; C1 and later treat silence as a
-// stop. C2 is the last automatic green light: a green C2 asks the user before
-// entering C3.
-func decideCycle(cycleNo int, signal cycleSignal, answer cycleAnswer) cycleDecision {
+// decideCycle implements the autonomy budget table. autoUsed is the number of
+// green-light advances already consumed by this run; cycleNo remains the current
+// cycle label for user-default rules and audit messages.
+func decideCycle(cycleNo, autoUsed, maxAutoCycles int, signal cycleSignal, answer cycleAnswer) cycleDecision {
+	if maxAutoCycles < 1 {
+		maxAutoCycles = 1
+	}
+	if maxAutoCycles > 4 {
+		maxAutoCycles = 4
+	}
 	terminate := func(state, reason string) cycleDecision {
 		return cycleDecision{Action: cycleActionTerminate, TerminalState: state, Reason: reason}
 	}
@@ -70,85 +75,40 @@ func decideCycle(cycleNo int, signal cycleSignal, answer cycleAnswer) cycleDecis
 		return cycleDecision{Action: cycleActionNext, NextCycle: n, Reason: reason}
 	}
 	request := func(n int, reason string) cycleDecision {
+		rule := "c1_plus_terminate"
+		if cycleNo == 0 {
+			rule = "c0_continue"
+		}
 		return cycleDecision{
 			Action: cycleActionRequest, NextCycle: n,
-			RequestKind: db.WatchdogRequestAsk, DefaultRule: "c1_plus_terminate",
+			RequestKind: db.WatchdogRequestAsk, DefaultRule: rule,
 			Reason: reason,
 		}
 	}
-	switch cycleNo {
-	case 0:
-		switch signal {
-		case cycleSignalGreen:
-			return next(1, "C0 慢速判断放绿灯，进入 C1")
-		case cycleSignalAsk:
-			switch answer {
-			case cycleAnswerYes:
-				return next(1, "用户明确同意进入 C1")
-			case cycleAnswerNo:
-				return terminate("stopped", "用户明确拒绝继续")
-			default:
+	switch signal {
+	case cycleSignalGreen:
+		if autoUsed < maxAutoCycles {
+			return next(cycleNo+1, fmt.Sprintf("C%d 慢速判断放绿灯，自主进入 C%d（预算 %d，已用 %d）",
+				cycleNo, cycleNo+1, maxAutoCycles, autoUsed))
+		}
+		return request(cycleNo+1, fmt.Sprintf("已用完自主放行预算（%d），当前 C%d 生成下一周期用户请求",
+			maxAutoCycles, cycleNo))
+	case cycleSignalAsk:
+		switch answer {
+		case cycleAnswerYes:
+			return next(cycleNo+1, fmt.Sprintf("用户明确同意进入 C%d", cycleNo+1))
+		case cycleAnswerNo:
+			return terminate("stopped", "用户明确拒绝继续，终止本运行")
+		default:
+			if cycleNo == 0 {
 				return next(1, "C0 用户请求静默，默认同意进入 C1")
 			}
-		case cycleSignalTerminate:
-			return terminate("stopped", "慢速判断要求终止")
-		default:
-			return terminate("exhausted", "C0 没有绿灯，也没有用户请求")
+			return terminate("exhausted", fmt.Sprintf("C%d 用户请求静默，按默认规则终止", cycleNo))
 		}
-	case 1:
-		switch signal {
-		case cycleSignalGreen:
-			return next(2, "C1 慢速判断放绿灯，进入 C2")
-		case cycleSignalAsk:
-			switch answer {
-			case cycleAnswerYes:
-				return next(2, "用户明确同意进入 C2")
-			case cycleAnswerNo:
-				return terminate("stopped", "用户明确拒绝继续，终止本运行")
-			default:
-				return terminate("exhausted", "C1 用户请求静默，按默认规则终止")
-			}
-		case cycleSignalTerminate:
-			return terminate("stopped", "慢速判断要求终止")
-		default:
-			return terminate("exhausted", "C1 没有绿灯，也没有用户请求")
-		}
-	case 2:
-		switch signal {
-		case cycleSignalGreen:
-			return request(3, "C2 自动绿灯止步，生成 C3 用户请求")
-		case cycleSignalAsk:
-			switch answer {
-			case cycleAnswerYes:
-				return next(3, "用户明确同意进入 C3")
-			case cycleAnswerNo:
-				return terminate("stopped", "用户明确拒绝继续，终止本运行")
-			default:
-				return terminate("exhausted", "C2 用户请求静默，按默认规则终止")
-			}
-		case cycleSignalTerminate:
-			return terminate("stopped", "慢速判断要求终止")
-		default:
-			return terminate("exhausted", "C2 没有绿灯，也没有用户请求")
-		}
+	case cycleSignalTerminate:
+		return terminate("stopped", "慢速判断要求终止")
 	default:
-		switch signal {
-		case cycleSignalGreen:
-			return request(cycleNo+1, fmt.Sprintf("C%d 用户请求继续，生成下一周期请求", cycleNo))
-		case cycleSignalAsk:
-			switch answer {
-			case cycleAnswerYes:
-				return next(cycleNo+1, fmt.Sprintf("用户明确同意进入 C%d", cycleNo+1))
-			case cycleAnswerNo:
-				return terminate("stopped", "用户明确拒绝继续，终止本运行")
-			default:
-				return terminate("exhausted", fmt.Sprintf("C%d 用户请求静默，按默认规则终止", cycleNo))
-			}
-		case cycleSignalTerminate:
-			return terminate("stopped", "慢速判断要求终止")
-		default:
-			return terminate("exhausted", fmt.Sprintf("C%d 没有绿灯，也没有用户请求", cycleNo))
-		}
+		return terminate("exhausted", fmt.Sprintf("C%d 没有绿灯，也没有用户请求", cycleNo))
 	}
 }
 
@@ -172,6 +132,9 @@ func (f *watchdogFast) Tick(ctx context.Context) {
 		return
 	}
 	f.monitor.Flush()
+	if f.s.engine != nil {
+		f.s.engine.SweepExpiredPeerRequests()
+	}
 	cfg := f.s.watchdogConfig()
 	if !cfg.Enabled {
 		return
@@ -312,7 +275,7 @@ func (f *watchdogFast) processCycle(ctx context.Context, t *Task, snap RunSnapsh
 		// consents to C1, C1+ defaults to termination. Fall through and apply it
 		// instead of leaving the Worker alive until the next tick.
 	}
-	decision := decideCycle(snap.CycleNo, signal, answer)
+	decision := decideCycle(snap.CycleNo, snap.AutoCyclesUsed, cfg.MaxAutoCycles, signal, answer)
 	switch decision.Action {
 	case cycleActionNext:
 		if ask != nil && ask.Status == db.WatchdogRequestOpen {
@@ -329,7 +292,7 @@ func (f *watchdogFast) processCycle(ctx context.Context, t *Task, snap RunSnapsh
 				return // 用户刚回答了同一张卡；由其选择路径推进
 			}
 		}
-		f.advanceCycle(t, snap, decision.NextCycle, decision.Reason)
+		f.advanceCycle(t, snap, decision.NextCycle, decision.Reason, signal == cycleSignalGreen)
 	case cycleActionRequest:
 		result := f.createAsk(ctx, t, snap, cfg, true)
 		if result == askCreated || result == askAlreadyExists {
@@ -375,12 +338,15 @@ func (f *watchdogFast) processCycle(ctx context.Context, t *Task, snap RunSnapsh
 
 // advanceCycle grants the next cycle and restarts all three timers. The cycle
 // number is monotonic for the run; effective output resets it to C0 separately.
-func (f *watchdogFast) advanceCycle(t *Task, snap RunSnapshot, next int, reason string) {
+func (f *watchdogFast) advanceCycle(t *Task, snap RunSnapshot, next int, reason string, autonomous bool) {
 	if next <= snap.CycleNo {
 		next = snap.CycleNo + 1
 	}
 	now := f.now()
 	f.monitor.SetCycle(snap.RunID, next, now, false, db.SlowPathNone, db.WatchdogDecisionNone)
+	if autonomous {
+		f.monitor.RecordAutoAdvance(snap.RunID)
+	}
 	f.s.emitWatchdogActivity(t, "watchdog_cycle",
 		fmt.Sprintf("意图 #%d 进入 C%d", snap.IntentID, next), reason,
 		watchdogAudit{CycleNo: next, Phase: snap.Phase})
@@ -473,7 +439,7 @@ func (f *watchdogFast) createAsk(ctx context.Context, t *Task, snap RunSnapshot,
 // terminate is the only place Fast Path cancels a worker. The Engine validates
 // the run id and waits until runIntent has committed the final state.
 func (f *watchdogFast) terminate(ctx context.Context, t *Task, snap RunSnapshot, reason, terminalState string) (TerminationResult, error) {
-	waitCtx, cancel := context.WithTimeout(ctx, workControlWaitTimeout+5*time.Second)
+	waitCtx, cancel := context.WithTimeout(ctx, watchdogSettlementWait+workControlWaitTimeout+5*time.Second)
 	defer cancel()
 	result, err := f.s.engine.TerminateWorkForCycle(waitCtx, snap.IntentID, snap.RunID, reason, terminalState, snap.CycleNo)
 	if err != nil {
@@ -494,7 +460,7 @@ func (s *Server) watchdogContinueCycle(t *Task, snap RunSnapshot, reason string)
 	if current == nil || current.State != db.WorkerRunStateRunning || current.CycleNo != snap.CycleNo {
 		return fmt.Errorf("该运行或周期已结束")
 	}
-	s.watchdog.fast.advanceCycle(t, *current, snap.CycleNo+1, reason)
+	s.watchdog.fast.advanceCycle(t, *current, snap.CycleNo+1, reason, false)
 	return nil
 }
 

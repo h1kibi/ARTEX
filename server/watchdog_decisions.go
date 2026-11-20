@@ -34,6 +34,30 @@ type watchdogRunDTO struct {
 	ProviderError   string `json:"provider_error,omitempty"`
 	SlowPathClass   string `json:"slow_path_class,omitempty"`
 	SlowPathSummary string `json:"slow_path_summary,omitempty"`
+	// Autonomy budget for this run, from the current Watchdog configuration.
+	MaxAutoCycles       int `json:"max_auto_cycles"`
+	AutoCyclesUsed      int `json:"auto_cycles_used"`
+	AutoCyclesRemaining int `json:"auto_cycles_remaining"`
+}
+
+// applyAutoBudget fills the informational autonomy fields from the run's real
+// count of green-light advances. User-approved cycles are not included.
+func (d *watchdogRunDTO) applyAutoBudget(maxAuto, used int) {
+	if maxAuto < 1 {
+		maxAuto = defaultWatchdogMaxAuto
+	}
+	if maxAuto > 4 {
+		maxAuto = 4
+	}
+	if used < 0 {
+		used = 0
+	}
+	if used > maxAuto {
+		used = maxAuto
+	}
+	d.MaxAutoCycles = maxAuto
+	d.AutoCyclesUsed = used
+	d.AutoCyclesRemaining = maxAuto - used
 }
 
 func optionalTime(t time.Time) string {
@@ -145,10 +169,13 @@ func (s *Server) watchdogRuns(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "task_id 为必填")
 		return
 	}
+	maxAuto := s.watchdogConfig().MaxAutoCycles
 	var runs []watchdogRunDTO
 	if s.watchdog != nil && s.watchdog.monitor != nil {
 		for _, snap := range s.watchdog.monitor.ListRunning(taskID) {
-			runs = append(runs, watchdogRunDTOFromSnapshot(snap))
+			dto := watchdogRunDTOFromSnapshot(snap)
+			dto.applyAutoBudget(maxAuto, snap.AutoCyclesUsed)
+			runs = append(runs, dto)
 		}
 	} else if s.m != nil && s.m.pg != nil {
 		rows, err := s.m.pg.ListWorkerRuns(r.Context(), taskID, true)
@@ -157,7 +184,9 @@ func (s *Server) watchdogRuns(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, row := range rows {
-			runs = append(runs, watchdogRunDTOFromDB(row))
+			dto := watchdogRunDTOFromDB(row)
+			dto.applyAutoBudget(maxAuto, row.AutoCyclesUsed)
+			runs = append(runs, dto)
 		}
 	}
 	writeJSON(w, 200, map[string]any{"runs": runs})

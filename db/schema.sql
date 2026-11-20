@@ -1414,6 +1414,8 @@ CREATE TABLE IF NOT EXISTS worker_runs (
     last_output_at    TIMESTAMPTZ,
     cycle_start       TIMESTAMPTZ,
     cycle_no          INTEGER NOT NULL DEFAULT 0,
+    -- 本 run 内由 Watchdog 自主绿灯推进的次数；用户批准进入的周期不增加。
+    auto_cycles_used  INTEGER NOT NULL DEFAULT 0,
     pressure_sent     BOOLEAN NOT NULL DEFAULT false,
     -- none | queued | running | done | failed | stale
     slow_path_state   TEXT NOT NULL DEFAULT 'none',
@@ -1427,6 +1429,7 @@ CREATE TABLE IF NOT EXISTS worker_runs (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE worker_runs ADD COLUMN IF NOT EXISTS auto_cycles_used INTEGER NOT NULL DEFAULT 0;
 CREATE UNIQUE INDEX IF NOT EXISTS ux_worker_runs_run ON worker_runs(run_id);
 CREATE INDEX IF NOT EXISTS idx_worker_runs_task_state ON worker_runs(task_id, state);
 CREATE INDEX IF NOT EXISTS idx_worker_runs_lease ON worker_runs(lease_until);

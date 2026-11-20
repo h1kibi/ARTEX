@@ -71,6 +71,7 @@ type WorkerRun struct {
 	LastOutputAt   *time.Time `json:"last_output_at,omitempty"`
 	CycleStart     *time.Time `json:"cycle_start,omitempty"`
 	CycleNo        int        `json:"cycle_no"`
+	AutoCyclesUsed int        `json:"auto_cycles_used"`
 	PressureSent   bool       `json:"pressure_sent"`
 	SlowPathState  string     `json:"slow_path_state"`
 	DecisionState  string     `json:"decision_state"`
@@ -81,14 +82,14 @@ type WorkerRun struct {
 }
 
 const workerRunCols = `id,task_id,intent_id,run_id,worker_name,phase,phase_started_at,heartbeat_at,
-last_event_at,last_output_at,cycle_start,cycle_no,pressure_sent,slow_path_state,decision_state,
+last_event_at,last_output_at,cycle_start,cycle_no,auto_cycles_used,pressure_sent,slow_path_state,decision_state,
 lease_until,state,created_at,updated_at`
 
 func scanWorkerRun(sc interface{ Scan(...any) error }) (*WorkerRun, error) {
 	var r WorkerRun
 	if err := sc.Scan(&r.ID, &r.TaskID, &r.IntentID, &r.RunID, &r.WorkerName, &r.Phase,
 		&r.PhaseStartedAt, &r.HeartbeatAt, &r.LastEventAt, &r.LastOutputAt, &r.CycleStart,
-		&r.CycleNo, &r.PressureSent, &r.SlowPathState, &r.DecisionState, &r.LeaseUntil,
+		&r.CycleNo, &r.AutoCyclesUsed, &r.PressureSent, &r.SlowPathState, &r.DecisionState, &r.LeaseUntil,
 		&r.State, &r.CreatedAt, &r.UpdatedAt); err != nil {
 		return nil, err
 	}
@@ -123,20 +124,21 @@ func (d *DB) SaveWorkerRun(ctx context.Context, r *WorkerRun) error {
 	}
 	_, err := d.ExecContext(ctx, `
 INSERT INTO worker_runs(task_id,intent_id,run_id,worker_name,phase,phase_started_at,heartbeat_at,
-last_event_at,last_output_at,cycle_start,cycle_no,pressure_sent,slow_path_state,decision_state,
+last_event_at,last_output_at,cycle_start,cycle_no,auto_cycles_used,pressure_sent,slow_path_state,decision_state,
 lease_until,state)
-VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
 ON CONFLICT (run_id) DO UPDATE SET
   task_id=EXCLUDED.task_id, intent_id=EXCLUDED.intent_id, worker_name=EXCLUDED.worker_name,
   phase=EXCLUDED.phase, phase_started_at=EXCLUDED.phase_started_at,
   heartbeat_at=EXCLUDED.heartbeat_at, last_event_at=EXCLUDED.last_event_at,
   last_output_at=EXCLUDED.last_output_at, cycle_start=EXCLUDED.cycle_start,
-  cycle_no=EXCLUDED.cycle_no, pressure_sent=EXCLUDED.pressure_sent,
+  cycle_no=EXCLUDED.cycle_no, auto_cycles_used=EXCLUDED.auto_cycles_used,
+  pressure_sent=EXCLUDED.pressure_sent,
   slow_path_state=EXCLUDED.slow_path_state, decision_state=EXCLUDED.decision_state,
   lease_until=EXCLUDED.lease_until, state=EXCLUDED.state, updated_at=now()`,
 		r.TaskID, r.IntentID, r.RunID, r.WorkerName, r.Phase, timeArg(r.PhaseStartedAt),
 		timeArg(r.HeartbeatAt), timeArg(r.LastEventAt), timeArg(r.LastOutputAt),
-		timeArg(r.CycleStart), r.CycleNo, r.PressureSent, r.SlowPathState,
+		timeArg(r.CycleStart), r.CycleNo, r.AutoCyclesUsed, r.PressureSent, r.SlowPathState,
 		r.DecisionState, timeArg(r.LeaseUntil), r.State)
 	return err
 }
@@ -174,6 +176,29 @@ func (d *DB) FinishWorkerRun(ctx context.Context, runID, state string) error {
 	_, err := d.ExecContext(ctx, `
 UPDATE worker_runs SET state=$2, lease_until=NULL, heartbeat_at=now(), updated_at=now()
 WHERE run_id=$1`, runID, state)
+	return err
+}
+
+// FinishWorkerRuns marks multiple run rows finished in one statement. It is
+// used by task-level cleanup, where issuing one UPDATE per live run adds
+// avoidable round trips while the task is already being torn down.
+func (d *DB) FinishWorkerRuns(ctx context.Context, runIDs []string, state string) error {
+	if len(runIDs) == 0 {
+		return nil
+	}
+	if state == "" {
+		state = WorkerRunStateFinished
+	}
+	args := make([]any, 0, len(runIDs)+1)
+	marks := make([]string, len(runIDs))
+	for i, id := range runIDs {
+		args = append(args, id)
+		marks[i] = fmt.Sprintf("$%d", i+1)
+	}
+	args = append(args, state)
+	_, err := d.ExecContext(ctx, `
+UPDATE worker_runs SET state=$`+fmt.Sprint(len(args))+`, lease_until=NULL, heartbeat_at=now(), updated_at=now()
+WHERE run_id IN (`+strings.Join(marks, ",")+`)`, args...)
 	return err
 }
 

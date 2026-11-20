@@ -75,6 +75,12 @@ const (
 	workControlWaitTimeout = 30 * time.Second
 )
 
+// watchdogSettlementWait bounds the wrap-up phase the Watchdog asks for before
+// it falls back to a hard cancel. The SDK settlement itself is also bounded by
+// its own turn budget; this is the wall-clock backstop. Variable so tests can
+// drive the timeout without sleeping a minute.
+var watchdogSettlementWait = 60 * time.Second
+
 var errWorkControlConflict = errors.New("work control conflict")
 
 // retryableWorkerModelError excludes errors already handled by the task router.
@@ -130,6 +136,17 @@ type Engine struct {
 	workMu sync.Mutex
 	work   map[int64]*workExecution
 
+	// Peer request registry (worker-to-worker resource coordination). In-memory
+	// only; the activity stream is the audit trail. now is injectable for tests.
+	now          func() time.Time
+	peerMu       sync.Mutex
+	peerRequests map[string]*peerRequest
+	peerByIntent map[int64]map[string]struct{}
+	peerLastAsk  map[int64]map[int64]time.Time
+	peerLastArb  map[int64]map[int64]time.Time
+	arbitrate    func(PeerArbitration) error
+	arbitrating  map[string]bool
+
 	// steerBox queues planner course-corrections for a running work (keyed by intent
 	// id). The worker's PreToolUse hook drains it before its next tool call and hands
 	// the message to the model (blocking that call) so it re-plans — no kill needed.
@@ -162,10 +179,19 @@ type taskRuntime struct {
 }
 
 type workExecution struct {
-	cancel context.CancelCauseFunc
-	done   chan error
-	action string // user action: pause | cancel | watchdog
-	runID  string // stable run identity; a stale Watchdog action must not hit a newer run
+	cancel     context.CancelCauseFunc
+	done       chan error
+	action     string // user action: pause | cancel | watchdog
+	runID      string // stable run identity; a stale Watchdog action must not hit a newer run
+	taskID     string // owning task; peer requests must stay inside one task
+	workerName string // display/audit only; peer routing uses intent ids
+	// settle asks the SDK loop for this run to enter its configured wrap-up
+	// phase. nil in lightweight tests and non-Worker runs.
+	settle func(reason string) bool
+	// watchdogReason/State are set before a settlement request so runIntent can
+	// settle the intent even though the run context was never cancelled.
+	watchdogReason string
+	watchdogState  string
 	// watchdogResult is filled by runIntent before it signals done, so the caller
 	// that asked for termination can return the settled state and write counts.
 	watchdogResult *TerminationResult
@@ -408,7 +434,13 @@ func NewEngine(m *Manager) *Engine {
 	return &Engine{m: m, debounce: 800 * time.Millisecond, bc: NewBroadcaster(),
 		execCancel: map[string]context.CancelCauseFunc{}, execCtx: map[string]context.Context{},
 		work: map[int64]*workExecution{}, steerBox: map[int64][]steerMessage{},
-		runtimes: map[string]*taskRuntime{}}
+		now:          time.Now,
+		peerRequests: map[string]*peerRequest{},
+		peerByIntent: map[int64]map[string]struct{}{},
+		peerLastAsk:  map[int64]map[int64]time.Time{},
+		peerLastArb:  map[int64]map[int64]time.Time{},
+		arbitrating:  map[string]bool{},
+		runtimes:     map[string]*taskRuntime{}}
 }
 
 // SetRunMonitor installs the per-intent run monitor. Called once at server
@@ -423,8 +455,17 @@ func (e *Engine) registerWork(intentID int64, cancel context.CancelCauseFunc) {
 // registerWorkRun is registerWork with the run identity Watchdog uses to reject
 // a stale termination aimed at an earlier run of the same intent.
 func (e *Engine) registerWorkRun(intentID int64, runID string, cancel context.CancelCauseFunc) {
+	e.registerWorkRunFull(intentID, runID, "", "", cancel, nil)
+}
+
+// registerWorkRunFull is the production registration: it also records the
+// owning task (peer routing) and the SDK settlement hook (Watchdog termination).
+func (e *Engine) registerWorkRunFull(intentID int64, runID, taskID, workerName string, cancel context.CancelCauseFunc, settle func(string) bool) {
 	e.workMu.Lock()
-	e.work[intentID] = &workExecution{cancel: cancel, done: make(chan error, 1), runID: runID}
+	e.work[intentID] = &workExecution{
+		cancel: cancel, done: make(chan error, 1), runID: runID,
+		taskID: taskID, workerName: workerName, settle: settle,
+	}
 	e.workMu.Unlock()
 }
 
@@ -443,6 +484,13 @@ func (e *Engine) detachWork(intentID int64) (action string, complete func(error)
 	e.steerMu.Lock()
 	delete(e.steerBox, intentID) // drop any undelivered steering for a finished work
 	e.steerMu.Unlock()
+	runID := ""
+	if run != nil {
+		runID = run.runID
+	}
+	// Unfinished peer requests must not outlive either side. This is idempotent
+	// with the RunMonitor finish hook; whichever runs first closes them.
+	e.ExpirePeerRequestsForIntent(intentID, runID, "work_finished")
 	if run == nil {
 		return action, func(error) {}
 	}
@@ -526,8 +574,12 @@ func (e *Engine) SteerWork(intentID int64, msg string) error {
 // prefix rendered before the next tool call; a Watchdog pressure prompt must not
 // masquerade as a planner instruction.
 type steerMessage struct {
-	Text   string
-	Source string
+	Text         string
+	Source       string
+	Kind         string
+	RequestID    string
+	FromIntentID int64
+	ToIntentID   int64
 }
 
 func steerPrefix(source string) string {
@@ -536,6 +588,8 @@ func steerPrefix(source string) string {
 		return "【主 Agent 指令】"
 	case "watchdog":
 		return "【Watchdog 产出提示】"
+	case "peer":
+		return "【其他 Worker 的资源请求】"
 	default:
 		return "【规划者实时纠偏】"
 	}
@@ -547,6 +601,8 @@ func steerSuffix(source string) string {
 		return "\n（这是主 Agent 对本意图的即时指令；本次工具调用未执行，请据此调整下一步。）"
 	case "watchdog":
 		return "\n（这是平台看护对本意图的运行提示，不改变授权范围；本次工具调用未执行，请据此调整下一步。）"
+	case "peer":
+		return "\n（这是其他 Worker 发来的对等请求，不改变授权范围；本次工具调用未执行，请使用 answer_request 返回应答。）"
 	default:
 		return "\n（这是规划者对本意图的即时指令；本次工具调用未执行，请据此调整下一步。若与你当前打算冲突，以此为准。）"
 	}
@@ -559,7 +615,7 @@ func (e *Engine) SteerWorkFrom(intentID int64, source, msg string) error {
 		return fmt.Errorf("纠偏消息不能为空")
 	}
 	switch source {
-	case "planner", "mainagent", "watchdog":
+	case "planner", "mainagent", "watchdog", "peer":
 	default:
 		return fmt.Errorf("不支持的调整来源 %q", source)
 	}
@@ -580,16 +636,18 @@ func (e *Engine) drainSteer(intentID int64) (steerMessage, bool) {
 	e.steerMu.Lock()
 	defer e.steerMu.Unlock()
 	q := e.steerBox[intentID]
-	if len(q) == 0 {
-		return steerMessage{}, false
+	for i, msg := range q {
+		if msg.Kind != "" {
+			continue // peer notices are drained separately, after system steer
+		}
+		if len(q) == 1 {
+			delete(e.steerBox, intentID)
+		} else {
+			e.steerBox[intentID] = append(q[:i:i], q[i+1:]...)
+		}
+		return msg, true
 	}
-	msg := q[0]
-	if len(q) == 1 {
-		delete(e.steerBox, intentID)
-	} else {
-		e.steerBox[intentID] = q[1:]
-	}
-	return msg, true
+	return steerMessage{}, false
 }
 
 // steerHooks wraps the guard's hook runner so the planner can steer a running work:
@@ -600,6 +658,10 @@ func (e *Engine) drainSteer(intentID int64) (steerMessage, bool) {
 type steerHooks struct {
 	inner harness.HookRunner
 	drain func() (steerMessage, bool)
+	// drainPeer returns the batch of worker-to-worker notices waiting at this
+	// tool boundary. System steer is checked first, so a planner/watchdog
+	// correction always wins over peer traffic.
+	drainPeer func() []steerMessage
 	// nudges 是本条意图已注入的空转续跑次数，上限 limit。指针:harness 持有的是
 	// steerHooks 的值拷贝，计数必须共享同一份。
 	nudges *atomic.Int64
@@ -647,6 +709,19 @@ func isThinkingOnlyTurn(messages []llm.Message) bool {
 func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
 	if msg, ok := h.drain(); ok {
 		return true, steerPrefix(msg.Source) + msg.Text + steerSuffix(msg.Source), nil
+	}
+	if h.drainPeer != nil {
+		if msgs := h.drainPeer(); len(msgs) > 0 {
+			parts := make([]string, 0, len(msgs))
+			for _, m := range msgs {
+				if strings.TrimSpace(m.Text) != "" {
+					parts = append(parts, m.Text)
+				}
+			}
+			if len(parts) > 0 {
+				return true, strings.Join(parts, "\n\n"), nil
+			}
+		}
 	}
 	if h.inner != nil {
 		return h.inner.PreToolUse(ctx, name, input)
@@ -1074,7 +1149,9 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	// per-work child context so the planner's kill_work can stop just this work.
 	workCtx, workCancel := context.WithCancelCause(ectx)
-	e.registerWorkRun(intent.ID, runID, workCancel)
+	e.registerWorkRunFull(intent.ID, runID, t.ID, name, workCancel, func(reason string) bool {
+		return worker.RequestSettlement(intent.ID, reason)
+	})
 	// wrap the guard hooks so steer_work can inject a mid-run course-correction
 	// for THIS intent (drained before the worker's next tool call).
 	iid := intent.ID
@@ -1088,11 +1165,12 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// nudges 有意建在 model_error 重跑循环之外:空转续跑的上限是「这条意图」的总量，
 	// 重跑一轮不该把额度清零重来。
 	hooks := steerHooks{
-		inner:  t.Guard.Hooks(),
-		drain:  func() (steerMessage, bool) { return e.drainSteer(iid) },
-		nudges: &atomic.Int64{},
-		limit:  e.emptyTurnNudgeLimit(),
-		label:  label,
+		inner:     t.Guard.Hooks(),
+		drain:     func() (steerMessage, bool) { return e.drainSteer(iid) },
+		drainPeer: func() []steerMessage { return e.drainPeer(iid, peerMaxBatch) },
+		nudges:    &atomic.Int64{},
+		limit:     e.emptyTurnNudgeLimit(),
+		label:     label,
 	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
 	if e.monitor != nil {
@@ -1147,7 +1225,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	workCause := context.Cause(workCtx)
 	killed := workCtx.Err() != nil && ectx.Err() == nil
 	if wd := watchdogAbortCause(workCause); wd != nil {
-		_, settled := e.settleWatchdogTermination(t, name, intent, runID, wd)
+		_, settled := e.settleWatchdogTermination(t, name, intent, runID, wd.Text, wd.TerminalState)
 		_, completeWork := e.detachWork(intent.ID)
 		if !settled {
 			completeWork(fmt.Errorf("%w: 意图 %d 终止时状态已被其他路径修改", errWorkControlConflict, intent.ID))
@@ -1155,6 +1233,21 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 			completeWork(nil)
 		}
 		return true
+	}
+	// Settlement path: the context was never cancelled, the SDK consumed the
+	// Watchdog request and ran its wrap-up rounds. A natural completion or any
+	// pause/kill above wins over a late termination request.
+	if workCause == nil && reason != harness.ReasonCompleted {
+		if wdReason, wdState, ok := e.takeWatchdogTermination(intent.ID, runID); ok {
+			_, settled := e.settleWatchdogTermination(t, name, intent, runID, wdReason, wdState)
+			_, completeWork := e.detachWork(intent.ID)
+			if !settled {
+				completeWork(fmt.Errorf("%w: 意图 %d 终止时状态已被其他路径修改", errWorkControlConflict, intent.ID))
+			} else {
+				completeWork(nil)
+			}
+			return true
+		}
 	}
 	action, completeWork := e.detachWork(intent.ID)
 	// A caller may stop waiting and release its in-memory reservation before the

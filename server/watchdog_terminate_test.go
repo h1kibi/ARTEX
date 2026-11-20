@@ -70,7 +70,7 @@ func TestWatchdogTerminationSettlesIntentAndNotifiesPlanner(t *testing.T) {
 			t.Errorf("watchdog cancel lost its named cause: %v", context.Cause(workCtx))
 			return
 		}
-		s.engine.settleWatchdogTermination(task, "work#1", intent, runID, cause)
+		s.engine.settleWatchdogTermination(task, "work#1", intent, runID, cause.Text, cause.TerminalState)
 		_, complete := s.engine.detachWork(intent.ID)
 		complete(nil)
 	}()
@@ -165,7 +165,7 @@ func TestWatchdogTerminationConcurrentOnlyOneWins(t *testing.T) {
 		if !ok {
 			return
 		}
-		s.engine.settleWatchdogTermination(task, "work#1", intent, runID, cause)
+		s.engine.settleWatchdogTermination(task, "work#1", intent, runID, cause.Text, cause.TerminalState)
 		_, complete := s.engine.detachWork(intent.ID)
 		complete(nil)
 	}()
@@ -219,7 +219,7 @@ func TestWatchdogSettlementCASConflictDoesNotEmitTerminationEvent(t *testing.T) 
 	}
 	e := NewEngine(nil)
 	cause := agent.WatchdogTermination("late termination", "stopped")
-	result, settled := e.settleWatchdogTermination(task, "work#1", intent, "run-late", cause)
+	result, settled := e.settleWatchdogTermination(task, "work#1", intent, "run-late", cause.Text, cause.TerminalState)
 	if settled || result.IntentID != intent.ID {
 		t.Fatalf("late CAS settlement=%+v settled=%v, want conflict result", result, settled)
 	}

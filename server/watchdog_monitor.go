@@ -31,6 +31,9 @@ type RunMonitor struct {
 	// monitor lock. The server uses it to supersede open asks and stale queued
 	// jobs; tests can leave it nil.
 	onCycleReset func(RunSnapshot)
+	// onFinish runs exactly once per run, outside the monitor lock, after the
+	// final state is persisted. It closes that run's control-plane leftovers.
+	onFinish func(RunSnapshot)
 }
 
 type runState struct {
@@ -45,6 +48,7 @@ type runState struct {
 	LastOutputAt     time.Time
 	CycleStart       time.Time
 	CycleNo          int
+	AutoCyclesUsed   int
 	PressureSent     bool
 	SlowPathState    string
 	DecisionState    string
@@ -60,6 +64,7 @@ type runState struct {
 	SlowPathEvidence []string
 	SlowPathCycle    int
 	dirty            bool
+	finishNotified   bool // the finish hook ran once for this run
 }
 
 // RunSnapshot is a copy of one run at a point in time. The Fast Path, API and
@@ -76,6 +81,7 @@ type RunSnapshot struct {
 	LastOutputAt     time.Time `json:"last_output_at"`
 	CycleStart       time.Time `json:"cycle_start"`
 	CycleNo          int       `json:"cycle_no"`
+	AutoCyclesUsed   int       `json:"auto_cycles_used"`
 	PressureSent     bool      `json:"pressure_sent"`
 	SlowPathState    string    `json:"slow_path_state"`
 	DecisionState    string    `json:"decision_state"`
@@ -98,7 +104,8 @@ func (r *runState) snapshot() RunSnapshot {
 		TaskID: r.TaskID, IntentID: r.IntentID, RunID: r.RunID, WorkerName: r.WorkerName,
 		Phase: r.Phase, PhaseStartedAt: r.PhaseStartedAt, HeartbeatAt: r.HeartbeatAt,
 		LastEventAt: r.LastEventAt, LastOutputAt: r.LastOutputAt, CycleStart: r.CycleStart,
-		CycleNo: r.CycleNo, PressureSent: r.PressureSent, SlowPathState: r.SlowPathState,
+		CycleNo: r.CycleNo, AutoCyclesUsed: r.AutoCyclesUsed,
+		PressureSent: r.PressureSent, SlowPathState: r.SlowPathState,
 		DecisionState: r.DecisionState, State: r.State, Tool: r.Tool,
 		Facts: r.Facts, Assets: r.Assets, Findings: r.Findings,
 		ProviderError: r.ProviderError, SlowPathClass: r.SlowPathClass,
@@ -286,9 +293,8 @@ func (m *RunMonitor) Observe(runID string, a db.Activity) {
 	}
 }
 
-// markOutputLocked records an effective write. It resets the cycle, so a worker
-// that keeps producing facts/assets/findings gets a fresh 8/10/20 minute window
-// instead of being terminated on cumulative runtime.
+// markOutputLocked records an effective write. It resets only the current
+// cycle; AutoCyclesUsed is a run-wide budget and must survive every cycle reset.
 func (m *RunMonitor) markOutputLocked(r *runState, now time.Time) {
 	r.LastOutputAt = now
 	m.resetCycleLocked(r, now)
@@ -330,6 +336,21 @@ func (m *RunMonitor) SetCycle(runID string, cycleNo int, cycleStart time.Time, p
 		r.SlowPathSummary = ""
 		r.SlowPathEvidence = nil
 		r.SlowPathCycle = 0
+		r.dirty = true
+	}
+	m.mu.Unlock()
+}
+
+// RecordAutoAdvance increments the run's count of cycles advanced by a green
+// Watchdog judgment. User-approved cycles use SetCycle without this call, so
+// the displayed remaining autonomy budget tracks real automatic advances.
+func (m *RunMonitor) RecordAutoAdvance(runID string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if r := m.runs[runID]; r != nil {
+		r.AutoCyclesUsed++
 		r.dirty = true
 	}
 	m.mu.Unlock()
@@ -423,9 +444,8 @@ func (m *RunMonitor) setTaskPhase(taskID, phase string) {
 	m.mu.Unlock()
 }
 
-// ResumeTask restarts the cycle timer on any run that survived a pause. In
-// practice the pause cancels the run and it settles; this makes a fast resume
-// safe without awarding a free cycle.
+// ResumeTask restarts the cycle timer on any run that survived a pause. The
+// run-wide autonomous budget remains consumed; resuming does not award cycles.
 func (m *RunMonitor) ResumeTask(taskID string) {
 	if m == nil {
 		return
@@ -467,26 +487,60 @@ func (m *RunMonitor) Finish(runID, state string) {
 	if m.byIntent[r.IntentID] == runID {
 		delete(m.byIntent, r.IntentID)
 	}
+	notify := !r.finishNotified
+	r.finishNotified = true
 	snap := r.snapshot()
 	m.mu.Unlock()
 	m.save(snap)
+	if notify && m.onFinish != nil {
+		m.onFinish(snap)
+	}
 }
 
-// FinishTask settles every live run for a task (delete/shutdown path).
+// FinishTask settles every live run for a task. Memory state changes atomically
+// under one lock; persistence is one batch update and each once-only finish hook
+// runs outside the lock with the final snapshot.
 func (m *RunMonitor) FinishTask(taskID, state string) {
 	if m == nil {
 		return
 	}
+	if state == "" {
+		state = db.WorkerRunStateFinished
+	}
+	var snapshots []RunSnapshot
 	var runIDs []string
 	m.mu.Lock()
 	for id, r := range m.runs {
-		if r.TaskID == taskID && r.State == db.WorkerRunStateRunning {
+		if r.TaskID != taskID || r.State != db.WorkerRunStateRunning {
+			continue
+		}
+		r.State = state
+		r.LeaseUntil = time.Time{}
+		if m.byIntent[r.IntentID] == id {
+			delete(m.byIntent, r.IntentID)
+		}
+		if !r.finishNotified {
+			r.finishNotified = true
+			snapshots = append(snapshots, r.snapshot())
 			runIDs = append(runIDs, id)
 		}
 	}
 	m.mu.Unlock()
-	for _, id := range runIDs {
-		m.Finish(id, state)
+
+	if len(runIDs) == 0 {
+		return
+	}
+	if m.pg != nil {
+		ctx, cancel := m.writeCtx()
+		if err := m.pg.FinishWorkerRuns(ctx, runIDs, state); err != nil {
+			log.Printf("[watchdog] 批量结束任务运行失败 task=%s: %v", taskID, err)
+		}
+		cancel()
+	}
+	if m.onFinish != nil {
+		for _, snap := range snapshots {
+			m.onFinish(snap)
+		}
 	}
 }
 
@@ -680,7 +734,8 @@ func (m *RunMonitor) save(snap RunSnapshot) {
 func runRowFromSnapshot(s RunSnapshot) *db.WorkerRun {
 	row := &db.WorkerRun{
 		TaskID: s.TaskID, IntentID: s.IntentID, RunID: s.RunID, WorkerName: s.WorkerName,
-		Phase: s.Phase, CycleNo: s.CycleNo, PressureSent: s.PressureSent,
+		Phase: s.Phase, CycleNo: s.CycleNo, AutoCyclesUsed: s.AutoCyclesUsed,
+		PressureSent:  s.PressureSent,
 		SlowPathState: s.SlowPathState, DecisionState: s.DecisionState, State: s.State,
 	}
 	set := func(dst **time.Time, value time.Time) {
@@ -701,3 +756,7 @@ func runRowFromSnapshot(s RunSnapshot) *db.WorkerRun {
 // SetCycleResetHook installs the post-output callback. It must be called before
 // runs start (server construction); no locking is needed after that.
 func (m *RunMonitor) SetCycleResetHook(fn func(RunSnapshot)) { m.onCycleReset = fn }
+
+// SetFinishHook installs the once-per-run cleanup callback. It must be called
+// before runs start (server construction).
+func (m *RunMonitor) SetFinishHook(fn func(RunSnapshot)) { m.onFinish = fn }

@@ -563,13 +563,14 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	window := workerRuntime.CompactionWindow()
 	wk := agent.NewWorker(workerRuntime, "task-router", s.m.dir, tx, window, s.agentMaxTurns("worker"))
 	wk.SetFindingRecorder(s.evidenceStore())
+	wk.SetPeerOps(s.engine)
 	wk.SetCompactionWindowResolver(workerRuntime.CompactionWindow)
 	wk.SetNonStreaming(workerRuntime.nonStreaming) // 按任务当前激活 profile 的流式开关(每轮读)
 	wk.SetMaxTokens(workerRuntime.maxTokens)       // 同上,输出上限也跟随当前激活 profile
 	wk.SetNoaEnabled(s.m.NoaCompactionEnabled)     // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
-	// Watchdog 开启时，worker_run_seconds=0 不再原样沿用 Worker 的 1200 秒默认值：
-	// 改为不限时，让用户可连续批准 C4、C5；显式配置仍优先，任务级截止时间会在
-	// run 内继续夹逼这个值。
+	// Watchdog 开启时 run_seconds 是“单周期长度”，不再作为 SDK 的固定总运行时长：
+	// 这里把 SDK 预算置 0（不限时），由 Watchdog 的周期/用户批准决定何时结束，
+	// 任务级截止时间仍会在 run 内夹逼。关闭时 run_seconds 保持原有单次预算语义。
 	workerRunSecs := watchdogWorkerRunSeconds(s.agentRunSeconds("worker"), s.watchdogConfig())
 	wk.SetRunTimeout(time.Duration(workerRunSecs) * time.Second)
 	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())

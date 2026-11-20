@@ -93,6 +93,9 @@ type Watchdog struct {
 	maxTurns   int
 	runTimeout time.Duration
 	window     int
+	// promptOverride replaces the editable Slow Path prompt for a specialized
+	// read-only runner (resource arbitration). Empty = use the agent-key prompt.
+	promptOverride string
 }
 
 // NewWatchdog builds one judge runner. agentKey selects the editable prompt row
@@ -100,6 +103,10 @@ type Watchdog struct {
 // tool set stays fixed. maxTurns/runTimeout are clamped here so every caller
 // gets a bounded, non-runaway judge (defaults 6 turns / 120s).
 func NewWatchdog(prov llm.Provider, agentKey, workDir string, tools []actool.CoreTool, maxTurns int, runTimeout time.Duration, window int) *Watchdog {
+	return newWatchdogRunner(prov, agentKey, workDir, "", tools, maxTurns, runTimeout, window)
+}
+
+func newWatchdogRunner(prov llm.Provider, agentKey, workDir, promptOverride string, tools []actool.CoreTool, maxTurns int, runTimeout time.Duration, window int) *Watchdog {
 	if maxTurns <= 0 {
 		maxTurns = 6
 	}
@@ -110,7 +117,43 @@ func NewWatchdog(prov llm.Provider, agentKey, workDir string, tools []actool.Cor
 		agentKey = "watchdog"
 	}
 	return &Watchdog{prov: prov, agentKey: agentKey, workDir: workDir, tools: tools,
-		maxTurns: maxTurns, runTimeout: runTimeout, window: window}
+		maxTurns: maxTurns, runTimeout: runTimeout, window: window, promptOverride: promptOverride}
+}
+
+// runJudge owns the read-only SDK session shared by Slow Path and arbitration.
+// Callers pass the complete system prompt and user input, then parse the final
+// text under their own output rules.
+func (w *Watchdog) runJudge(ctx context.Context, runID, system, input string) (string, error) {
+	if w == nil || w.prov == nil {
+		return "", fmt.Errorf("Watchdog Agent 没有可用的模型配置")
+	}
+	workdir := filepath.Join(w.workDir, "watchdog", runID)
+	if err := os.MkdirAll(workdir, 0o755); err != nil {
+		return "", fmt.Errorf("创建 Watchdog 工作目录: %w", err)
+	}
+	// The judge has no write tools; its run directory exists only for the SDK's
+	// session/tool-output plumbing. Remove it when the judgment ends so a long
+	// task does not accumulate one directory per quarter-hour.
+	defer os.RemoveAll(workdir)
+	opts := agentcore.Options{
+		Provider:       w.prov,
+		SystemPrompt:   []string{system},
+		Tools:          w.tools,
+		PermissionMode: permission.ModeBypass,
+		WorkingDir:     workdir,
+		MaxTurns:       w.maxTurns,
+		MaxDuration:    w.runTimeout,
+		Compaction:     compactionConfig(w.window),
+		ToolOutputDir:  filepath.Join(workdir, "cmd-output"),
+	}
+	text, reason, err := captureRun(ctx, opts, input, nil)
+	if err != nil {
+		return "", err
+	}
+	if reason == harness.ReasonTimeout {
+		return "", fmt.Errorf("Watchdog Agent 运行超时: %w", context.DeadlineExceeded)
+	}
+	return text, nil
 }
 
 // Analyze runs one judgment over the supplied snapshot. The agent's final text
@@ -124,33 +167,14 @@ func (w *Watchdog) Analyze(ctx context.Context, runID string, snapshot json.RawM
 	if len(snapshot) == 0 {
 		return report, fmt.Errorf("Watchdog 快照为空")
 	}
-	workdir := filepath.Join(w.workDir, "watchdog", runID)
-	if err := os.MkdirAll(workdir, 0o755); err != nil {
-		return report, fmt.Errorf("创建 Watchdog 工作目录: %w", err)
-	}
-	// The judge has no write tools; its run directory exists only for the SDK's
-	// session/tool-output plumbing. Remove it when the judgment ends so a long
-	// task does not accumulate one directory per quarter-hour.
-	defer os.RemoveAll(workdir)
-	system := renderSystem(w.agentKey, watchdogDefaultTmpl, struct{ Now, DataDir string }{nowStr(), w.workDir})
-	opts := agentcore.Options{
-		Provider:       w.prov,
-		SystemPrompt:   []string{system},
-		Tools:          w.tools,
-		PermissionMode: permission.ModeBypass,
-		WorkingDir:     workdir,
-		MaxTurns:       w.maxTurns,
-		MaxDuration:    w.runTimeout,
-		Compaction:     compactionConfig(w.window),
-		ToolOutputDir:  filepath.Join(workdir, "cmd-output"),
+	system := w.promptOverride
+	if strings.TrimSpace(system) == "" {
+		system = renderSystem(w.agentKey, watchdogDefaultTmpl, struct{ Now, DataDir string }{nowStr(), w.workDir})
 	}
 	input := "请判断下面这次运行。只输出约定的 JSON 对象。\n\n" + string(snapshot)
-	text, reason, err := captureRun(ctx, opts, input, nil)
+	text, err := w.runJudge(ctx, runID, system, input)
 	if err != nil {
 		return report, err
-	}
-	if reason == harness.ReasonTimeout {
-		return report, fmt.Errorf("Watchdog Agent 运行超时: %w", context.DeadlineExceeded)
 	}
 	report, err = ParseWatchdogReport(text)
 	if err != nil {
@@ -163,6 +187,18 @@ func (w *Watchdog) Analyze(ctx context.Context, runID string, snapshot json.RawM
 // markdown fence. It does not invent missing fields; Validate rejects them.
 func ParseWatchdogReport(text string) (WatchdogReport, error) {
 	var report WatchdogReport
+	if err := parseJSONObject(text, &report); err != nil {
+		return report, err
+	}
+	if err := report.Validate(); err != nil {
+		return report, err
+	}
+	return report, nil
+}
+
+// parseJSONObject accepts a bare JSON object or one wrapped in a single
+// markdown fence. It does not invent missing fields.
+func parseJSONObject(text string, dst any) error {
 	s := strings.TrimSpace(text)
 	s = strings.TrimPrefix(s, "```json")
 	s = strings.TrimPrefix(s, "```JSON")
@@ -172,13 +208,7 @@ func ParseWatchdogReport(text string) (WatchdogReport, error) {
 	start := strings.IndexByte(s, '{')
 	end := strings.LastIndexByte(s, '}')
 	if start < 0 || end <= start {
-		return report, fmt.Errorf("没有找到 JSON 对象")
+		return fmt.Errorf("没有找到 JSON 对象")
 	}
-	if err := json.Unmarshal([]byte(s[start:end+1]), &report); err != nil {
-		return report, err
-	}
-	if err := report.Validate(); err != nil {
-		return report, err
-	}
-	return report, nil
+	return json.Unmarshal([]byte(s[start:end+1]), dst)
 }

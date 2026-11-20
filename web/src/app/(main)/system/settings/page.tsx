@@ -55,10 +55,11 @@ export default function SystemSettingsPage() {
   const [watchdogEnabled, setWatchdogEnabled] = React.useState(false);
   const [watchdogPressure, setWatchdogPressure] = React.useState("480");
   const [watchdogSlow, setWatchdogSlow] = React.useState("600");
-  const [watchdogCycle, setWatchdogCycle] = React.useState("1200");
+  const [watchdogMaxAuto, setWatchdogMaxAuto] = React.useState("2");
   const [watchdogAgentKey, setWatchdogAgentKey] = React.useState("watchdog");
   const [watchdogRetry, setWatchdogRetry] = React.useState("300");
-  const [workerRunSeconds, setWorkerRunSeconds] = React.useState("0");
+  // 只读回显：唯一周期来源是 Worker Agent 的 run_seconds（Agent 管理页修改）。
+  const [workerRunSeconds, setWorkerRunSeconds] = React.useState("1200");
   const [savingWatchdog, setSavingWatchdog] = React.useState(false);
   // 纯前端偏好：不走 /api/settings，直接读写 localStorage。
   const sendMode = useChatSendMode();
@@ -80,10 +81,10 @@ export default function SystemSettingsPage() {
     setWatchdogEnabled(!!s.watchdog_enabled);
     setWatchdogPressure(String(s.watchdog_pressure_after_sec ?? 480));
     setWatchdogSlow(String(s.watchdog_slow_path_after_sec ?? 600));
-    setWatchdogCycle(String(s.watchdog_cycle_after_sec ?? 1200));
+    setWatchdogMaxAuto(String(s.watchdog_max_auto_cycles ?? 2));
     setWatchdogAgentKey(s.watchdog_agent_key ?? "watchdog");
     setWatchdogRetry(String(s.watchdog_agent_retry_sec ?? 300));
-    setWorkerRunSeconds(String(s.worker_run_seconds ?? 0));
+    setWorkerRunSeconds(String(s.worker_run_seconds ?? 1200));
   }, []);
 
   const saveWorkers = () => {
@@ -204,15 +205,23 @@ export default function SystemSettingsPage() {
   const saveWatchdog = () => {
     const pressure = Number(watchdogPressure);
     const slow = Number(watchdogSlow);
-    const cycle = Number(watchdogCycle);
+    const maxAuto = Number(watchdogMaxAuto);
     const retry = Number(watchdogRetry);
     const runSeconds = Number(workerRunSeconds);
-    if (![pressure, slow, cycle, retry, runSeconds].every((n) => Number.isInteger(n) && n >= 0)) {
+    if (![pressure, slow, maxAuto, retry].every((n) => Number.isInteger(n) && n >= 0)) {
       toast.error("阈值必须是非负整数");
       return;
     }
-    if (!(pressure > 0 && slow > pressure && cycle > slow)) {
-      toast.error("阈值必须满足：压力提示 < 慢速判断 < 周期处理");
+    if (!(pressure > 0 && slow > pressure)) {
+      toast.error("阈值必须满足：压力提示 < 慢速判断");
+      return;
+    }
+    if (runSeconds > 0 && slow >= runSeconds) {
+      toast.error(`慢速判断必须小于 Worker 单周期长度（${runSeconds} 秒，可在 Agent 管理页修改）`);
+      return;
+    }
+    if (maxAuto < 1 || maxAuto > 4) {
+      toast.error("Watchdog 自主放行周期数必须是 1 到 4");
       return;
     }
     if (retry <= 0) {
@@ -224,10 +233,9 @@ export default function SystemSettingsPage() {
       .setSettings({
         watchdog_pressure_after_sec: pressure,
         watchdog_slow_path_after_sec: slow,
-        watchdog_cycle_after_sec: cycle,
+        watchdog_max_auto_cycles: maxAuto,
         watchdog_agent_key: watchdogAgentKey.trim(),
         watchdog_agent_retry_sec: retry,
-        worker_run_seconds: runSeconds,
       })
       .then((s) => {
         apply(s);
@@ -776,7 +784,7 @@ export default function SystemSettingsPage() {
                 onCheckedChange={toggleWatchdog}
               />
             </div>
-            <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
               <div className="grid gap-1">
                 <Label htmlFor="watchdog-pressure" className="text-xs text-muted-foreground">
                   压力提示（秒）
@@ -804,17 +812,27 @@ export default function SystemSettingsPage() {
                 />
               </div>
               <div className="grid gap-1">
-                <Label htmlFor="watchdog-cycle" className="text-xs text-muted-foreground">
-                  周期处理（秒）
+                <Label htmlFor="watchdog-max-auto" className="text-xs text-muted-foreground">
+                  Watchdog 自主放行周期数（1-4）
                 </Label>
                 <Input
-                  id="watchdog-cycle"
+                  id="watchdog-max-auto"
                   type="number"
                   min={1}
-                  value={watchdogCycle}
+                  max={4}
+                  value={watchdogMaxAuto}
                   disabled={!loaded || savingWatchdog}
-                  onChange={(e) => setWatchdogCycle(e.target.value)}
+                  onChange={(e) => setWatchdogMaxAuto(e.target.value)}
                 />
+              </div>
+              <div className="grid gap-1">
+                <span className="text-xs text-muted-foreground">Worker 单周期长度（秒）</span>
+                <div className="flex h-9 items-center rounded-md border border-input bg-muted/40 px-3 text-sm tabular-nums">
+                  {workerRunSeconds}
+                  <span className="ml-2 text-[10px] font-normal text-muted-foreground">
+                    在「Agent 管理」的 Worker Agent run_seconds 修改
+                  </span>
+                </div>
               </div>
             </div>
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
@@ -843,19 +861,10 @@ export default function SystemSettingsPage() {
                 />
               </div>
             </div>
-            <div className="grid gap-1">
-              <Label htmlFor="watchdog-worker-run" className="text-xs text-muted-foreground">
-                Worker 单次运行时限（秒，0=开启看护时不限时、由任务截止时间约束；&gt;0 显式覆盖）
-              </Label>
-              <Input
-                id="watchdog-worker-run"
-                type="number"
-                min={0}
-                value={workerRunSeconds}
-                disabled={!loaded || savingWatchdog}
-                onChange={(e) => setWorkerRunSeconds(e.target.value)}
-              />
-            </div>
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              每个周期到达后，Slow Path 的 continue 只有在自主放行预算内才自动进入下一周期；预算用完后需要用户判断卡批准。
+              开启看护时 Worker 不再受固定总时长限制，任务截止时间仍是外部上限，max_turns 独立生效。
+            </p>
             <div>
               <Button onClick={saveWatchdog} disabled={!loaded || savingWatchdog}>
                 {savingWatchdog ? "保存中…" : "保存看护配置"}

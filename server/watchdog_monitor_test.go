@@ -32,17 +32,20 @@ func TestRunMonitorPhasesAndEffectiveOutputResetCycle(t *testing.T) {
 		t.Fatalf("approval phase=%+v", snap)
 	}
 
+	// Autonomous advances belong to the run, not to the current cycle chain.
+	m.RecordAutoAdvance("run-a")
+	m.RecordAutoAdvance("run-a")
 	// Leave approval and spend time in the old cycle; then a successful fact write
-	// must reset the entire cycle back to C0 and update last_output_at.
+	// must reset the current cycle back to C0 and update last_output_at.
 	now = now.Add(10 * time.Minute)
 	m.SetCycle("run-a", 2, now.Add(-10*time.Minute), true, db.SlowPathDone, db.WatchdogDecisionOpen)
 	m.Observe("run-a", db.Activity{Kind: "thinking"})
 	now = now.Add(5 * time.Minute)
 	m.Observe("run-a", db.Activity{Kind: "tool_result", Tool: "record_fact", Detail: `{"id":1}`})
 	snap = *m.Lookup(113)
-	if snap.CycleNo != 0 || snap.PressureSent || snap.SlowPathState != db.SlowPathNone ||
+	if snap.CycleNo != 0 || snap.AutoCyclesUsed != 2 || snap.PressureSent || snap.SlowPathState != db.SlowPathNone ||
 		snap.DecisionState != db.WatchdogDecisionNone || snap.Facts != 1 {
-		t.Fatalf("effective output did not reset cycle: %+v", snap)
+		t.Fatalf("effective output did not reset cycle without resetting budget: %+v", snap)
 	}
 	if !snap.LastOutputAt.Equal(now) {
 		t.Fatalf("last_output_at=%v want %v", snap.LastOutputAt, now)
@@ -70,38 +73,42 @@ func TestRunMonitorPauseResumeAndFinish(t *testing.T) {
 	now := time.Now()
 	m := newTestMonitor(t, &now, nil)
 	m.Register("2", 11, "run-p", "work#1")
+	m.RecordAutoAdvance("run-p")
+	m.RecordAutoAdvance("run-p")
 	m.PauseTask("2")
 	if snap := m.Lookup(11); snap == nil || snap.Phase != db.WorkerRunPhasePaused {
 		t.Fatalf("pause=%+v", snap)
 	}
 	now = now.Add(time.Minute)
 	m.ResumeTask("2")
-	if snap := m.Lookup(11); snap == nil || snap.Phase != db.WorkerRunPhaseLLM || !snap.CycleStart.Equal(now) {
-		t.Fatalf("resume=%+v", snap)
+	if snap := m.Lookup(11); snap == nil || snap.Phase != db.WorkerRunPhaseLLM || !snap.CycleStart.Equal(now) || snap.AutoCyclesUsed != 2 {
+		t.Fatalf("resume changed run budget=%+v", snap)
 	}
 	m.Finish("run-p", db.WorkerRunStateFinished)
 	if snap := m.Lookup(11); snap != nil {
 		t.Fatalf("finished run still lookup-able: %+v", snap)
 	}
-	if snap := m.LookupRun("run-p"); snap == nil || snap.State != db.WorkerRunStateFinished {
+	if snap := m.LookupRun("run-p"); snap == nil || snap.State != db.WorkerRunStateFinished || snap.AutoCyclesUsed != 2 {
 		t.Fatalf("finished history=%+v", snap)
 	}
 	m.RemoveTask("2")
 	if snap := m.LookupRun("run-p"); snap != nil {
 		t.Fatalf("removed run still present: %+v", snap)
 	}
+
 }
 
 func TestRunMonitorApprovalExitResetsCycleAndRunsHook(t *testing.T) {
 	now := time.Date(2026, 11, 18, 10, 0, 0, 0, time.UTC)
 	m := newTestMonitor(t, &now, nil)
 	m.Register("2", 14, "run-approval", "work#1")
+	m.RecordAutoAdvance("run-approval")
 	m.SetSlowPath("run-approval", db.SlowPathQueued, "", "", nil, 0)
 	calls := 0
 	m.SetCycleResetHook(func(snap RunSnapshot) {
 		calls++
-		if snap.CycleNo != 0 {
-			t.Errorf("hook cycle=%d want C0", snap.CycleNo)
+		if snap.CycleNo != 0 || snap.AutoCyclesUsed != 1 {
+			t.Errorf("hook cycle/budget=%d/%d want 0/1", snap.CycleNo, snap.AutoCyclesUsed)
 		}
 	})
 	m.Phase("run-approval", db.WorkerRunPhaseApproval, "")
@@ -110,8 +117,8 @@ func TestRunMonitorApprovalExitResetsCycleAndRunsHook(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("cycle reset hook calls=%d, want 1", calls)
 	}
-	if snap := m.LookupRun("run-approval"); snap == nil || !snap.CycleStart.Equal(now) {
-		t.Fatalf("approval exit did not reset cycle start: %+v", snap)
+	if snap := m.LookupRun("run-approval"); snap == nil || !snap.CycleStart.Equal(now) || snap.AutoCyclesUsed != 1 {
+		t.Fatalf("approval exit changed run budget=%+v", snap)
 	}
 }
 

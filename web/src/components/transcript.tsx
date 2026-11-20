@@ -99,7 +99,7 @@ function groupSteps(steps: Activity[], chat: boolean): Group[] {
       out.push({ type: "intercept", key: s.seq, step: s });
       continue;
     }
-    if (s.kind.startsWith("watchdog_") || s.kind === "provider_error") {
+    if (s.kind.startsWith("watchdog_") || s.kind.startsWith("peer_") || s.kind === "provider_error") {
       out.push({ type: "watchdog", key: s.seq, step: s });
       continue;
     }
@@ -133,6 +133,28 @@ function groupSteps(steps: Activity[], chat: boolean): Group[] {
     else out.push({ type: "msg", key: s.seq, worker: s.worker, steps: [s] });
   }
   return out;
+}
+
+// sortDecisionGroups lifts the currently OPEN watchdog cards above the normal
+// history, newest first. Everything else keeps the original order; the raw
+// activity array is never sorted, so tool pairing and round boundaries stay
+// intact. Closed cards (answered/expired/superseded) stay where they were.
+const EMPTY_OPEN_IDS: ReadonlySet<string> = new Set();
+export function sortDecisionGroups(groups: Group[], openIDs: ReadonlySet<string>): Group[] {
+  if (!openIDs || openIDs.size === 0) return groups;
+  const decisions: Extract<Group, { type: "watchdog" }>[] = [];
+  const rest: Group[] = [];
+  for (const g of groups) {
+    const requestID = g.type === "watchdog" ? g.step.metadata?.watchdog?.request_id : undefined;
+    if (g.type === "watchdog" && requestID != null && openIDs.has(String(requestID))) {
+      decisions.push(g);
+    } else {
+      rest.push(g);
+    }
+  }
+  if (decisions.length === 0) return groups;
+  decisions.sort((a, b) => b.step.seq - a.step.seq);
+  return [...decisions, ...rest];
 }
 
 const kindLabel = (k: string) => (k === "thinking" ? "推理" : k === "result" ? "总结" : "说明");
@@ -690,6 +712,7 @@ function ExecView({
   focusedSeq,
   onOpenIntent,
   onChanged,
+  openWatchdogIDs,
 }: {
   activity: Activity[];
   taskId?: string;
@@ -698,6 +721,7 @@ function ExecView({
   focusedSeq?: number;
   onOpenIntent?: (intentId: string) => void;
   onChanged?: () => void;
+  openWatchdogIDs?: ReadonlySet<string>;
 }) {
   const showWorker = new Set(activity.map((a) => a.worker)).size > 1;
   // default detail fetcher: the task-scoped activity endpoint. The chat page passes
@@ -708,7 +732,7 @@ function ExecView({
   );
   return (
     <div className="flex flex-col">
-      {groupSteps(activity, !!chat).map((g) =>
+      {sortDecisionGroups(groupSteps(activity, !!chat), openWatchdogIDs ?? EMPTY_OPEN_IDS).map((g) =>
         g.type === "round" ? (
           <div key={"r" + g.key} className="my-2 flex items-center gap-2 text-[10px] font-medium text-muted-foreground">
             <span className="h-px flex-1 bg-border" />
@@ -760,6 +784,7 @@ export function Transcript({
   focusedSeq,
   onOpenIntent,
   onChanged,
+  openWatchdogIDs,
 }: {
   activity: Activity[];
   live?: boolean;
@@ -769,6 +794,7 @@ export function Transcript({
   focusedSeq?: number;
   onOpenIntent?: (intentId: string) => void;
   onChanged?: () => void;
+  openWatchdogIDs?: ReadonlySet<string>;
 }) {
   const transcriptRef = React.useRef<HTMLDivElement>(null);
   const [focusPadding, setFocusPadding] = React.useState(0);
@@ -792,6 +818,7 @@ export function Transcript({
         focusedSeq={focusedSeq}
         onOpenIntent={onOpenIntent}
         onChanged={onChanged}
+        openWatchdogIDs={openWatchdogIDs}
       />
       {live && (
         <div className="flex items-center gap-2 pl-2 pt-1 text-xs text-muted-foreground">

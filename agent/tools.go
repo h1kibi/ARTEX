@@ -77,6 +77,9 @@ type ToolSet struct {
 	// intent id (engine callback, wired by the planner): the worker injects it before
 	// its next tool call and re-plans, without being killed. nil = tool unavailable.
 	steerWork func(intentID int64, msg string) error
+	// peerOps is the engine-side registry for worker-to-worker resource requests.
+	// nil = the peer tools report unavailable (non-worker agents, tests).
+	peerOps PeerOps
 	// enrich, if set, receives async auto-completion triggers (DNS resolve for a
 	// domain, HTTP probe for a site). nil = no engine enrichment.
 	enrich EnrichTrigger
@@ -108,6 +111,20 @@ type ToolSet struct {
 	// agent + cross-task orchestration; nil elsewhere → falls back to the bare notify.
 	notifyHint func(texts []string)
 }
+
+// PeerOps is the engine-side registry for worker-to-worker resource requests.
+// The agent package only sees this interface so it does not depend on server.
+type PeerOps interface {
+	CreatePeerRequest(fromIntentID, toIntentID int64, requestType, reason string) (string, error)
+	AnswerPeerRequest(receiverIntentID int64, requestID, answer, reason string) error
+	CancelPeerRequest(fromIntentID int64, requestID string) error
+	ReleasePeerRequest(receiverIntentID int64, requestID string) error
+	RequestPeerArbitration(fromIntentID int64, requestID, reason string) error
+}
+
+// SetPeerOps wires the per-task peer request registry. Workers set it on each
+// run; other agents leave it nil so the tools stay unavailable.
+func (t *ToolSet) SetPeerOps(ops PeerOps) { t.peerOps = ops }
 
 // SetNotifyGoal wires the goal-add trigger callback (see ToolSet.notifyGoal). Set only
 // by the main-agent chat, so runtime-added goals are announced to the planner by name.

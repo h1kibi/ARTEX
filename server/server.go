@@ -156,9 +156,16 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		provByProfile:  map[int64]*provEntry{}, llmHealth: newLLMHealthRegistry(m.pg),
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
+	// One-time upgrade from the duplicated watchdog cycle settings; must run
+	// before the runtime reads its configuration.
+	if err := s.migrateWatchdogSettings(); err != nil {
+		log.Fatalf("[watchdog] 配置迁移失败: %v", err)
+	}
 	s.watchdog = newWatchdogRuntime(s, time.Now)
 	s.engine.SetRunMonitor(s.watchdog.monitor)
+	s.engine.SetPeerArbitrationRunner(s.watchdog.service.EnqueueArbitration)
 	s.watchdog.monitor.SetCycleResetHook(s.watchdogOnCycleReset)
+	s.watchdog.monitor.SetFinishHook(s.watchdogOnRunFinish)
 	// 熔断阈值/冷却是失败路径上的热参数，启动时把全局重试策略推给 Registry 一次；
 	// 之后每次保存策略再推一次（saveLLMRetryPolicy）。
 	s.applyRetryPolicy()
@@ -3415,36 +3422,33 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		NotifyBaseURL    *string `json:"notify_public_base_url"`
 		NotifyDigestMins *int    `json:"notify_digest_interval_min"`
 		// Watchdog 配置。阈值只在这里校验一次，运行期直接使用已归一的值。
-		WatchdogEnabled     *bool   `json:"watchdog_enabled"`
-		WatchdogPressureSec *int    `json:"watchdog_pressure_after_sec"`
-		WatchdogSlowPathSec *int    `json:"watchdog_slow_path_after_sec"`
-		WatchdogCycleSec    *int    `json:"watchdog_cycle_after_sec"`
-		WatchdogAgentKey    *string `json:"watchdog_agent_key"`
-		WatchdogAgentRetry  *int    `json:"watchdog_agent_retry_sec"`
-		WorkerRunSeconds    *int    `json:"worker_run_seconds"`
+		WatchdogEnabled      *bool   `json:"watchdog_enabled"`
+		WatchdogPressureSec  *int    `json:"watchdog_pressure_after_sec"`
+		WatchdogSlowPathSec  *int    `json:"watchdog_slow_path_after_sec"`
+		WatchdogAgentKey     *string `json:"watchdog_agent_key"`
+		WatchdogAgentRetry   *int    `json:"watchdog_agent_retry_sec"`
+		WatchdogMaxAutoCycle *int    `json:"watchdog_max_auto_cycles"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
 	watchdogChanged := req.WatchdogEnabled != nil || req.WatchdogPressureSec != nil || req.WatchdogSlowPathSec != nil ||
-		req.WatchdogCycleSec != nil || req.WatchdogAgentKey != nil || req.WatchdogAgentRetry != nil ||
-		req.WorkerRunSeconds != nil
+		req.WatchdogAgentKey != nil || req.WatchdogAgentRetry != nil || req.WatchdogMaxAutoCycle != nil
 	if watchdogChanged {
 		if err := s.applyWatchdogSettings(watchdogSettingsPatch{
-			Enabled:     req.WatchdogEnabled,
-			PressureSec: req.WatchdogPressureSec,
-			SlowPathSec: req.WatchdogSlowPathSec,
-			CycleSec:    req.WatchdogCycleSec,
-			AgentKey:    req.WatchdogAgentKey,
-			AgentRetry:  req.WatchdogAgentRetry,
-			WorkerRun:   req.WorkerRunSeconds,
+			Enabled:       req.WatchdogEnabled,
+			PressureSec:   req.WatchdogPressureSec,
+			SlowPathSec:   req.WatchdogSlowPathSec,
+			AgentKey:      req.WatchdogAgentKey,
+			AgentRetry:    req.WatchdogAgentRetry,
+			MaxAutoCycles: req.WatchdogMaxAutoCycle,
 		}); err != nil {
 			writeErr(w, 400, err.Error())
 			return
 		}
-		// worker_run_seconds 只在构造任务 agent bundle 时读取；丢弃缓存让下一次运行
-		// 用新阈值。正在执行的 run 保持原预算，避免中途改变已承诺的时限。
+		// Watchdog 开关与周期只影响下一次运行的预算；丢弃缓存让下一次运行按新
+		// 配置构造 Worker。正在执行的 run 保持已承诺的配置。
 		s.invalidateTaskAgents()
 	}
 	if req.ConstraintsInjectPlanner != nil {

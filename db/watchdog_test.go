@@ -73,6 +73,36 @@ WHERE table_name='exploration_nodes' AND column_name='terminal_reason')`).Scan(&
 	}
 }
 
+func TestFinishWorkerRunsUpdatesOnlyRequestedRows(t *testing.T) {
+	d, _, _ := testSetup(t)
+	defer d.Close()
+	ctx := context.Background()
+	taskID := watchdogTestTaskID(t)
+	defer d.DeleteWatchdogTaskData(ctx, taskID)
+	now := time.Now().UTC()
+	for i, runID := range []string{"run-batch-a", "run-batch-b", "run-batch-other"} {
+		if err := d.SaveWorkerRun(ctx, &WorkerRun{
+			TaskID: taskID, IntentID: int64(i + 1), RunID: runID, WorkerName: "worker",
+			Phase: WorkerRunPhaseTool, HeartbeatAt: &now, State: WorkerRunStateRunning,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.FinishWorkerRuns(ctx, []string{"run-batch-a", "run-batch-b"}, WorkerRunStateAbandoned); err != nil {
+		t.Fatal(err)
+	}
+	for _, runID := range []string{"run-batch-a", "run-batch-b"} {
+		row, err := d.WorkerRunByID(ctx, runID)
+		if err != nil || row == nil || row.State != WorkerRunStateAbandoned || row.LeaseUntil != nil {
+			t.Fatalf("finished row %s=%+v err=%v", runID, row, err)
+		}
+	}
+	row, err := d.WorkerRunByID(ctx, "run-batch-other")
+	if err != nil || row == nil || row.State != WorkerRunStateRunning {
+		t.Fatalf("unselected row=%+v err=%v", row, err)
+	}
+}
+
 func TestWatchdogJobsQueueAndRetry(t *testing.T) {
 	d, _, _ := testSetup(t)
 	defer d.Close()

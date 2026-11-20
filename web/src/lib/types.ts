@@ -636,6 +636,13 @@ export type ActivityKind =
   | "watchdog_unavailable" // Watchdog Agent is unavailable; its queue is retained
   | "watchdog_decision" // the user's choice on a decision card
   | "watchdog_terminated" // Fast Path terminated one worker
+  | "watchdog_run_finished" // a run ended and its control-plane leftovers were closed
+  | "peer_request" // a worker asked another worker for a resource
+  | "peer_answer" // the receiver answered / confirmed a release
+  | "peer_cancel" // the requester cancelled; carries status cancelled
+  | "peer_request_expired" // the request or one side's run ended
+  | "peer_arbitration" // Watchdog judged a stuck peer request
+  | "peer_arbitration_failed" // the arbitration run failed; no resource action
   | "provider_error"; // final provider failure after the task model chain gave up
 
 // ChatAttachment 是一次上传的文件:path 相对该会话/任务工作目录(即 agent 的 CWD)。
@@ -660,6 +667,7 @@ export interface Activity {
   metadata?: {
     llm_transition?: LLMTransition;
     watchdog?: WatchdogActivityMeta;
+    peer?: PeerActivityMeta;
   };
   source_task_id?: string;
   inherited?: boolean;
@@ -690,6 +698,24 @@ export interface WatchdogActivityMeta {
   evidence?: string[];
 }
 
+// PeerActivityMeta is attached to peer_* activities: worker-to-worker resource
+// requests and Watchdog arbitration. State lives in Engine memory; this is the
+// durable audit card.
+export interface PeerActivityMeta {
+  request_id?: string;
+  from_intent_id?: number;
+  to_intent_id?: number;
+  from_worker?: string;
+  to_worker?: string;
+  request_type?: string; // release_container_slot | request_container_slot
+  status?: string; // pending | delivered | accepted | rejected | released | cancelled | expired
+  reason?: string;
+  answer?: string;
+  decision?: string; // keep | release | terminate | requested | stale | failed
+  cooldown_sec?: number;
+  upgrade_sec?: number;
+}
+
 export interface WatchdogRun {
   task_id: string;
   intent_id: number;
@@ -713,6 +739,9 @@ export interface WatchdogRun {
   provider_error?: string;
   slow_path_class?: string;
   slow_path_summary?: string;
+  max_auto_cycles?: number;
+  auto_cycles_used?: number;
+  auto_cycles_remaining?: number;
 }
 
 // WatchdogRequest is one system-audit card. watchdog_ask carries the user
@@ -1033,12 +1062,12 @@ export interface Settings {
   notify_digest_interval_min?: number; // 汇总模式周期（分钟），默认 30
   // ---- 运行看护（Watchdog）----
   watchdog_enabled?: boolean; // 生产默认关；打开后启用 8/10/20 分钟规则与 Slow Path
-  watchdog_pressure_after_sec?: number; // 8 分钟压力提示
-  watchdog_slow_path_after_sec?: number; // 10 分钟慢速判断
-  watchdog_cycle_after_sec?: number; // 20 分钟周期处理
+  watchdog_pressure_after_sec?: number; // 当前周期内的压力提示
+  watchdog_slow_path_after_sec?: number; // 当前周期内的慢速判断
+  watchdog_max_auto_cycles?: number; // 自主放行周期数 1..4，默认 2
   watchdog_agent_key?: string; // 慢速判断使用的 Agent key，默认 watchdog
   watchdog_agent_retry_sec?: number; // Agent 不可用后的自动重试间隔，默认 300
-  worker_run_seconds?: number; // >0 时覆盖 worker 单次运行时限；0=沿用 Agent 配置
+  worker_run_seconds?: number; // 只读回显：Worker Agent 的 run_seconds（唯一周期来源）
 }
 
 // ---- 漏洞 IM 推送 ----

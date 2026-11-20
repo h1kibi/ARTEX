@@ -106,6 +106,7 @@ func (s *Server) toolGetWorkerHealth() actool.CoreTool {
 			if a.TaskID == "" {
 				return actool.Errorf("task_id 为必填"), nil
 			}
+			maxAuto := s.watchdogConfig().MaxAutoCycles
 			var out []watchdogRunDTO
 			if s.watchdog != nil && s.watchdog.monitor != nil {
 				for _, snap := range s.watchdog.monitor.ListRunning(a.TaskID) {
@@ -115,7 +116,9 @@ func (s *Server) toolGetWorkerHealth() actool.CoreTool {
 					if a.RunID != "" && snap.RunID != a.RunID {
 						continue
 					}
-					out = append(out, watchdogRunDTOFromSnapshot(snap))
+					dto := watchdogRunDTOFromSnapshot(snap)
+					dto.applyAutoBudget(maxAuto, snap.AutoCyclesUsed)
+					out = append(out, dto)
 				}
 			} else if s.m != nil && s.m.pg != nil {
 				rows, err := s.m.pg.ListWorkerRuns(ctx, a.TaskID, true)
@@ -129,7 +132,9 @@ func (s *Server) toolGetWorkerHealth() actool.CoreTool {
 					if a.RunID != "" && row.RunID != a.RunID {
 						continue
 					}
-					out = append(out, watchdogRunDTOFromDB(row))
+					dto := watchdogRunDTOFromDB(row)
+					dto.applyAutoBudget(maxAuto, row.AutoCyclesUsed)
+					out = append(out, dto)
 				}
 			}
 			return jsonResult(map[string]any{"runs": out})

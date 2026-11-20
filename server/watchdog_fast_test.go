@@ -50,7 +50,7 @@ func TestDecideCycleTable(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := decideCycle(tc.cycle, tc.signal, tc.answer)
+			got := decideCycle(tc.cycle, tc.cycle, defaultWatchdogMaxAuto, tc.signal, tc.answer)
 			if got.Action != tc.action || got.NextCycle != tc.next || got.TerminalState != tc.terminal {
 				t.Fatalf("decision=%+v want action=%s next=%d terminal=%s", got, tc.action, tc.next, tc.terminal)
 			}
@@ -64,6 +64,105 @@ func TestDecideCycleTable(t *testing.T) {
 	}
 }
 
+func TestDecideCycleAutoBudget(t *testing.T) {
+	cases := []struct {
+		name    string
+		maxAuto int
+		cycle   int
+		signal  cycleSignal
+		answer  cycleAnswer
+		action  cycleAction
+		next    int
+	}{
+		{"N1 C0 green -> C1", 1, 0, cycleSignalGreen, cycleAnswerNone, cycleActionNext, 1},
+		{"N1 C1 green -> ask", 1, 1, cycleSignalGreen, cycleAnswerNone, cycleActionRequest, 2},
+		{"N2 C0 green -> C1", 2, 0, cycleSignalGreen, cycleAnswerNone, cycleActionNext, 1},
+		{"N2 C1 green -> C2", 2, 1, cycleSignalGreen, cycleAnswerNone, cycleActionNext, 2},
+		{"N2 C2 green -> ask", 2, 2, cycleSignalGreen, cycleAnswerNone, cycleActionRequest, 3},
+		{"N3 C2 green -> C3", 3, 2, cycleSignalGreen, cycleAnswerNone, cycleActionNext, 3},
+		{"N3 C3 green -> ask", 3, 3, cycleSignalGreen, cycleAnswerNone, cycleActionRequest, 4},
+		{"N4 C3 green -> C4", 4, 3, cycleSignalGreen, cycleAnswerNone, cycleActionNext, 4},
+		{"N4 C4 green -> ask", 4, 4, cycleSignalGreen, cycleAnswerNone, cycleActionRequest, 5},
+		{"ask yes advances", 2, 1, cycleSignalAsk, cycleAnswerYes, cycleActionNext, 2},
+		{"ask no stops", 2, 1, cycleSignalAsk, cycleAnswerNo, cycleActionTerminate, 0},
+		{"ask silence exhausts", 2, 1, cycleSignalAsk, cycleAnswerNone, cycleActionTerminate, 0},
+		{"C0 ask silence advances", 4, 0, cycleSignalAsk, cycleAnswerNone, cycleActionNext, 1},
+		{"terminate stops", 4, 2, cycleSignalTerminate, cycleAnswerNone, cycleActionTerminate, 0},
+		{"no signal exhausts", 4, 2, cycleSignalNone, cycleAnswerNone, cycleActionTerminate, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := decideCycle(tc.cycle, tc.cycle, tc.maxAuto, tc.signal, tc.answer)
+			if got.Action != tc.action || got.NextCycle != tc.next {
+				t.Fatalf("decision=%+v want action=%s next=%d", got, tc.action, tc.next)
+			}
+			if tc.action == cycleActionTerminate && got.TerminalState == "" {
+				t.Fatal("terminate decision missing terminal state")
+			}
+		})
+	}
+}
+
+func TestDecideCycleUsesCumulativeAutoBudget(t *testing.T) {
+	if got := decideCycle(0, 2, 2, cycleSignalGreen, cycleAnswerNone); got.Action != cycleActionRequest {
+		t.Fatalf("used budget was ignored: %+v", got)
+	}
+	if got := decideCycle(0, 0, 2, cycleSignalGreen, cycleAnswerNone); got.Action != cycleActionNext || got.NextCycle != 1 {
+		t.Fatalf("unused budget did not advance: %+v", got)
+	}
+}
+
+func TestWatchdogRunDTOAutoBudget(t *testing.T) {
+	cases := []struct {
+		maxAuto, inputUsed int
+		used, remaining    int
+	}{
+		{2, 0, 0, 2},
+		{2, 1, 1, 1},
+		{2, 2, 2, 0},
+		{2, 5, 2, 0},
+		{1, 0, 0, 1},
+		{4, 3, 3, 1},
+	}
+	for _, tc := range cases {
+		var d watchdogRunDTO
+		d.applyAutoBudget(tc.maxAuto, tc.inputUsed)
+		if d.MaxAutoCycles != tc.maxAuto || d.AutoCyclesUsed != tc.used || d.AutoCyclesRemaining != tc.remaining {
+			t.Fatalf("budget(%d,%d)=%+v", tc.maxAuto, tc.inputUsed, d)
+		}
+	}
+}
+
+func TestRunMonitorTracksOnlyAutonomousAdvances(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	t.Cleanup(func() { m.Close() })
+	task, err := m.CreateTask("auto budget", "count only green advances", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = m.DeleteTask(task.ID, DeleteTaskOptions{}) })
+	monitor := NewRunMonitor(m.pg, nil)
+	monitor.Register(task.ID, 1, "run-auto", "work#1")
+	monitor.RecordAutoAdvance("run-auto")
+	monitor.RecordAutoAdvance("run-auto")
+	snap := monitor.Lookup(1)
+	if snap == nil || snap.AutoCyclesUsed != 2 || snap.CycleNo != 0 {
+		t.Fatalf("snapshot=%+v, want 2 autonomous advances at cycle 0", snap)
+	}
+	monitor.SetCycle("run-auto", 3, time.Now(), false, db.SlowPathNone, db.WatchdogDecisionNone)
+	if snap := monitor.Lookup(1); snap.AutoCyclesUsed != 2 {
+		t.Fatalf("user cycle advance changed auto count: %+v", snap)
+	}
+	monitor.Flush()
+	row, err := m.pg.WorkerRunByID(t.Context(), "run-auto")
+	if err != nil || row == nil || row.AutoCyclesUsed != 2 || row.CycleNo != 3 {
+		t.Fatalf("persisted run=%+v err=%v", row, err)
+	}
+}
+
 func TestWatchdogFastPressureOnceAndSlowPathQueue(t *testing.T) {
 	m, task, intent := testWatchdogTask(t)
 	now := time.Now()
@@ -71,7 +170,7 @@ func TestWatchdogFastPressureOnceAndSlowPathQueue(t *testing.T) {
 	s.watchdog = newWatchdogRuntime(s, func() time.Time { return now })
 	monitor := s.watchdog.monitor
 	s.engine.SetRunMonitor(monitor)
-	keys := []string{settingWatchdogEnabled, settingWatchdogPressureSec, settingWatchdogSlowPathSec, settingWatchdogCycleSec}
+	keys := []string{settingWatchdogEnabled, settingWatchdogPressureSec, settingWatchdogSlowPathSec}
 	previous := map[string]string{}
 	present := map[string]bool{}
 	for _, key := range keys {
@@ -79,6 +178,7 @@ func TestWatchdogFastPressureOnceAndSlowPathQueue(t *testing.T) {
 			previous[key], present[key] = old, true
 		}
 	}
+	oldRun := agentRunSecs(t, m, "worker")
 	t.Cleanup(func() {
 		for _, key := range keys {
 			if present[key] {
@@ -87,16 +187,19 @@ func TestWatchdogFastPressureOnceAndSlowPathQueue(t *testing.T) {
 				_, _ = m.pg.Exec(`DELETE FROM settings WHERE key=$1`, key)
 			}
 		}
+		_ = m.pg.SetAgentRunSeconds("worker", oldRun)
 	})
 	for key, value := range map[string]string{
 		settingWatchdogEnabled:     "true",
 		settingWatchdogPressureSec: "1",
 		settingWatchdogSlowPathSec: "2",
-		settingWatchdogCycleSec:    "10",
 	} {
 		if err := m.pg.SetSetting(key, value); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := m.pg.SetAgentRunSeconds("worker", 10); err != nil {
+		t.Fatal(err)
 	}
 	runID := "run-fast-pressure"
 	monitor.Register(task.ID, intent.ID, runID, "work#1")
@@ -171,7 +274,7 @@ func TestWatchdogFastSkipsPressureAndSlowPathWhileDecisionOpen(t *testing.T) {
 	s.watchdog = newWatchdogRuntime(s, func() time.Time { return now })
 	monitor := s.watchdog.monitor
 	s.engine.SetRunMonitor(monitor)
-	keys := []string{settingWatchdogEnabled, settingWatchdogPressureSec, settingWatchdogSlowPathSec, settingWatchdogCycleSec}
+	keys := []string{settingWatchdogEnabled, settingWatchdogPressureSec, settingWatchdogSlowPathSec}
 	previous := map[string]string{}
 	present := map[string]bool{}
 	for _, key := range keys {
@@ -179,6 +282,7 @@ func TestWatchdogFastSkipsPressureAndSlowPathWhileDecisionOpen(t *testing.T) {
 			previous[key], present[key] = old, true
 		}
 	}
+	oldRun := agentRunSecs(t, m, "worker")
 	t.Cleanup(func() {
 		for _, key := range keys {
 			if present[key] {
@@ -187,16 +291,19 @@ func TestWatchdogFastSkipsPressureAndSlowPathWhileDecisionOpen(t *testing.T) {
 				_, _ = m.pg.Exec(`DELETE FROM settings WHERE key=$1`, key)
 			}
 		}
+		_ = m.pg.SetAgentRunSeconds("worker", oldRun)
 	})
 	for key, value := range map[string]string{
 		settingWatchdogEnabled:     "true",
 		settingWatchdogPressureSec: "1",
 		settingWatchdogSlowPathSec: "2",
-		settingWatchdogCycleSec:    "10",
 	} {
 		if err := m.pg.SetSetting(key, value); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := m.pg.SetAgentRunSeconds("worker", 10); err != nil {
+		t.Fatal(err)
 	}
 	runID := "run-decision-open"
 	monitor.Register(task.ID, intent.ID, runID, "work#1")
@@ -264,6 +371,12 @@ func TestWatchdogUnavailableAtCycleBoundaryAppliesDefault(t *testing.T) {
 			runID := "run-unavailable-boundary"
 			monitor.Register(task.ID, intent.ID, runID, "work#1")
 			monitor.SetCycle(runID, tc.cycle, now, false, db.SlowPathNone, db.WatchdogDecisionNone)
+			if tc.cycle >= 2 {
+				// The fixture omits MaxAutoCycles, so the decision table clamps it to
+				// the default budget of one. C2/C3 must model that budget as spent;
+				// otherwise the current run-wide semantics correctly auto-advance.
+				monitor.RecordAutoAdvance(runID)
+			}
 			monitor.SetSlowPath(runID, db.SlowPathDone, tc.slowClass, "fixture", nil, tc.cycle)
 			if _, err := m.pg.CreateOrUpdateWatchdogUnavailable(t.Context(), task.ID,
 				"Watchdog Agent 不可用", 1, &now, &now, &now); err != nil {
@@ -278,7 +391,7 @@ func TestWatchdogUnavailableAtCycleBoundaryAppliesDefault(t *testing.T) {
 					<-workCtx.Done()
 					cause, _ := context.Cause(workCtx).(*agent.AbortCause)
 					if cause != nil {
-						s.engine.settleWatchdogTermination(task, "work#1", intent, runID, cause)
+						s.engine.settleWatchdogTermination(task, "work#1", intent, runID, cause.Text, cause.TerminalState)
 					}
 					_, complete := s.engine.detachWork(intent.ID)
 					complete(nil)
@@ -350,7 +463,7 @@ func TestWatchdogAskWriteFailureTerminatesAtBoundary(t *testing.T) {
 		<-workCtx.Done()
 		cause, _ := context.Cause(workCtx).(*agent.AbortCause)
 		if cause != nil {
-			s.engine.settleWatchdogTermination(task, "work#1", intent, runID, cause)
+			s.engine.settleWatchdogTermination(task, "work#1", intent, runID, cause.Text, cause.TerminalState)
 		}
 		_, complete := s.engine.detachWork(intent.ID)
 		complete(nil)
@@ -408,6 +521,7 @@ func TestWatchdogFastCycleAdvanceThenAsk(t *testing.T) {
 	cfg := watchdogConfig{
 		Enabled: true, PressureAfter: time.Minute, SlowPathAfter: 2 * time.Minute,
 		CycleAfter: 3 * time.Minute, AgentKey: "watchdog", AgentRetry: time.Minute,
+		MaxAutoCycles: 2,
 	}
 	runID := "run-fast-cycle"
 	monitor.Register(task.ID, intent.ID, runID, "work#1")
@@ -493,7 +607,7 @@ func TestWatchdogFastProviderErrorDoesNotAsk(t *testing.T) {
 }
 
 func TestWatchdogC0ConsentReasonIsNotSilentDefault(t *testing.T) {
-	got := decideCycle(0, cycleSignalAsk, cycleAnswerYes)
+	got := decideCycle(0, 0, defaultWatchdogMaxAuto, cycleSignalAsk, cycleAnswerYes)
 	if got.Action != cycleActionNext || got.NextCycle != 1 {
 		t.Fatalf("C0 consent decision=%+v", got)
 	}

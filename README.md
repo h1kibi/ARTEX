@@ -356,7 +356,7 @@ flowchart TB
 | **server** | `net/http` 路由 + JWT 鉴权 + SSE；`Manager` 托管任务、引擎、DB store 的生命周期 |
 | **engine** | 每任务一个 `plannerLoop` + N 个 worker goroutine；意图领取、超时/暂停/drain |
 | **agent** | goals / planner / worker / mainagent，`ToolSet` 把双图暴露成 LLM 工具 |
-| **db** | 双图的 Postgres 落地（pgx）；schema 随 `go:embed` 每次启动幂等建表 |
+| **db** | 双图的 Postgres 存储实现（pgx）；schema 随 `go:embed` 每次启动幂等建表 |
 | **支撑** | 记录型 MITM 代理、审批门、异步补全、MCP/技能/记忆/报告、Watchdog 运行看护 |
 
 ### 双图架构：探索图 + 资产图
@@ -452,18 +452,18 @@ Fast Path 默认节奏：
 | --- | --- |
 | 8 分钟 | 向 Worker 注入一次压力提示，只在下一次工具调用前生效 |
 | 10 分钟 | 组装最近执行证据，入队 Slow Path |
-| 20 分钟 | 进入周期状态机；必要时创建用户判断卡或终止 Worker |
+| Worker 周期长度（默认 20 分钟，取 Worker Agent 的 `run_seconds`） | 进入周期状态机；必要时创建用户判断卡或终止 Worker |
 
 #### 周期状态机
 
-| 当前周期 | 绿灯 | 用户同意 | 用户拒绝 | 用户静默 |
-| --- | --- | --- | --- | --- |
-| C0 | 进入 C1 | 进入 C1 | `stopped` | 进入 C1（C0 是唯一静默默认同意阶段） |
-| C1 | 进入 C2 | 进入 C2 | `stopped` | `exhausted` |
-| C2 | 生成 C3 用户请求 | 进入 C3 | `stopped` | `exhausted` |
-| C3 及以后 | 生成下一周期请求 | 进入下一周期 | `stopped` | `exhausted` |
+`watchdog_max_auto_cycles`（默认 `2`，范围 1–4）是一个 run 内 Watchdog 可以**自主放行**的绿灯周期总数 `N`。有效写入会把当前计时周期重置为 C0，但不会恢复已消耗的自主预算；人工批准也不消耗该预算：
 
-Slow Path 要求终止时直接 `stopped`；没有绿灯、也没有用户请求（无信号）时按 `exhausted` 处理。只有 C0 的**用户请求静默**默认同意进入 C1。一个 run 的一个周期最多一张开放决策卡。
+| 当前 run 已自主推进次数 | 绿灯 | 用户同意 | 用户拒绝 | 用户静默 |
+| --- | --- | --- | --- | --- |
+| `< N` | 进入下一周期并消耗一次预算 | 进入下一周期 | `stopped` | C0 的请求默认进入下一周期，其余 `exhausted` |
+| `>= N` | 生成下一周期请求 | 进入下一周期 | `stopped` | `exhausted` |
+
+周期号仍用于审计和用户默认规则；有效写入、恢复、审批退出只重置当前周期状态，不重置 run 总预算。一个 run 的一个周期最多一张开放决策卡；人工批准次数不设上限。
 
 #### 用户判断卡与不可用卡
 
@@ -477,7 +477,8 @@ Slow Path 要求终止时直接 `stopped`；没有绿灯、也没有用户请求
 #### 终止与审计
 
 - 终止必须同时匹配 `run_id` 和当前周期，避免旧结果杀掉新运行；
-- 取消 Worker 后等待其停止写入，再写 `terminal_reason` 和 `watchdog_terminated` 活动；
+- 终止优先请求 SDK 进入现有 `Settlement` 收尾：Worker 获得有界收尾轮次、隐藏 Bash 等工具，先把已确认的事实/资产/漏洞写回，再由引擎写入终态；收尾窗口超时或 SDK 未配置收尾时回退为强制取消；
+- 运行结束（正常完成、供应商错误、用户取消、Watchdog 终止）都会通过一次性的 finish hook 关闭该 run 的开放判断卡、Slow Path 任务和未完成的 Worker 资源请求，并写入 `watchdog_run_finished` 审计；
 - 已登记的事实、资产、漏洞和执行记录保留；
 - Planner 收到终止事件，但不会自动重跑同一意图；用户可手动重跑；
 - 周期重置会清理该 run 的旧 Slow Path job，避免旧唯一键吞掉新周期判断；
@@ -488,14 +489,20 @@ Slow Path 要求终止时直接 `stopped`；没有绿灯、也没有用户请求
 | 键 | 默认值 | 说明 |
 | --- | --- | --- |
 | `watchdog_enabled` | `false` | 总开关，默认关闭 |
-| `watchdog_pressure_after_sec` | `480` | 压力提示 |
-| `watchdog_slow_path_after_sec` | `600` | Slow Path 入队 |
-| `watchdog_cycle_after_sec` | `1200` | 周期处理 |
-| `watchdog_agent_key` | `watchdog` | Slow Path 使用的只读 Agent |
+| `watchdog_pressure_after_sec` | `480` | 当前周期内的压力提示 |
+| `watchdog_slow_path_after_sec` | `600` | 当前周期内的 Slow Path 入队 |
+| `watchdog_max_auto_cycles` | `2` | 自主放行周期数，范围 1–4 |
+| `watchdog_agent_key` | `watchdog` | Slow Path / 仲裁使用的只读 Agent |
 | `watchdog_agent_retry_sec` | `300` | 不可用自动重试间隔 |
-| `worker_run_seconds` | `0` | Watchdog 开启时 `0` 表示不限时，由任务截止时间约束；`>0` 显式覆盖 |
+| Worker Agent 的 `run_seconds` | `1200` | **唯一周期长度来源**；Watchdog 开启时它表示单周期长度，SDK 不再把它当固定总时长。可在「Agent 管理」修改 |
 
-配置位于「系统 -> 系统配置 -> 运行看护（Watchdog）」。系统审计页会展示压力提示、慢速判断、周期推进、用户判断、终止和供应商错误卡片；前端复用现有 `Alert`、`Badge`、`Button` 和设置 Card 组件。
+保存时校验 `0 < 压力提示 < Slow Path < Worker run_seconds`。历史设置 `worker_run_seconds` / `watchdog_cycle_after_sec` 会在首次启动时一次性迁移进 Worker Agent 的 `run_seconds` 并删除，之后设置页只显示一个周期来源。任务级 `timeout_seconds` 仍是外部截止时间，`max_turns` 保持独立限制。
+
+配置位于「系统 -> 系统配置 -> 运行看护（Watchdog）」。系统审计页会展示压力提示、慢速判断、周期推进、用户判断、终止、运行结束、Worker 资源请求/应答/仲裁和供应商错误卡片；判断卡按新到旧置顶，普通活动保持原顺序。
+
+#### Worker 间资源请求
+
+同一任务的两个运行中 Worker 可以通过工具异步协调容器/槽位：`send_request` 立即返回 `request_id`，接收方在下一次工具调用前收到请求（本次工具调用被阻止，模型重新决策），用 `answer_request` 返回 `accepted`/`rejected`；`accepted` 后接收方执行释放并调用 `release_request`，请求方收到 `released` 才继续。`cancel_request` 可撤回未应答请求；拒绝后 10 分钟内不能再次向同一接收方请求。`accepted` 超过 10 分钟未释放，或请求被拒绝后，请求方可调用 `request_arbitration`：Watchdog 读取双方运行状态和执行证据后裁决 `keep / release / terminate`，同一对 Worker 的仲裁冷却为 20 分钟。请求状态只保存在引擎内存，活动流负责审计，不新增资源归属表。
 
 ### worker 间的过程级信息交换
 

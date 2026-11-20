@@ -4,6 +4,7 @@ import * as React from "react";
 
 import {
   AlertTriangleIcon,
+  ArrowLeftRightIcon,
   CircleCheckIcon,
   Clock3Icon,
   GaugeIcon,
@@ -283,6 +284,129 @@ export function WatchdogCard({
     }
   }
 
+  if (kind.startsWith("peer_")) {
+    const peer = activity.metadata?.peer;
+    const status = peer?.status ?? "";
+    const decision = peer?.decision ?? (kind === "peer_arbitration_failed" ? "failed" : "");
+    const pair = (
+      <>
+        {peer?.from_intent_id != null && <Badge variant="outline">#{peer.from_intent_id}</Badge>}
+        {peer?.to_intent_id != null && (
+          <>
+            <span className="text-muted-foreground">→</span>
+            <Badge variant="outline">#{peer.to_intent_id}</Badge>
+          </>
+        )}
+      </>
+    );
+    const peerMeta =
+      peer?.from_worker || peer?.to_worker || peer?.cooldown_sec || peer?.upgrade_sec ? (
+        <div className="mt-1 grid gap-0.5 text-[10px] text-muted-foreground">
+          {(peer?.from_worker || peer?.to_worker) && (
+            <span>
+              Worker：{peer?.from_worker || "?"} → {peer?.to_worker || "?"}
+            </span>
+          )}
+          {peer?.cooldown_sec ? <span>冷却：{Math.round(peer.cooldown_sec / 60)} 分钟</span> : null}
+          {peer?.upgrade_sec ? (
+            <span>释放确认超过 {Math.round(peer.upgrade_sec / 60)} 分钟可申请仲裁</span>
+          ) : null}
+        </div>
+      ) : null;
+    if (kind === "peer_request") {
+      return (
+        <CardShell
+          tone="blue"
+          icon={<ArrowLeftRightIcon className="size-4 text-blue-500" />}
+          title={
+            <>
+              <span>Worker 资源请求</span>
+              {pair}
+              {peer?.request_type && <Badge variant="outline">{peer.request_type}</Badge>}
+              {status && <Badge variant="outline">{status}</Badge>}
+            </>
+          }
+          subtitle={fmtTime(activity.ts)}
+        >
+          <p className="break-words text-sm">{activity.summary}</p>
+          {(peer?.reason || detail) && (
+            <p className="mt-1 break-words text-xs text-muted-foreground">{firstText(peer?.reason, detail)}</p>
+          )}
+          {peer?.request_id && <p className="mt-1 break-all text-[10px] text-muted-foreground">request_id: {peer.request_id}</p>}
+          {peerMeta}
+        </CardShell>
+      );
+    }
+    if (kind === "peer_answer") {
+      const answer = peer?.answer || status;
+      const rejected = answer === "rejected";
+      return (
+        <CardShell
+          tone={rejected ? "red" : "blue"}
+          icon={rejected ? <XCircleIcon className="size-4 text-red-500" /> : <CircleCheckIcon className="size-4 text-blue-500" />}
+          title={
+            <>
+              <span>Worker 资源应答</span>
+              {pair}
+              {answer && <Badge variant="outline">{answer}</Badge>}
+            </>
+          }
+          subtitle={fmtTime(activity.ts)}
+        >
+          <p className="break-words text-sm">{activity.summary}</p>
+          {(peer?.reason || detail) && (
+            <p className="mt-1 break-words text-xs text-muted-foreground">{firstText(peer?.reason, detail)}</p>
+          )}
+          {peerMeta}
+        </CardShell>
+      );
+    }
+    if (kind === "peer_arbitration" || kind === "peer_arbitration_failed") {
+      const tone = decision === "terminate" || decision === "failed" ? "red" : decision === "release" ? "amber" : "blue";
+      return (
+        <CardShell
+          tone={tone}
+          icon={<ShieldAlertIcon className="size-4 text-muted-foreground" />}
+          title={
+            <>
+              <span>{kind === "peer_arbitration_failed" ? "Watchdog 资源仲裁失败" : "Watchdog 资源仲裁"}</span>
+              {pair}
+              {decision && <Badge variant="outline">{decision}</Badge>}
+            </>
+          }
+          subtitle={fmtTime(activity.ts)}
+        >
+          <p className="break-words text-sm">{activity.summary}</p>
+          {(peer?.reason || detail) && (
+            <p className="mt-1 break-words text-xs text-muted-foreground">{firstText(peer?.reason, detail)}</p>
+          )}
+          {peer?.request_id && <p className="mt-1 break-all text-[10px] text-muted-foreground">request_id: {peer.request_id}</p>}
+          {peerMeta}
+        </CardShell>
+      );
+    }
+    return (
+      <CardShell
+        tone="slate"
+        icon={<TimerResetIcon className="size-4 text-muted-foreground" />}
+        title={
+          <>
+            <span>{kind === "peer_request_expired" ? "资源请求已过期" : "请求状态变更"}</span>
+            {pair}
+            {status && <Badge variant="outline">{status}</Badge>}
+          </>
+        }
+        subtitle={fmtTime(activity.ts)}
+      >
+        <p className="break-words text-sm">{activity.summary}</p>
+        {(peer?.reason || detail) && (
+          <p className="mt-1 break-words text-xs text-muted-foreground">{firstText(peer?.reason, detail)}</p>
+        )}
+        {peerMeta}
+      </CardShell>
+    );
+  }
+
   if (kind === "watchdog_pressure") {
     return (
       <CardShell
@@ -328,6 +452,31 @@ export function WatchdogCard({
         <p className="break-words text-sm">{activity.summary}</p>
         {detail && <p className="mt-1 break-words text-xs text-muted-foreground">{detail}</p>}
         <EvidenceList evidence={meta?.evidence} />
+      </CardShell>
+    );
+  }
+
+  if (kind === "watchdog_run_finished") {
+    return (
+      <CardShell
+        tone="slate"
+        icon={<TimerResetIcon className="size-4 text-muted-foreground" />}
+        title={
+          <>
+            <span>运行已结束</span>
+            {meta?.state && <Badge variant="outline">{meta.state === "abandoned" ? "已放弃" : "已结束"}</Badge>}
+            {typeof meta?.cycle_no === "number" && <Badge variant="outline">C{meta.cycle_no}</Badge>}
+          </>
+        }
+        subtitle={fmtTime(activity.ts)}
+      >
+        <p className="break-words text-sm">{activity.summary}</p>
+        {detail && <p className="mt-1 break-words text-xs text-muted-foreground">{detail}</p>}
+        <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+          <span>事实 {meta?.facts ?? 0}</span>
+          <span>资产 {meta?.assets ?? 0}</span>
+          <span>漏洞 {meta?.findings ?? 0}</span>
+        </div>
       </CardShell>
     );
   }
@@ -539,6 +688,12 @@ export function WatchdogCard({
           <span>
             目标周期：C{nextCycle}（同意后进入）
           </span>
+          {run?.max_auto_cycles != null && (
+            <span>
+              自主放行预算：已用 {run.auto_cycles_used ?? 0}/{run.max_auto_cycles}，剩余{" "}
+              {run.auto_cycles_remaining ?? 0}
+            </span>
+          )}
           <span>
             默认规则：
             {defaultRule === "c0_continue" ? "C0 静默默认同意，进入 C1" : "C1 及以后静默，默认终止"}

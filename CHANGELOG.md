@@ -4,6 +4,23 @@
 
 ## [Unreleased]
 
+### 运行看护优化（Watchdog v2）
+
+#### 新增的功能
+
+- **运行结束清理**：每个 run 结束（正常完成、供应商错误、用户取消、Watchdog 终止）时，一次性 finish hook 关闭该 run 的开放判断卡、删除 Slow Path 任务、过期未完成的 Worker 资源请求，并写入 `watchdog_run_finished` 审计；`FinishTask` 对任务暂停 / 删除 / 归档 / 服务关闭做批量清理。任务删除事务与清理回调都可重复执行。
+- **Watchdog 终止复用收尾**：SDK 新增外部结算请求（`SettlementRequest` / `ReasonWatchdog`）。终止顺序改为“请求收尾 → 等待既有收尾轮数 → 完成或超时 → 强制取消 → 写终态”，Worker 可以先把已确认的事实、资产、漏洞写回；收尾窗口默认 60 秒，超时回退原有取消路径。
+- **单一 Worker 周期来源**：周期长度只读 Worker Agent 的 `run_seconds`；Watchdog 开启时 SDK 不再把它当固定总时长（置 0，由周期和用户批准决定结束），任务级截止时间仍是外部上限。首次启动执行 `watchdog_opt_v1` 迁移：历史 `worker_run_seconds` / `watchdog_cycle_after_sec` 只有正数时覆盖 Worker Agent，否则保留当前 `run_seconds`；Agent 写入、历史键删除和迁移标记在同一事务中提交。
+- **自主放行预算**：新增 `watchdog_max_auto_cycles`（1–4，默认 2）。绿灯在周期号小于预算时自主进入下一周期；预算用完后即使绿灯也生成用户判断卡。人工批准次数不设上限。
+- **Worker 间资源请求**：新增 `send_request` / `answer_request` / `cancel_request` / `release_request` / `request_arbitration` 工具与引擎内存注册表。请求只在接收方下一次工具调用前注入，接受后必须 `release_request` 确认；拒绝后 10 分钟冷却，accepted 超过 10 分钟未释放可申请仲裁。状态不写数据库，活动流写入 `peer_request` / `peer_answer` / `peer_cancel` / `peer_request_expired` / `peer_arbitration` 审计。
+- **Watchdog 资源仲裁**：独立只读提示词与 `keep / release / terminate` JSON 约定，读取双方运行状态和执行证据后默认保持原状；释放通过 steer 下发，终止复用 `TerminateWorkForCycle`，同一对 Worker 仲裁冷却 20 分钟。
+- **前端排序与配置**：开放判断卡从 `groupSteps` 结果中提取并按 `seq` 降序置顶，普通活动、工具配对和轮次分组保持原序；设置页删除重复的周期/运行时限字段，显示只读 Worker 单周期长度和 `watchdog_max_auto_cycles`；审计卡支持 `peer_*`、`watchdog_run_finished` 和运行预算。
+- **norma 本地 fork**：`third_party/norma`（v0.4.4）承载外部结算接口，`go.mod` 通过 `replace` 指向本地；升级上游时需把该接口回移或重新同步。
+
+#### 配置变更
+
+`watchdog_pressure_after_sec` 和 `watchdog_slow_path_after_sec` 保留；删除运行期读取 `watchdog_cycle_after_sec` / `worker_run_seconds`；新增 `watchdog_max_auto_cycles`。保存时校验 `0 < 压力提示 < Slow Path < Worker run_seconds`，不写入部分配置。
+
 ### 运行看护（Watchdog）
 
 #### 新增的功能

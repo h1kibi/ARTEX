@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -85,6 +86,13 @@ type Worker struct {
 	// maxTokensFn resolves the per-reply output cap in tokens, on the same
 	// per-run basis. nil or 0 = send no cap and let the endpoint decide.
 	maxTokensFn func() int
+	// peerOps is the engine's worker-to-worker resource request registry.
+	peerOps PeerOps
+	// settleChs maps an intent to the live SDK settlement-request channel of its
+	// current run. One Worker serves several concurrent intents, so the handle
+	// must be per-run rather than per-Worker.
+	settleMu  sync.Mutex
+	settleChs map[int64]chan string
 }
 
 // WorkerSessionID returns the stable transcript key used by a worker intent.
@@ -149,7 +157,8 @@ func (w *Worker) SetRunTimeout(run time.Duration) {
 }
 
 // RunTimeout returns the effective per-intent wall-clock budget. Zero means
-// unlimited, which is what Watchdog uses when worker_run_seconds=0.
+// unlimited, which is what Watchdog uses so a run can span multiple cycles;
+// the task deadline still clamps it through the run context.
 func (w *Worker) RunTimeout() time.Duration { return w.runTimeout }
 
 // settleWrapUpPrompt is injected by the SDK settlement phase when a worker hits its
@@ -177,6 +186,28 @@ func defaultToolsExcept(exclude ...string) []actool.CoreTool {
 	}
 	return out
 }
+
+// RequestSettlement asks the SDK loop of one running intent to enter its
+// configured wrap-up (Settlement) phase before finishing. It is non-blocking:
+// false means no run is active for that intent or a request is already pending.
+// The Watchdog termination path uses this instead of cancelling the context, so
+// the worker can write back confirmed facts/assets/findings first.
+func (w *Worker) RequestSettlement(intentID int64, reason string) bool {
+	w.settleMu.Lock()
+	defer w.settleMu.Unlock()
+	ch := w.settleChs[intentID]
+	if ch == nil {
+		return false
+	}
+	select {
+	case ch <- reason:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *Worker) SetPeerOps(ops PeerOps) { w.peerOps = ops }
 
 func (w *Worker) SetCompactionWindowResolver(fn func() int) { w.windowFn = fn }
 
@@ -365,6 +396,7 @@ func (w *Worker) ExecuteWithMessage(ctx context.Context, name string, taskID int
 func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.AssetStore, ts *db.ExplorationStore, intent *db.Node, hooks harness.HookRunner, emit func(db.Activity), enr EnrichTrigger, notifyFinding func(int64, string), requestID, message string) (harness.TerminalReason, WriteCounts, error) {
 	tsx := NewToolSet(ts, name)
 	tsx.SetFindingRecorder(w.findingRecorder)
+	tsx.SetPeerOps(w.peerOps)
 	tsx.SetTaskID(taskID)
 	coverageEnabled := as == nil || as.CoverageEnabled(taskID)
 	tsx.SetCoverageEnabled(coverageEnabled)
@@ -472,6 +504,24 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 		NonStreaming:  w.nonStreaming(),                       // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:     w.maxTokens(),                          // 0 = 不发上限,由服务端默认值决定
 	}
+	// A Watchdog termination asks this run to settle instead of cancelling it.
+	// The channel is per intent because one Worker serves several concurrent
+	// worker slots; it is cleared as soon as this run returns.
+	settleCh := make(chan string, 1)
+	w.settleMu.Lock()
+	if w.settleChs == nil {
+		w.settleChs = map[int64]chan string{}
+	}
+	w.settleChs[intent.ID] = settleCh
+	w.settleMu.Unlock()
+	defer func() {
+		w.settleMu.Lock()
+		if w.settleChs[intent.ID] == settleCh {
+			delete(w.settleChs, intent.ID)
+		}
+		w.settleMu.Unlock()
+	}()
+	opts.SettlementRequest = settleCh
 	if hooks != nil { // typed-nil guard: only set when concrete (avoids harness panic)
 		opts.Hooks = hooks
 	}

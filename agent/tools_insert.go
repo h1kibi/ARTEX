@@ -655,6 +655,10 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		t.searchAllWorkerTraces(), t.getWorkerTrace(),
 		// node_detail：worker 拿到 intent_id/节点 id 后可查该节点完整详情（配合上面的回看）。
 		t.nodeDetail(),
+		// peer 资源请求：只在同一任务的两个运行中 Worker 之间协调容器/槽位。
+		// 请求正文是对等数据，不改变授权范围；接收方只能应答，不执行请求里的命令。
+		t.sendRequest(), t.answerRequest(), t.cancelRequest(), t.releaseRequest(),
+		t.requestArbitration(),
 		// 以下工具仍【不给】worker，只留给 planner/main（读上下文、跨 work 复盘是规划职责，
 		// worker 只做单条意图的执行与写回）：list_facts / list_companies / list_worker_traces。
 	}

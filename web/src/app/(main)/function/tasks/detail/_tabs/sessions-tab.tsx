@@ -533,10 +533,10 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const [listOpen, setListOpen] = React.useState(false);
   // Per-session lazily-loaded caches, keyed by session_key (main | plan | intent:<id>).
   const [store, setStore] = React.useState<SessionStore>({});
-  // While the task-level default card is open, the system audit shows only that
-  // card; older watchdog_* / provider_error rows stay in storage and reappear
-  // after recovery. null means normal history.
-  const [watchdogUnavailableID, setWatchdogUnavailableID] = React.useState<number | null>(null);
+  // Open decision/unavailable cards, lifted above history by Transcript. The
+  // system audit still shows the full append-only history; closed cards stay in
+  // their original position.
+  const [openWatchdogIDs, setOpenWatchdogIDs] = React.useState<ReadonlySet<string>>(new Set());
   // Worker sessions derived from exploration intents (paged past the old 300 cap).
   const [intents, setIntents] = React.useState<TaskNode[]>([]);
   const [intentAssets, setIntentAssets] = React.useState<IntentAsset[]>([]);
@@ -1284,26 +1284,22 @@ export function SessionsTab({ taskId }: { taskId: string }) {
   const isMain = active.role === "mainagent";
   const isPlanner = active.role === "planner";
   const isSystem = active.role === "system";
+  const refreshOpenWatchdogIDs = React.useCallback(() => {
+    if (!isSystem) return;
+    void api
+      .watchdogRequests(taskId, "open")
+      .then((rows) => setOpenWatchdogIDs(new Set(rows.map((r) => String(r.id)))))
+      .catch(() => undefined);
+  }, [isSystem, taskId]);
   React.useEffect(() => {
     if (!isSystem) {
-      setWatchdogUnavailableID(null);
+      setOpenWatchdogIDs(new Set());
       return;
     }
-    let alive = true;
-    const load = () =>
-      api
-        .watchdogRequests(taskId, "open")
-        .then((rows) => {
-          if (alive) setWatchdogUnavailableID(rows.find((r) => r.kind === "watchdog_unavailable")?.id ?? null);
-        })
-        .catch(() => undefined);
-    void load();
-    const timer = setInterval(load, 5000);
-    return () => {
-      alive = false;
-      clearInterval(timer);
-    };
-  }, [isSystem, taskId]);
+    refreshOpenWatchdogIDs();
+    const timer = setInterval(refreshOpenWatchdogIDs, 5000);
+    return () => clearInterval(timer);
+  }, [isSystem, refreshOpenWatchdogIDs]);
   const activeKey = keyForSession(active);
   const activeState = store[activeKey];
   // A main turn is serialized per task (chat lock), so "busy" is task-wide: while any
@@ -1371,15 +1367,7 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     // persisted+broadcast by the backend BEFORE it returns, so it arrives over the
     // same SSE stream (worker="mainagent") as every agent step — no client-side
     // optimistic echo, hence no fabricated seq that could collide with real DB ids.
-    if (isMain) return items;
-    if (isPlanner) return items;
-    if (isSystem) {
-      if (!watchdogUnavailableID) return items;
-      return items.filter(
-        (item) =>
-          item.kind === "watchdog_unavailable" && item.metadata?.watchdog?.request_id === watchdogUnavailableID,
-      );
-    }
+    if (isMain || isPlanner || isSystem) return items;
     // Worker session: the intent leads the transcript as a right-aligned "user"-style
     // message (the task handed to this worker), followed by its execution steps.
     const intentTitle = sessionMeta.get(active.id)?.title ?? active.title;
@@ -1404,7 +1392,6 @@ export function SessionsTab({ taskId }: { taskId: string }) {
     active.source_task_id,
     active.inherited,
     sessionMeta,
-    watchdogUnavailableID,
   ]);
 
   // seq of this session's most-recent TodoWrite call — for the Todo popover.
@@ -1959,7 +1946,11 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                     chat={isMain}
                     focusedSeq={focusHistory.ready ? approvalFocus.state?.source?.seq : undefined}
                     onOpenIntent={(intentId) => setActiveId(intentId)}
-                    onChanged={() => loadSession(activeKey)}
+                    onChanged={() => {
+                      loadSession(activeKey);
+                      refreshOpenWatchdogIDs();
+                    }}
+                    openWatchdogIDs={openWatchdogIDs}
                   />
                 ) : (
                   <div className="pl-9 text-xs text-muted-foreground">

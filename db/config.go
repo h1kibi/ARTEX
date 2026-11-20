@@ -464,7 +464,7 @@ type Agent struct {
 	TriggerMaxParallel int    `json:"trigger_max_parallel"`
 }
 
-const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,600),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id`
+const agentCols = `id,key,name,COALESCE(description,''),role,builtin,enabled,COALESCE(max_turns,0),COALESCE(run_seconds,1200),COALESCE(web_search,false),COALESCE(interactive_shell,false),COALESCE(wrapup_prompt,''),COALESCE(wrapup_max_turns,0),COALESCE(task_timeout_wrapup_prompt,''),COALESCE(task_timeout_wrapup_max_turns,0),COALESCE(trigger_run_mode,'serial'),COALESCE(trigger_merge_mode,'all'),COALESCE(trigger_max_parallel,5),llm_profile_id`
 
 func scanAgent(sc interface{ Scan(...any) error }) (*Agent, error) {
 	var a Agent
@@ -680,6 +680,49 @@ func (d *DB) SetAgentRunSeconds(key string, runSecs int) error {
 	return err
 }
 
+// ApplyWatchdogSettingsMigration commits the one-time Watchdog v1 migration as
+// one transaction. workerRunSeconds is nil when the historical settings do not
+// override the Worker Agent's current run_seconds. The legacy keys are deleted
+// and the marker is written in the same transaction, so an interrupted startup
+// cannot leave half of the migration applied.
+func (d *DB) ApplyWatchdogSettingsMigration(ctx context.Context, workerRunSeconds *int, deleteKeys []string, markerKey, markerValue string) error {
+	tx, err := d.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if workerRunSeconds != nil {
+		res, err := tx.ExecContext(ctx, `UPDATE agents SET run_seconds=$1 WHERE key=$2`, *workerRunSeconds, "worker")
+		if err != nil {
+			return fmt.Errorf("update worker run_seconds: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("worker run_seconds rows affected: %w", err)
+		}
+		if n != 1 {
+			return fmt.Errorf("worker agent row missing")
+		}
+	}
+	for _, key := range deleteKeys {
+		if key == "" {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM settings WHERE key=$1`, key); err != nil {
+			return fmt.Errorf("delete legacy setting %s: %w", key, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO settings(key, value) VALUES ($1, $2)
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, markerKey, markerValue); err != nil {
+		return fmt.Errorf("write migration marker: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit watchdog migration: %w", err)
+	}
+	return nil
+}
+
 // SetAgentTriggerBehavior stores an agent's P3 trigger post-processing策略:
 // runMode(serial|parallel) / mergeMode(by_task|all|none) / maxParallel(parallel 用,0=不限)。
 // 枚举做白名单校验,非法值回落默认,避免脏数据把调度 pump 带偏。
@@ -815,7 +858,7 @@ type MCPServer struct {
 	Env       json.RawMessage `json:"env"`
 	URL       string          `json:"url,omitempty"`
 	Enabled   bool            `json:"enabled"`
-	Insecure  bool            `json:"insecure"` // http: skip TLS cert verification (self-signed servers, issue #108)
+	Insecure  bool            `json:"insecure"`        // http: skip TLS cert verification (self-signed servers, issue #108)
 	Tools     []string        `json:"tools,omitempty"` // cached tool names (mcp_tools_cache)
 }
 
