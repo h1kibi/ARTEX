@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -642,7 +643,8 @@ func TestWatchdogProcessCycleTerminateDoesNotBlockTick(t *testing.T) {
 
 	runID := "run-async-terminate"
 	_, workCancel := context.WithCancelCause(context.Background())
-	settled := make(chan struct{})
+	settled := make(chan struct{}, 4)
+	var dispatches atomic.Int32
 	release := make(chan struct{})
 	released := false
 	defer func() {
@@ -653,7 +655,8 @@ func TestWatchdogProcessCycleTerminateDoesNotBlockTick(t *testing.T) {
 	finished := make(chan struct{})
 	s.engine.registerWorkRunFull(intent.ID, runID, task.ID, "work#1", workCancel,
 		func(reason string) bool {
-			close(settled)
+			dispatches.Add(1)
+			settled <- struct{}{}
 			go func() {
 				defer close(finished)
 				<-release
@@ -682,13 +685,22 @@ func TestWatchdogProcessCycleTerminateDoesNotBlockTick(t *testing.T) {
 	}()
 	select {
 	case <-returned:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("processCycle blocked on the settlement window instead of dispatching it")
 	}
 	select {
 	case <-settled:
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("termination was not dispatched after the cycle decision")
+	}
+	if got := dispatches.Load(); got != 1 {
+		t.Fatalf("settlement requested %d times, want 1", got)
+	}
+	// A second decision for the same run must not stack another attempt while
+	// the first settlement is still pending.
+	s.watchdog.fast.processCycle(context.Background(), task, *snap, cfg)
+	if got := dispatches.Load(); got != 1 {
+		t.Fatalf("duplicate decision stacked %d settlement requests, want 1", got)
 	}
 	close(release)
 	released = true

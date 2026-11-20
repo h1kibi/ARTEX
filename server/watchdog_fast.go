@@ -442,7 +442,8 @@ func (f *watchdogFast) createAsk(ctx context.Context, t *Task, snap RunSnapshot,
 // wait plus the hard-cancel window can span well over a minute, far longer than
 // the shared 5s tick, so running it inline would stall every other task's
 // pressure prompt, Slow Path enqueue and cycle accounting. One attempt per run
-// is in flight at a time; a later cycle retries after it returns.
+// is in flight at a time; a later cycle retries after it returns. ctx should be
+// the long-lived server/service root so shutdown still bounds the attempt.
 func (f *watchdogFast) terminateAsync(ctx context.Context, snap RunSnapshot, reason, terminalState string) {
 	if _, loaded := f.terminating.LoadOrStore(snap.RunID, struct{}{}); loaded {
 		return

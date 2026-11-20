@@ -191,16 +191,17 @@ func (e *Engine) CreatePeerRequest(fromIntentID, toIntentID int64, requestType, 
 	}
 	e.peerRequests[r.RequestID] = r
 	e.peerIndexAddLocked(r)
+	copy := *r
 	e.peerMu.Unlock()
 
-	e.peerAuditActivity(fromTask, peerKindRequest, r,
+	e.peerAuditActivity(fromTask, peerKindRequest, &copy,
 		fmt.Sprintf("意图 #%d 向 #%d 请求资源（%s）", fromIntentID, toIntentID, requestType), reason)
-	if !e.enqueuePeerMessage(toIntentID, peerKindRequest, r) {
+	if !e.enqueuePeerMessage(toIntentID, peerKindRequest, &copy) {
 		// The target finished between validation and enqueue. Expire the row so
 		// the caller gets an immediate error instead of a request that can never
 		// be delivered.
 		e.peerMu.Lock()
-		if cur := e.peerRequests[r.RequestID]; cur != nil && cur.Status == peerPending {
+		if cur := e.peerRequests[copy.RequestID]; cur != nil && cur.Status == peerPending {
 			cur.Answer = "target_finished"
 			cur.AnswerReason = "目标 Worker 在请求入队前结束"
 			e.finishPeerLocked(cur, peerExpired)
@@ -208,7 +209,7 @@ func (e *Engine) CreatePeerRequest(fromIntentID, toIntentID int64, requestType, 
 		e.peerMu.Unlock()
 		return "", fmt.Errorf("目标意图 %d 在请求入队前结束", toIntentID)
 	}
-	return r.RequestID, nil
+	return copy.RequestID, nil
 }
 
 // AnswerPeerRequest is called by the receiver's answer_request tool.

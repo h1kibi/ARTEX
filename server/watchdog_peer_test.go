@@ -569,6 +569,23 @@ func TestPeerAnswerAndExpireDoNotRace(t *testing.T) {
 			t.Fatalf("iteration %d delivered=%d", i, len(got))
 		}
 		var wg sync.WaitGroup
+		if i%2 == 1 {
+			// ReleasePeerRequest carries the same post-unlock audit read.
+			if err := r.e.AnswerPeerRequest(r.b, id, "accepted", "ok"); err != nil {
+				t.Fatalf("iteration %d accept: %v", i, err)
+			}
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				_ = r.e.ReleasePeerRequest(r.b, id)
+			}()
+			go func() {
+				defer wg.Done()
+				r.e.ExpirePeerRequestsForIntent(r.b, "run-b", "holder_finished")
+			}()
+			wg.Wait()
+			continue
+		}
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
@@ -579,5 +596,27 @@ func TestPeerAnswerAndExpireDoNotRace(t *testing.T) {
 			r.e.ExpirePeerRequestsForIntent(r.b, "run-b", "holder_finished")
 		}()
 		wg.Wait()
+	}
+}
+
+// CreatePeerRequest also audits after dropping the registry lock; a run finish
+// in that window expires the just-published request and rewrites Status/Answer.
+// Run under -race.
+func TestPeerCreateAndExpireDoNotRace(t *testing.T) {
+	r := newPeerTestRig(t)
+	for i := range 100 {
+		errCh := make(chan error, 1)
+		go func() {
+			_, err := r.e.CreatePeerRequest(r.a, r.b, "release_container_slot", "need slot")
+			errCh <- err
+		}()
+		r.e.ExpirePeerRequestsForIntent(r.b, "run-b", "holder_finished")
+		err := <-errCh
+		// Close any request the concurrent expiry raced past, keeping the
+		// per-pair pending cap free for the next iteration.
+		r.e.ExpirePeerRequestsForIntent(r.b, "run-b", "holder_finished")
+		if err != nil {
+			t.Fatalf("iteration %d create: %v", i, err)
+		}
 	}
 }
