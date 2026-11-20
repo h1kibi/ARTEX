@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -550,5 +551,33 @@ func TestRunFinishTaskClosesMultipleRuns(t *testing.T) {
 	}
 	if n != 2 {
 		t.Fatalf("run_finished activities after repeated FinishTask=%d, want 2", n)
+	}
+}
+
+// AnswerPeerRequest/ReleasePeerRequest publish audit data after dropping the
+// registry lock. Those reads must use the snapshot copy: a concurrent run finish
+// expires the same request and rewrites AnswerReason under the lock, so reading
+// the live struct is an unsynchronized read/write pair. Run under -race.
+func TestPeerAnswerAndExpireDoNotRace(t *testing.T) {
+	r := newPeerTestRig(t)
+	for i := range 100 {
+		id, err := r.e.CreatePeerRequest(r.a, r.b, "release_container_slot", "need slot")
+		if err != nil {
+			t.Fatalf("iteration %d create: %v", i, err)
+		}
+		if got := r.e.drainPeer(r.b, peerMaxBatch); len(got) != 1 {
+			t.Fatalf("iteration %d delivered=%d", i, len(got))
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = r.e.AnswerPeerRequest(r.b, id, "accepted", "ok")
+		}()
+		go func() {
+			defer wg.Done()
+			r.e.ExpirePeerRequestsForIntent(r.b, "run-b", "holder_finished")
+		}()
+		wg.Wait()
 	}
 }

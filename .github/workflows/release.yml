@@ -39,6 +39,12 @@ jobs:
         run: >-
           go test ./server -parallel 1
           -run '^(TestRealWorkerAutoAdvanceWriteAndResume|TestWatchdogUnavailableAtCycleBoundaryAppliesDefault|TestRunMonitor.*|TestDecideCycle.*|TestPeerArbitration.*|TestRunFinish.*|TestWatchdogTermination.*|TestRunIntentConsumesSettlementRequest|TestEngineRunIntentProviderErrorRunsFinishHook)$'
+      - name: Race-check Watchdog termination and peer paths
+        env:
+          ARTEX_PG_DSN: postgres://artex:artex_test_password@127.0.0.1:5432/artex?sslmode=disable
+        run: >-
+          go test ./server -race -parallel 1 -count=1
+          -run '^(TestWatchdogProcessCycleTerminateDoesNotBlockTick|TestPeerAnswerAndExpireDoNotRace)$'
       - name: Audit complete server package
         env:
           ARTEX_PG_DSN: postgres://artex:artex_test_password@127.0.0.1:5432/artex?sslmode=disable

@@ -157,9 +157,11 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		taskAgents: map[string]*taskAgentBundle{}, archiveWake: make(chan struct{}, 1)}
 	s.initSideQuestions()
 	// One-time upgrade from the duplicated watchdog cycle settings; must run
-	// before the runtime reads its configuration.
+	// before the runtime reads its configuration. A failed migration must not
+	// brick startup: keep the Worker Agent's current run_seconds (the marker stays
+	// absent, so the next boot retries) and log an actionable error instead.
 	if err := s.migrateWatchdogSettings(); err != nil {
-		log.Fatalf("[watchdog] 配置迁移失败: %v", err)
+		log.Printf("[watchdog] 配置迁移未完成，本次启动沿用现有 Worker 周期（下次启动重试）: %v", err)
 	}
 	s.watchdog = newWatchdogRuntime(s, time.Now)
 	s.engine.SetRunMonitor(s.watchdog.monitor)

@@ -251,9 +251,9 @@ func (e *Engine) AnswerPeerRequest(receiverIntentID int64, requestID, answer, re
 	copy := *r
 	e.peerMu.Unlock()
 
-	e.peerAuditActivity(r.TaskID, peerKindAnswer, &copy,
-		fmt.Sprintf("意图 #%d 对 #%d 的请求应答 %s", receiverIntentID, r.FromIntentID, answer), r.AnswerReason)
-	e.enqueuePeerMessage(r.FromIntentID, peerKindAnswer, &copy)
+	e.peerAuditActivity(copy.TaskID, peerKindAnswer, &copy,
+		fmt.Sprintf("意图 #%d 对 #%d 的请求应答 %s", receiverIntentID, copy.FromIntentID, answer), copy.AnswerReason)
+	e.enqueuePeerMessage(copy.FromIntentID, peerKindAnswer, &copy)
 	return nil
 }
 
@@ -286,9 +286,9 @@ func (e *Engine) ReleasePeerRequest(receiverIntentID int64, requestID string) er
 	copy := *r
 	e.peerMu.Unlock()
 
-	e.peerAuditActivity(r.TaskID, peerKindAnswer, &copy,
-		fmt.Sprintf("意图 #%d 已释放资源（请求 %s）", receiverIntentID, requestID), r.AnswerReason)
-	e.enqueuePeerMessage(r.FromIntentID, peerKindAnswer, &copy)
+	e.peerAuditActivity(copy.TaskID, peerKindAnswer, &copy,
+		fmt.Sprintf("意图 #%d 已释放资源（请求 %s）", receiverIntentID, requestID), copy.AnswerReason)
+	e.enqueuePeerMessage(copy.FromIntentID, peerKindAnswer, &copy)
 	return nil
 }
 

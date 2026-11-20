@@ -212,9 +212,7 @@ func (w *watchdogService) runJob(ctx context.Context, job *db.WatchdogJob, cfg w
 			return
 		}
 		reason := "慢速判断：" + report.Summary
-		if _, err := w.s.watchdog.fast.terminate(ctx, t, *current, reason, "stopped"); err != nil {
-			log.Printf("[watchdog] task %s 意图 #%d 慢速判断终止未生效: %v", t.ID, job.IntentID, err)
-		}
+		w.s.watchdog.fast.terminateAsync(ctx, *current, reason, "stopped")
 	}
 }
 

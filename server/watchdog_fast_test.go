@@ -626,3 +626,79 @@ func TestWatchdogDefaultRule(t *testing.T) {
 		}
 	}
 }
+
+// A termination can wait on a worker's settlement for up to
+// watchdogSettlementWait plus the hard-cancel window. processCycle runs on the
+// single shared Fast Path tick, so that wait must be dispatched in the
+// background; otherwise every other task's pressure prompt, Slow Path enqueue
+// and cycle accounting is delayed with it.
+func TestWatchdogProcessCycleTerminateDoesNotBlockTick(t *testing.T) {
+	m, task, intent := testWatchdogTask(t)
+	now := time.Now()
+	s := newAdmissionTestServer(m, nil)
+	s.watchdog = newWatchdogRuntime(s, func() time.Time { return now })
+	monitor := s.watchdog.monitor
+	s.engine.SetRunMonitor(monitor)
+
+	runID := "run-async-terminate"
+	_, workCancel := context.WithCancelCause(context.Background())
+	settled := make(chan struct{})
+	release := make(chan struct{})
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	finished := make(chan struct{})
+	s.engine.registerWorkRunFull(intent.ID, runID, task.ID, "work#1", workCancel,
+		func(reason string) bool {
+			close(settled)
+			go func() {
+				defer close(finished)
+				<-release
+				s.engine.settleWatchdogTermination(task, "work#1", intent, runID, reason, "stopped")
+				_, done := s.engine.detachWork(intent.ID)
+				done(nil)
+			}()
+			return true
+		})
+	monitor.Register(task.ID, intent.ID, runID, "work#1")
+	monitor.SetSlowPath(runID, db.SlowPathDone, "terminate", "no progress", nil, 0)
+	snap := monitor.Lookup(intent.ID)
+	if snap == nil {
+		t.Fatal("run disappeared")
+	}
+	cfg := watchdogConfig{
+		Enabled: true, PressureAfter: time.Minute, SlowPathAfter: 2 * time.Minute,
+		CycleAfter: 3 * time.Minute, AgentKey: "watchdog", AgentRetry: time.Minute,
+		MaxAutoCycles: 2,
+	}
+
+	returned := make(chan struct{})
+	go func() {
+		s.watchdog.fast.processCycle(context.Background(), task, *snap, cfg)
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("processCycle blocked on the settlement window instead of dispatching it")
+	}
+	select {
+	case <-settled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("termination was not dispatched after the cycle decision")
+	}
+	close(release)
+	released = true
+	select {
+	case <-finished:
+	case <-time.After(5 * time.Second):
+		t.Fatal("dispatched termination did not settle")
+	}
+	node, err := task.Store.GetNode(intent.ID)
+	if err != nil || node == nil || node.State != "stopped" {
+		t.Fatalf("intent=%+v err=%v, want stopped", node, err)
+	}
+}

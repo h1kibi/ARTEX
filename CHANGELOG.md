@@ -17,6 +17,12 @@
 - **前端排序与配置**：开放判断卡从 `groupSteps` 结果中提取并按 `seq` 降序置顶，普通活动、工具配对和轮次分组保持原序；设置页删除重复的周期/运行时限字段，显示只读 Worker 单周期长度和 `watchdog_max_auto_cycles`；审计卡支持 `peer_*`、`watchdog_run_finished` 和运行预算。
 - **norma 本地 fork**：`third_party/norma`（v0.4.4）承载外部结算接口，`go.mod` 通过 `replace` 指向本地；升级上游时需把该接口回移或重新同步。
 
+#### 修复
+
+- **终止不再阻塞 Fast Path**：周期终止与 Slow Path 终止改为后台派发并按 run 去重，结算等待（最长 60 秒 + 30 秒强取消）不再占用共享的 5 秒 tick，其他任务的压力提示、Slow Path 入队和周期推进保持准时。
+- **迁移失败不再阻断启动**：历史配置非法时记录可操作错误并沿用 Worker Agent 当前 `run_seconds`，不写迁移标记，下次启动重试；服务与设置页仍可进入。
+- **修复 peer 审计竞态**：应答 / 释放的审计改用解锁前的快照字段，避免与运行结束过期并发改写 `AnswerReason` 的数据竞争。
+
 #### 配置变更
 
 `watchdog_pressure_after_sec` 和 `watchdog_slow_path_after_sec` 保留；删除运行期读取 `watchdog_cycle_after_sec` / `worker_run_seconds`；新增 `watchdog_max_auto_cycles`。保存时校验 `0 < 压力提示 < Slow Path < Worker run_seconds`，不写入部分配置。

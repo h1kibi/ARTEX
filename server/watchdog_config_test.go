@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"strconv"
 	"testing"
 	"time"
@@ -225,6 +226,51 @@ func TestWatchdogLegacySettingsMigration(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// A failed one-time migration must not brick startup: the Worker Agent keeps its
+// current run_seconds, the completion marker stays absent so the next boot
+// retries, and the server is still constructed.
+func TestWatchdogMigrationFailureKeepsServerBooting(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	t.Cleanup(func() { m.Close() })
+	oldAgent := agentRunSecs(t, m, "worker")
+	restoreSettings(t, m, []string{
+		legacySettingWorkerRunSeconds, legacySettingWatchdogCycleSec,
+		settingWatchdogMigrated, settingWatchdogPressureSec, settingWatchdogSlowPathSec,
+	})
+	t.Cleanup(func() { _ = m.pg.SetAgentRunSeconds("worker", oldAgent) })
+	// Start from a clean migration state: the shared test DB may still carry the
+	// marker from another test, which would skip the migration entirely.
+	for _, key := range []string{
+		settingWatchdogMigrated, legacySettingWatchdogCycleSec, legacySettingWorkerRunSeconds,
+	} {
+		if err := m.pg.DeleteSetting(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := m.pg.SetSetting(legacySettingWorkerRunSeconds, "not-an-integer"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := New(ctx, m, t.TempDir(), t.TempDir(), t.TempDir())
+	if s == nil {
+		t.Fatal("New returned nil after a failed migration")
+	}
+	defer stopAllServerTasks(s, m)
+	if got := agentRunSecs(t, m, "worker"); got != oldAgent {
+		t.Fatalf("failed migration changed run_seconds=%d, want %d", got, oldAgent)
+	}
+	if _, ok, _ := m.pg.GetSetting(settingWatchdogMigrated); ok {
+		t.Fatal("failed migration wrote the completion marker")
+	}
+	if _, ok, _ := m.pg.GetSetting(legacySettingWorkerRunSeconds); !ok {
+		t.Fatal("failed migration deleted the legacy key")
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/Autumn-27/artex/db"
@@ -113,12 +114,17 @@ func decideCycle(cycleNo, autoUsed, maxAutoCycles int, signal cycleSignal, answe
 }
 
 // watchdogFast is the fixed-rule ticker. It never waits on the model: Slow Path
-// work is enqueued and consumed by a separate goroutine, so a slow/unavailable
-// Watchdog Agent cannot stall pressure delivery or cycle accounting.
+// work is enqueued and consumed by a separate goroutine, and terminations are
+// dispatched to background goroutines, so neither a slow Watchdog Agent nor a
+// pending worker settlement can stall pressure delivery or cycle accounting.
 type watchdogFast struct {
 	s       *Server
 	monitor *RunMonitor
 	now     func() time.Time
+	// terminating dedupes in-flight terminations by run id. The settlement wait
+	// is far longer than the 5s tick, so without it the same run would be retried
+	// every tick while its first attempt is still pending.
+	terminating sync.Map
 }
 
 func newWatchdogFast(s *Server, monitor *RunMonitor) *watchdogFast {
@@ -305,9 +311,7 @@ func (f *watchdogFast) processCycle(ctx context.Context, t *Task, snap RunSnapsh
 		if result == askCreateFailed {
 			reason = "创建用户判断卡失败；按周期规则终止"
 		}
-		if _, err := f.terminate(ctx, t, snap, reason, "exhausted"); err != nil {
-			log.Printf("[watchdog] task %s 意图 #%d 周期终止未生效: %v", t.ID, snap.IntentID, err)
-		}
+		f.terminateAsync(ctx, snap, reason, "exhausted")
 	case cycleActionTerminate:
 		if ask != nil && ask.Status == db.WatchdogRequestOpen {
 			answerText := "stop"
@@ -330,9 +334,7 @@ func (f *watchdogFast) processCycle(ctx context.Context, t *Task, snap RunSnapsh
 				reason += "（" + snap.SlowPathEvidence[0] + "）"
 			}
 		}
-		if _, err := f.terminate(ctx, t, snap, reason, decision.TerminalState); err != nil {
-			log.Printf("[watchdog] task %s 意图 #%d 周期终止未生效: %v", t.ID, snap.IntentID, err)
-		}
+		f.terminateAsync(ctx, snap, reason, decision.TerminalState)
 	}
 }
 
@@ -436,9 +438,26 @@ func (f *watchdogFast) createAsk(ctx context.Context, t *Task, snap RunSnapshot,
 	return askCreated
 }
 
+// terminateAsync dispatches a termination on its own goroutine. The settlement
+// wait plus the hard-cancel window can span well over a minute, far longer than
+// the shared 5s tick, so running it inline would stall every other task's
+// pressure prompt, Slow Path enqueue and cycle accounting. One attempt per run
+// is in flight at a time; a later cycle retries after it returns.
+func (f *watchdogFast) terminateAsync(ctx context.Context, snap RunSnapshot, reason, terminalState string) {
+	if _, loaded := f.terminating.LoadOrStore(snap.RunID, struct{}{}); loaded {
+		return
+	}
+	go func() {
+		defer f.terminating.Delete(snap.RunID)
+		if _, err := f.terminate(ctx, snap, reason, terminalState); err != nil {
+			log.Printf("[watchdog] task %s 意图 #%d 周期终止未生效: %v", snap.TaskID, snap.IntentID, err)
+		}
+	}()
+}
+
 // terminate is the only place Fast Path cancels a worker. The Engine validates
 // the run id and waits until runIntent has committed the final state.
-func (f *watchdogFast) terminate(ctx context.Context, t *Task, snap RunSnapshot, reason, terminalState string) (TerminationResult, error) {
+func (f *watchdogFast) terminate(ctx context.Context, snap RunSnapshot, reason, terminalState string) (TerminationResult, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, watchdogSettlementWait+workControlWaitTimeout+5*time.Second)
 	defer cancel()
 	result, err := f.s.engine.TerminateWorkForCycle(waitCtx, snap.IntentID, snap.RunID, reason, terminalState, snap.CycleNo)
@@ -473,7 +492,7 @@ func (s *Server) watchdogTerminateCycle(t *Task, snap RunSnapshot, reason, termi
 	if current == nil || current.State != db.WorkerRunStateRunning || current.CycleNo != snap.CycleNo {
 		return TerminationResult{}, fmt.Errorf("该运行或周期已结束")
 	}
-	return s.watchdog.fast.terminate(s.ctx, t, *current, reason, terminalState)
+	return s.watchdog.fast.terminate(s.ctx, *current, reason, terminalState)
 }
 
 // buildWatchdogSnapshot captures bounded evidence for the Slow Path. Details are
