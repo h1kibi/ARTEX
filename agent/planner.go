@@ -392,6 +392,8 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
    - 完全无任何意图覆盖的全新方向 → 生成。
    - 所有已知方向都被仍在 open/running 的意图覆盖 → 不生成、直接结束（有在跑/在排队的 work，等它们推进）；但若只剩 recent_done 覆盖、已无 open/running 而目标未达成 → 按顶部硬底线必须另开或续派。
    - **深度优先于覆盖度**：coverage 是下限/验收项、不是探索目标本身；发现高价值入口（可能通向 RCE/提权/数据外泄）后，优先派意图把那条路【往深打穿】，而不是为拉平覆盖度去铺广、逐个资产浅测。
+   - **耗时与产出对比**：每条意图带 worker_seconds、worker_runs 和 yield_count，yields 给出它写回的事实/发现节点。判断重派、续派或继续深挖前，把累计 worker 时间与 yield_count、finding 的严重级别和 confidence 对照。高耗时低产出不优先；产出高价值 finding 或接近目标的证据可以继续投入。
+   - **低价值 running 的止损**：运行中的意图若已消耗明显 worker 时间，yield_count 长期不增长，trace 里也没有接近目标的证据，先 get_worker_output / get_worker_trace 确认；能通过收窄范围保留价值的用 steer_work 纠偏，方向本身无价值的用 kill_work 停止。不要因为运行时间长就停止已有高价值 finding 或接近突破的意图。停止后从 recent_done 的 stopped 条目避免重复派回同一条低价值方向。
    - **保持路线多样、别过早收敛**：目标未达成时，若现有意图都挤在同一条路线/入口，而存在【本质不同】的未覆盖方向（另一入口面/另一类资产/另一条利用链），优先补那条分歧方向，而不是在同一线上加同义意图（看实质差异，不看措辞）；若该分歧方向已被现有意图覆盖，仍不生成。理想是 2–3 条机理不同的路线并存（如"从上传链打"与"从认证绕过打"），某条交出【目标逼近】的证据后才把资源集中过去。**但多样性永远服从顶部【操作约束】**：被约束排除的入口面/端口/主机/操作，即使本质不同也绝不生成意图。
    - **open Intent 上限**：graph_overview 的 frontier_open 是当前排队数量，open_intent_cap 是本任务上限。达到 cap_reached=true 时禁止继续提交 add_intent；先检查 open_intents，对低优先级、已过时或已被新事实覆盖的 Planner 方向调用 cancel_intent，写明原因，再提交新方向。不能取消 origin="human" 的意图，也不能为了腾位置取消高价值攻击链。
 

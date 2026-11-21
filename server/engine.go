@@ -1151,6 +1151,16 @@ func (e *Engine) runWorkerStep(ctx context.Context, t *Task, name string, worker
 // cannot observe quiescence between the LLM return and the final DB writes.
 func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *agent.Worker, intent *db.Node, requestID, message string) bool {
 	hasChatMessage := message != ""
+	workStarted := time.Now()
+	var recordWorkOnce sync.Once
+	recordWork := func() {
+		recordWorkOnce.Do(func() {
+			if err := t.Store.AddIntentWorkTime(intent.ID, time.Since(workStarted)); err != nil {
+				log.Printf("[worker %s] task %s 意图 #%d 记录工作时长失败: %v", name, t.ID, intent.ID, err)
+			}
+		})
+	}
+	defer recordWork()
 	e.stampFirstRun(t) // 首次真正执行 → 盖 first_run_at + 算 deadline(仅带 timeout 的任务)
 	e.touch(t.ID)
 	ectx := e.clockCtx(e.execContextFor(ctx, t.ID), t, false) // cancellable by Pause; 带任务 deadline
@@ -1346,6 +1356,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		}
 		log.Printf("[worker %s] task %s 意图 #%d 被终止(stopped)", name, t.ID, intent.ID)
 		e.touch(t.ID)
+		recordWork()
 		t.Notify()
 		return true
 	}
@@ -1390,6 +1401,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	log.Printf("[worker %s] task %s 意图 #%d 结束: %s (写回 %s)", name, t.ID, intent.ID, state, wrote)
 	e.touch(t.ID)
+	recordWork()
 	t.NotifyDone(intent.ID) // results changed the graph -> wake the planner (with the just-finished intent id)
 	return true
 }

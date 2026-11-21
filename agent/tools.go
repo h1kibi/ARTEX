@@ -6,17 +6,28 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 	acperm "github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
+func intentWorkerSeconds(n *db.Node) float64 {
+	ms := n.WorkerMS
+	if n.State == "running" && n.WorkerStartedAt != nil {
+		ms += time.Since(*n.WorkerStartedAt).Milliseconds()
+	}
+	if ms < 0 {
+		ms = 0
+	}
+	return float64(ms) / 1000
+}
+
 // compactIntents distills intents to {id, summary, state, asset_ids, parents,
-// yields} so the planner sees both the direction and its LINEAGE — parents (the
-// upstream nodes it derived from: facts/intents/findings) and yields (the facts/
-// findings it produced) — without pulling full payloads. parentsOf/yieldsOf are
-// built from the exploration edges in graph_overview.
+// yields, worker_seconds, worker_runs} so the planner sees both the direction
+// and its cost, plus LINEAGE — parents (upstream facts/intents/findings) and
+// yields (facts/findings produced) — without pulling full payloads.
 func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[string]any {
 	out := make([]map[string]any, 0, len(ns))
 	for _, n := range ns {
@@ -25,6 +36,7 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 		m := map[string]any{
 			"id": n.ID, "summary": p["summary"], "state": n.State,
 			"origin": n.Origin, "priority": n.Priority,
+			"worker_seconds": intentWorkerSeconds(n), "worker_runs": n.WorkerRuns,
 		}
 		if n.Inherited {
 			m["source_task_id"] = n.SourceTaskID
@@ -43,7 +55,9 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 		if ps := parentsOf[n.ID]; len(ps) > 0 {
 			m["parents"] = ps // 上游：本意图派生自哪些节点（多个事实可共同产生一个意图）
 		}
-		if ys := yieldsOf[n.ID]; len(ys) > 0 {
+		ys := yieldsOf[n.ID]
+		m["yield_count"] = len(ys)
+		if len(ys) > 0 {
 			m["yields"] = ys // 下游：本意图产生了哪些事实/发现
 		}
 		out = append(out, m)
@@ -2050,6 +2064,8 @@ func (t *ToolSet) getWorkerOutput() actool.CoreTool {
 					result["summary"] = pick.Summary
 					result["is_error"] = pick.IsError
 				}
+				result["worker_seconds"] = intentWorkerSeconds(intentNode)
+				result["worker_runs"] = intentNode.WorkerRuns
 				if intentNode.Inherited {
 					inheritedMap(result, intentNode.SourceTaskID)
 				}
@@ -2075,6 +2091,8 @@ func (t *ToolSet) getWorkerOutput() actool.CoreTool {
 				"intent_id": id, "state": intentNode.State, "final": true,
 				"final_text": activityText(pick),
 				"summary":    pick.Summary, "is_error": pick.IsError,
+				"worker_seconds": intentWorkerSeconds(intentNode),
+				"worker_runs":    intentNode.WorkerRuns,
 			}
 			if intentNode.Inherited {
 				inheritedMap(result, intentNode.SourceTaskID)
@@ -2183,7 +2201,8 @@ func (t *ToolSet) getWorkerTrace() actool.CoreTool {
 					}
 					steps = append(steps, step)
 				}
-				result := map[string]any{"intent_id": id, "state": intentNode.State, "steps": steps, "returned_step_ids": ids}
+				result := map[string]any{"intent_id": id, "state": intentNode.State, "steps": steps, "returned_step_ids": ids,
+					"worker_seconds": intentWorkerSeconds(intentNode), "worker_runs": intentNode.WorkerRuns}
 				if len(omitted) > 0 {
 					// returned_step_ids/omitted_step_ids let the model decide programmatically
 					// whether another call is worth it; the notice states the same in prose.
@@ -2209,7 +2228,8 @@ func (t *ToolSet) getWorkerTrace() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			result := map[string]any{"intent_id": id, "state": intentNode.State, "steps": traceSteps(acts, intentNode.State)}
+			result := map[string]any{"intent_id": id, "state": intentNode.State, "steps": traceSteps(acts, intentNode.State),
+				"worker_seconds": intentWorkerSeconds(intentNode), "worker_runs": intentNode.WorkerRuns}
 			if intentNode.Inherited {
 				inheritedMap(result, intentNode.SourceTaskID)
 			}

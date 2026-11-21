@@ -198,6 +198,11 @@ ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS delete_reason TEXT;
 -- Watchdog 终止原因：intent 因空转/循环/脱离意图/周期预算结束而停止时写入。
 -- 与 blocked_reason、delete_reason 分开，三种终态的原因互不覆盖；重跑时清空。
 ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS terminal_reason TEXT;
+-- Durable worker timing per intent. worker_ms accumulates completed runs;
+-- worker_started_at marks the currently claimed run for live elapsed display.
+ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS worker_ms BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS worker_runs INT NOT NULL DEFAULT 0;
+ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS worker_started_at TIMESTAMPTZ;
 -- cold-digest (§2.3/§5.3): content_version bumps on any change that could alter a
 -- digest body (summary/state/confidence); cold_since_round stamps the planner round
 -- a node most recently went from "has a live downstream branch" to none (NULL = hot).

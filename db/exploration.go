@@ -77,23 +77,26 @@ func jsonbClean(b []byte) []byte {
 
 // Node is a typed reasoning node (= old task_nodes). kind ∈ goal|intent|finding|hint.
 type Node struct {
-	FindingID      int64           `json:"finding_id,omitempty"` // populated by finding-aware reads; never inferred from ID
-	FindingNodeID  int64           `json:"finding_node_id,omitempty"`
-	TrafficCount   int             `json:"traffic_count,omitempty"`
-	ID             int64           `json:"id"`
-	Kind           string          `json:"kind"`
-	Payload        json.RawMessage `json:"payload"`
-	Priority       int             `json:"priority"`
-	State          string          `json:"state"`
-	Origin         string          `json:"origin,omitempty"`
-	Owner          string          `json:"owner,omitempty"`
-	BlockedReason  string          `json:"blocked_reason,omitempty"`
-	DeleteReason   string          `json:"delete_reason,omitempty"`   // 仅意图假删除(state='deleted')时非空
-	TerminalReason string          `json:"terminal_reason,omitempty"` // Watchdog 终止/周期预算结束的原因
-	Anchors        []int64         `json:"anchors,omitempty"`
-	CreatedAt      time.Time       `json:"created_at"`
-	SourceTaskID   int64           `json:"source_task_id,omitempty"`
-	Inherited      bool            `json:"inherited,omitempty"`
+	FindingID       int64           `json:"finding_id,omitempty"` // populated by finding-aware reads; never inferred from ID
+	FindingNodeID   int64           `json:"finding_node_id,omitempty"`
+	TrafficCount    int             `json:"traffic_count,omitempty"`
+	ID              int64           `json:"id"`
+	Kind            string          `json:"kind"`
+	Payload         json.RawMessage `json:"payload"`
+	Priority        int             `json:"priority"`
+	State           string          `json:"state"`
+	Origin          string          `json:"origin,omitempty"`
+	Owner           string          `json:"owner,omitempty"`
+	BlockedReason   string          `json:"blocked_reason,omitempty"`
+	DeleteReason    string          `json:"delete_reason,omitempty"`   // 仅意图假删除(state='deleted')时非空
+	TerminalReason  string          `json:"terminal_reason,omitempty"` // Watchdog 终止/周期预算结束的原因
+	WorkerMS        int64           `json:"worker_ms,omitempty"`       // completed worker run time; live run adds worker_started_at
+	WorkerRuns      int             `json:"worker_runs,omitempty"`
+	WorkerStartedAt *time.Time      `json:"worker_started_at,omitempty"`
+	Anchors         []int64         `json:"anchors,omitempty"`
+	CreatedAt       time.Time       `json:"created_at"`
+	SourceTaskID    int64           `json:"source_task_id,omitempty"`
+	Inherited       bool            `json:"inherited,omitempty"`
 }
 
 // Activity is one worker execution step (= old task_activity).
@@ -395,7 +398,9 @@ func (s *ExplorationStore) SetIntentState(id int64, state string) error {
 	// terminal states stamp completed_at; reopening (back to open/running) clears it.
 	terminal := IsTerminalIntentState(state)
 	_, err := s.db.Exec(`UPDATE exploration_nodes
-SET state=$1, blocked_reason=NULL, terminal_reason=NULL, content_version=content_version+1, completed_at = CASE WHEN $4 THEN now() ELSE NULL END
+SET state=$1, blocked_reason=NULL, terminal_reason=NULL,
+    worker_started_at = CASE WHEN $1='running' THEN now() ELSE worker_started_at END,
+    content_version=content_version+1, completed_at = CASE WHEN $4 THEN now() ELSE NULL END
 WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, state, id, s.expID, terminal)
 	return err
 }
@@ -433,7 +438,9 @@ WHERE id=$4 AND exploration_id=$5 AND kind='intent' AND state='open'`,
 func (s *ExplorationStore) CompareAndSetIntentStateWithReason(id int64, expected, state, reason string) (bool, error) {
 	terminal := IsTerminalIntentState(state)
 	res, err := s.db.Exec(`UPDATE exploration_nodes
-SET state=$1, blocked_reason=NULL, terminal_reason=NULLIF($6,''), content_version=content_version+1, completed_at = CASE WHEN $5 THEN now() ELSE NULL END
+SET state=$1, blocked_reason=NULL, terminal_reason=NULLIF($6,''),
+    worker_started_at = CASE WHEN $1='running' THEN now() ELSE worker_started_at END,
+    content_version=content_version+1, completed_at = CASE WHEN $5 THEN now() ELSE NULL END
 WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state=$4`, state, id, s.expID, expected, terminal, reason)
 	if err != nil {
 		return false, err
@@ -768,12 +775,12 @@ func (u *TokenUsage) add(other TokenUsage) {
 	u.CacheWriteTokens += other.CacheWriteTokens
 }
 
-const nodeCols = `id, kind, payload, priority, state, COALESCE(origin,''), COALESCE(owner,''), COALESCE(blocked_reason,''), COALESCE(delete_reason,''), COALESCE(terminal_reason,''), created_at`
+const nodeCols = `id, kind, payload, priority, state, COALESCE(origin,''), COALESCE(owner,''), COALESCE(blocked_reason,''), COALESCE(delete_reason,''), COALESCE(terminal_reason,''), worker_ms, worker_runs, worker_started_at, created_at`
 
 func scanNode(sc interface{ Scan(...any) error }) (*Node, error) {
 	var n Node
 	var payload []byte
-	if err := sc.Scan(&n.ID, &n.Kind, &payload, &n.Priority, &n.State, &n.Origin, &n.Owner, &n.BlockedReason, &n.DeleteReason, &n.TerminalReason, &n.CreatedAt); err != nil {
+	if err := sc.Scan(&n.ID, &n.Kind, &payload, &n.Priority, &n.State, &n.Origin, &n.Owner, &n.BlockedReason, &n.DeleteReason, &n.TerminalReason, &n.WorkerMS, &n.WorkerRuns, &n.WorkerStartedAt, &n.CreatedAt); err != nil {
 		return nil, err
 	}
 	n.Payload = json.RawMessage(payload)
@@ -1239,9 +1246,24 @@ WHERE exploration_id=$1 AND kind='goal' AND state='open')`, s.expID).Scan(&exist
 	return exists, err
 }
 
+// AddIntentWorkTime records one completed worker run and clears the live start
+// marker. The elapsed time is measured across the whole run, including model
+// retries and tool execution; it is not a sum of individual tool durations.
+func (s *ExplorationStore) AddIntentWorkTime(id int64, elapsed time.Duration) error {
+	ms := elapsed.Milliseconds()
+	if ms < 0 {
+		ms = 0
+	}
+	_, err := s.db.Exec(`UPDATE exploration_nodes
+SET worker_ms=worker_ms+$2, worker_runs=worker_runs+1, worker_started_at=NULL
+WHERE id=$1 AND exploration_id=$3 AND kind='intent'`, id, ms, s.expID)
+	return err
+}
+
 // ClaimIntent atomically moves an open intent to running. Returns true if claimed.
 func (s *ExplorationStore) ClaimIntent(id int64, owner string) (bool, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='running', owner=$1
+	res, err := s.db.Exec(`UPDATE exploration_nodes
+SET state='running', owner=$1, worker_started_at=now()
 WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state='open'`, owner, id, s.expID)
 	if err != nil {
 		return false, err
