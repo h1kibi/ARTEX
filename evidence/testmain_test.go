@@ -1,35 +1,15 @@
 package evidence
 
 import (
-	"context"
 	"os"
 	"testing"
 
-	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/internal/testdb"
 )
 
-// Initialize an explicitly configured fresh database before taking the same
-// suite lock as db, agent and server. Hold it on one pinned connection.
+// TestMain runs the evidence suite in its own PostgreSQL schema. db.Open
+// applies the schema there, and testdb removes the whole schema after m.Run,
+// so fixtures cannot leak into the application's public schema.
 func TestMain(m *testing.M) {
-	if os.Getenv("ARTEX_PG_DSN") == "" {
-		os.Exit(m.Run())
-	}
-	os.Exit(runEvidenceSuite(m))
-}
-func runEvidenceSuite(m *testing.M) int {
-	pg, err := db.Open(os.Getenv("ARTEX_PG_DSN"))
-	if err != nil {
-		panic(err)
-	}
-	defer pg.Close()
-	conn, err := pg.Conn(context.Background())
-	if err != nil {
-		panic(err)
-	}
-	defer conn.Close()
-	if _, err = conn.ExecContext(context.Background(), `SELECT pg_advisory_lock(7337741002)`); err != nil {
-		panic(err)
-	}
-	defer conn.ExecContext(context.Background(), `SELECT pg_advisory_unlock(7337741002)`)
-	return m.Run()
+	os.Exit(testdb.Run(m, "evidence"))
 }
