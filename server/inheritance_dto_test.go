@@ -50,12 +50,12 @@ func TestInheritedDTOProvenance(t *testing.T) {
 
 func TestInheritedIntentResultOnlyAllowsHistory(t *testing.T) {
 	for _, state := range []string{"done", "blocked", "exhausted", "stopped"} {
-		if !inheritedIntentResult(state) {
+		if !db.IsTerminalIntentState(state) {
 			t.Errorf("terminal state %q should be inherited history", state)
 		}
 	}
 	for _, state := range []string{"open", "running", ""} {
-		if inheritedIntentResult(state) {
+		if db.IsTerminalIntentState(state) {
 			t.Errorf("live state %q must not enter inherited history", state)
 		}
 	}
