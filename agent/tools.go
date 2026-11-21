@@ -22,7 +22,10 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 	for _, n := range ns {
 		var p map[string]any
 		_ = json.Unmarshal(n.Payload, &p)
-		m := map[string]any{"id": n.ID, "summary": p["summary"], "state": n.State}
+		m := map[string]any{
+			"id": n.ID, "summary": p["summary"], "state": n.State,
+			"origin": n.Origin, "priority": n.Priority,
+		}
 		if n.Inherited {
 			m["source_task_id"] = n.SourceTaskID
 			m["inherited"] = true
@@ -77,6 +80,13 @@ type ToolSet struct {
 	// intent id (engine callback, wired by the planner): the worker injects it before
 	// its next tool call and re-plans, without being killed. nil = tool unavailable.
 	steerWork func(intentID int64, msg string) error
+	// retryWork, if set, reopens a blocked intent for its next run (engine callback,
+	// wired by the planner). It is intentionally narrower than the UI rerun path:
+	// only external failures (blocked) qualify; exhausted/stopped need a human.
+	retryWork func(intentID int64) (queued bool, err error)
+	// openIntentCap bounds the Planner's open frontier (2 × task worker count).
+	// Zero disables the check for non-planner tool sets and tests.
+	openIntentCap int
 	// peerOps is the engine-side registry for worker-to-worker resource requests.
 	// nil = the peer tools report unavailable (non-worker agents, tests).
 	peerOps PeerOps
@@ -434,7 +444,7 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		switch n.State {
 		case "running":
 			running = append(running, n)
-		case "done", "blocked", "exhausted":
+		case "done", "blocked", "exhausted", "stopped":
 			if hidden(n.ID) {
 				continue // in a cold_digest and still cold — shown via cold_digests (§6.2)
 			}
@@ -442,17 +452,26 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		}
 	}
 	out["running_intents"] = compactIntents(running, parentsOf, yieldsOf)
-	// done_intents_total：已结束意图（done/blocked/exhausted）总数，与 recent_done_intents
-	// 平行命名——后者只是它的最新窗口截断视图。两键并排即自描述："看到的是 N/总数"，
-	// 让 planner 去重时别把"没显示"当成"没派过"，无需在提示词里另行解释。
+	// done_intents_total：已结束意图（done/blocked/exhausted/stopped）总数，与
+	// recent_done_intents 平行命名——后者只是它的最新窗口截断视图。stopped 包含
+	// Planner 取消和人工终止，后续轮次必须能看到并据此去重。
 	if dt, err := t.ts.CountFinishedIntents(); err == nil {
 		out["done_intents_total"] = dt
 	}
 	// frontier_open：开放意图真实总数（open_intents 只是其中优先级最高的前 N 条截断视图）。
+	frontierOpen := len(fr)
 	if fo, err := t.ts.CountOpenIntents(); err == nil {
-		out["frontier_open"] = fo
-	} else {
-		out["frontier_open"] = len(fr)
+		frontierOpen = fo
+	}
+	out["frontier_open"] = frontierOpen
+	if t.openIntentCap > 0 {
+		remaining := t.openIntentCap - frontierOpen
+		if remaining < 0 {
+			remaining = 0
+		}
+		out["open_intent_cap"] = t.openIntentCap
+		out["open_intent_remaining"] = remaining
+		out["cap_reached"] = frontierOpen >= t.openIntentCap
 	}
 	// findings (confirmed vulns) and facts (worker exploration results) are
 	// now distinct node kinds. recent_facts surfaces fact summaries (esp.
@@ -816,7 +835,7 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 		intentNodes, _ := ts.ListByKind(db.KindIntent, 300)
 		terminalIntent := make(map[int64]bool, len(intentNodes))
 		for _, intent := range intentNodes {
-			terminalIntent[intent.ID] = inheritedIntentSummaryState(intent.State)
+			terminalIntent[intent.ID] = db.IsTerminalIntentState(intent.State)
 		}
 		item["facts"] = len(facts)
 		item["findings"] = len(findings)
@@ -948,15 +967,6 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 		out = append(out, item)
 	}
 	return out
-}
-
-func inheritedIntentSummaryState(state string) bool {
-	switch state {
-	case "done", "blocked", "exhausted", "stopped":
-		return true
-	default:
-		return false
-	}
 }
 
 // compactNode distills any exploration node to id + summary + state, dropping the
@@ -1109,10 +1119,11 @@ func (t *ToolSet) nodeDetail() actool.CoreTool {
 
 // intentItem 是 add_intent 批量/单条的一条探索方向。
 type intentItem struct {
-	Summary   string            `json:"summary"`
-	AssetIDs  []json.RawMessage `json:"asset_ids"`
-	ParentIDs []json.RawMessage `json:"parent_ids"`
-	Priority  int               `json:"priority"`
+	Summary        string            `json:"summary"`
+	AssetIDs       []json.RawMessage `json:"asset_ids"`
+	ParentIDs      []json.RawMessage `json:"parent_ids"`
+	Priority       int               `json:"priority"`
+	ContinuationOf int64             `json:"continuation_of"`
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1133,6 +1144,23 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		if n.Kind != db.KindFact && n.Kind != db.KindFinding {
 			return 0, fmt.Errorf("parent_id %d 是 %q 节点，不能作为意图锚点：意图只能锚在已确认的【事实(fact)/发现(finding)】上，不能挂在意图/目标/提示上；顶层全新方向请留空 parent_ids", pidv, n.Kind)
 		}
+	}
+	var continuation *db.Node
+	if it.ContinuationOf > 0 {
+		n, err := t.ts.GetNodeWithSources(it.ContinuationOf)
+		if err != nil || n == nil || n.Kind != db.KindIntent {
+			return 0, fmt.Errorf("continuation_of %d 不是本任务可用的意图 id", it.ContinuationOf)
+		}
+		if n.Inherited {
+			return 0, fmt.Errorf("continuation_of %d 是关联任务的历史意图，只读，不能接续", it.ContinuationOf)
+		}
+		if n.State == db.StateIntentDeleted {
+			return 0, fmt.Errorf("continuation_of %d 已被删除，不能接续", it.ContinuationOf)
+		}
+		if !db.IsTerminalIntentState(n.State) {
+			return 0, fmt.Errorf("原意图 #%d 当前状态为 %s，仍在执行队列中，不能创建接续；运行中的意图请用 steer_work，外部失败结束后请用 retry_work", n.ID, n.State)
+		}
+		continuation = n
 	}
 	priority := it.Priority
 	if priority == 0 {
@@ -1158,7 +1186,10 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if len(anchors) > 0 {
 		payload["asset_ids"] = anchors
 	}
-	id, err := t.ts.AddIntent(payload, priority, anchors, "planner")
+	if continuation != nil {
+		payload["continuation_of"] = continuation.ID
+	}
+	id, err := t.ts.AddIntent(payload, priority, anchors, t.worker)
 	if err != nil {
 		return 0, err
 	}
@@ -1166,6 +1197,9 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	// "multiple facts combine into one new intent" is expressible.
 	for _, parent := range parents {
 		_ = t.ts.Link(parent, db.RelDerivedFrom, id)
+	}
+	if continuation != nil {
+		_ = t.ts.Link(continuation.ID, db.RelDerivedFrom, id)
 	}
 	// a top-level intent (no explicit parent) connects to the origin fact, so every
 	// intent still traces back to a fact node — at task start the only fact is the
@@ -1178,15 +1212,47 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	return id, nil
 }
 
+// openIntentCapError returns a planner-facing capacity error, or "" when a new
+// intent of extra size fits. Write tools run exclusively in the harness, so the
+// count here and the insert by the caller form one serialized operation.
+func (t *ToolSet) openIntentCapError(extra int) (string, error) {
+	if t.worker != "planner" || t.openIntentCap <= 0 {
+		return "", nil
+	}
+	openCount, err := t.ts.CountOpenIntents()
+	if err != nil {
+		return "", err
+	}
+	if openCount+extra <= t.openIntentCap {
+		return "", nil
+	}
+	fr, err := t.ts.Frontier(openCount)
+	if err != nil {
+		return "", err
+	}
+	var cancelable []string
+	for i := len(fr) - 1; i >= 0 && len(cancelable) < 6; i-- {
+		if fr[i].Origin == t.worker {
+			cancelable = append(cancelable, fmt.Sprintf("#%d(p%d)", fr[i].ID, fr[i].Priority))
+		}
+	}
+	if len(cancelable) == 0 {
+		cancelable = append(cancelable, "无可取消的 Planner open 意图（队列由其他来源占用）")
+	}
+	return fmt.Sprintf("open Intent 上限 %d，当前 %d，本次提交 %d；先取消低优先级方向：%s",
+		t.openIntentCap, openCount, extra, strings.Join(cancelable, ", ")), nil
+}
+
 func (t *ToolSet) addIntent() actool.CoreTool {
 	return t.writeExpTool("add_intent", "生成【探索方向】写入 frontier，并连入探索链路。意图是开放的探索方向，不是固定类型——用 summary 一句话自由描述要探索/验证/利用什么。\n"+
 		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。",
 		obj(map[string]any{
-			"intents":    map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"summary":    str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
-			"asset_ids":  map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
-			"parent_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
-			"priority":   intp("优先级 0-10，默认5"),
+			"intents":         map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority/continuation_of）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
+			"summary":         str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
+			"asset_ids":       map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
+			"parent_ids":      map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
+			"priority":        intp("优先级 0-10，默认5"),
+			"continuation_of": intp("接续的原意图 id（可选）：仅当原意图已经结束（done/blocked/exhausted/stopped）且你要换一种打法时填写。原意图仍 open/running/paused 会被拒绝；外部失败恢复请优先使用 retry_work。"),
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -1198,6 +1264,13 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 			items := a.Intents
 			if !batch {
 				items = []intentItem{a.intentItem}
+			}
+			msg, err := t.openIntentCapError(len(items))
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if msg != "" {
+				return actool.Errorf(msg), nil
 			}
 
 			ids := make([]int64, len(items))
@@ -1826,9 +1899,102 @@ func (t *ToolSet) steerWorkTool() actool.CoreTool {
 		})
 }
 
-// getWorkerOutput returns a work's final (or截至中止时的) conclusion text by intent id.
+// retryWorkTool reopens one blocked intent for another run. It deliberately
+// excludes exhausted/stopped: those states can represent a Watchdog budget
+// decision or a human stop, so only the UI rerun path may revive them.
+func (t *ToolSet) retryWorkTool() actool.CoreTool {
+	return t.writeExpTool("retry_work", "重开一条因外部模型或网络故障进入 blocked 的意图(work)，复用原转录和已写回产物继续执行。running/open/paused 不可重开；exhausted/stopped 需要人工在界面处理。",
+		obj(map[string]any{"intent_id": idp("要重开的意图 id（= work 句柄）")}, "intent_id"),
+		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+			if t.retryWork == nil {
+				return actool.Errorf("retry_work 当前不可用"), nil
+			}
+			var a struct {
+				IntentID json.RawMessage `json:"intent_id"`
+			}
+			_ = json.Unmarshal(in, &a)
+			id := pid(a.IntentID)
+			if id <= 0 {
+				return actool.Errorf("intent_id 必填"), nil
+			}
+			node, err := t.ts.GetNode(id)
+			if err != nil || node == nil || node.Kind != db.KindIntent {
+				return actool.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）"), nil
+			}
+			if node.State != "blocked" {
+				return actool.Errorf(fmt.Sprintf("意图 #%d 当前状态为 %s，只有 blocked 可以自动重开；running 用 steer_work，open 可等待或 cancel_intent", id, node.State)), nil
+			}
+			msg, err := t.openIntentCapError(1)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if msg != "" {
+				return actool.Errorf(msg), nil
+			}
+			queued, err := t.retryWork(id)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			return jsonResult(map[string]any{
+				"intent_id": id, "state": "open", "queued": queued,
+				"message": "意图已重开，worker 会复用原转录继续执行。",
+			})
+		})
+}
+
+// cancelIntentTool stops one queued intent owned by the Planner. It is a logical
+// cancellation: the node, lineage and audit remain, and a human can still rerun it.
+// Only open intents are eligible; running work uses steer_work or the terminate path.
+func (t *ToolSet) cancelIntentTool() actool.CoreTool {
+	return t.writeExpTool("cancel_intent", "取消一条排队中的 open 意图(work)：只修改状态为 stopped，保留节点、血缘和审计；不会停止运行中的 work。只能取消由 Planner 自己创建的 open 意图。",
+		obj(map[string]any{
+			"intent_id": idp("要取消的意图 id（= work 句柄）"),
+			"reason":    str("取消原因，写明被新事实覆盖、方向过时或优先级过低等原因"),
+		}, "intent_id", "reason"),
+		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+			var a struct {
+				IntentID json.RawMessage `json:"intent_id"`
+				Reason   string          `json:"reason"`
+			}
+			_ = json.Unmarshal(in, &a)
+			id := pid(a.IntentID)
+			if id <= 0 {
+				return actool.Errorf("intent_id 必填"), nil
+			}
+			reason := strings.TrimSpace(a.Reason)
+			if reason == "" {
+				return actool.Errorf("reason 必填"), nil
+			}
+			node, err := t.ts.GetNode(id)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if node == nil || node.Kind != db.KindIntent {
+				return actool.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）"), nil
+			}
+			if node.Origin != t.worker {
+				return actool.Errorf(fmt.Sprintf("只能取消 Planner 自己创建的意图（当前来源 %q）", node.Origin)), nil
+			}
+			changed, err := t.ts.CompareAndSetIntentStateWithReason(id, "open", "stopped", "planner_cancelled: "+reason)
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
+			if !changed {
+				return actool.Errorf(fmt.Sprintf("意图 #%d 已不在 open 状态（可能刚被 worker 领取），未取消", id)), nil
+			}
+			return jsonResult(map[string]any{
+				"intent_id": id, "state": "stopped",
+				"reason": "planner_cancelled: " + reason,
+			})
+		})
+}
+
+// getWorkerOutput returns a work's final conclusion text by intent id. While the
+// intent is still live, the same rows are only attempt-level output: return them
+// as last_text with an explicit running state instead of presenting a retryable
+// model_error as the work's final answer.
 func (t *ToolSet) getWorkerOutput() actool.CoreTool {
-	return t.readExpTool("get_worker_output", "取本任务或直接关联任务某条意图(work)的最终输出结论。关联任务结果带 source_task_id/inherited=true 且只读。正常结束返回其总结；被终止(stopped)/异常的 work 返回其截至中止时的最后输出。",
+	return t.readExpTool("get_worker_output", "取本任务或直接关联任务某条意图(work)的输出。关联任务结果带 source_task_id/inherited=true 且只读。意图已结束(done/blocked/exhausted/stopped)时返回 final_text；仍 open/running/paused 时只返回 state、running=true 和 last_text，last_text 不是最终结论。",
 		obj(map[string]any{"intent_id": idp("意图 id（= work 句柄）")}, "intent_id"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
@@ -1850,35 +2016,65 @@ func (t *ToolSet) getWorkerOutput() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			var chosen, fallback *db.Activity
+			var lastResult, lastText *db.Activity
 			for i := range acts {
 				switch acts[i].Kind {
 				case "result":
-					chosen = &acts[i]
-					fallback = &acts[i]
+					lastResult = &acts[i]
 				case "text":
-					fallback = &acts[i]
+					lastText = &acts[i]
 				}
 			}
-			pick := chosen
+			activityText := func(pick *db.Activity) string {
+				if pick == nil {
+					return ""
+				}
+				detail, _ := t.ts.ActivityDetailWithSources(pick.ID)
+				if detail == "" {
+					detail = pick.Summary
+				}
+				return detail
+			}
+			if !db.IsTerminalIntentState(intentNode.State) {
+				pick := lastText
+				if pick == nil {
+					pick = lastResult
+				}
+				result := map[string]any{
+					"intent_id": id, "state": intentNode.State,
+					"running": true, "final": false,
+					"last_text": activityText(pick),
+					"notice":    "该意图仍在运行或排队，当前输出不是最终结论；实时状态用 graph_overview，执行过程用 get_worker_trace。",
+				}
+				if pick != nil {
+					result["summary"] = pick.Summary
+					result["is_error"] = pick.IsError
+				}
+				if intentNode.Inherited {
+					inheritedMap(result, intentNode.SourceTaskID)
+				}
+				return jsonResult(result)
+			}
+			pick := lastResult
 			if pick == nil {
-				pick = fallback
+				pick = lastText
 			}
 			if pick == nil {
 				if intentNode.Inherited {
 					return jsonResult(inheritedMap(map[string]any{
-						"intent_id": id, "final_text": "（该 work 尚无任何输出）",
+						"intent_id": id, "state": intentNode.State, "final": true,
+						"final_text": "（该 work 尚无任何输出）",
 					}, intentNode.SourceTaskID))
 				}
-				return actool.Text("（该 work 尚无任何输出）"), nil
-			}
-			detail, _ := t.ts.ActivityDetailWithSources(pick.ID)
-			if detail == "" {
-				detail = pick.Summary
+				return jsonResult(map[string]any{
+					"intent_id": id, "state": intentNode.State, "final": true,
+					"final_text": "（该 work 尚无任何输出）",
+				})
 			}
 			result := map[string]any{
-				"intent_id": id, "final_text": detail,
-				"summary": pick.Summary, "is_error": pick.IsError,
+				"intent_id": id, "state": intentNode.State, "final": true,
+				"final_text": activityText(pick),
+				"summary":    pick.Summary, "is_error": pick.IsError,
 			}
 			if intentNode.Inherited {
 				inheritedMap(result, intentNode.SourceTaskID)
@@ -1890,12 +2086,16 @@ func (t *ToolSet) getWorkerOutput() actool.CoreTool {
 // traceSteps renders summary-only trace rows, re-truncating each summary to 100
 // chars — the stored summary is capped at 200 for the UI transcript; the trace
 // tools want it tighter since a whole work's step list is many rows.
-func traceSteps(acts []db.Activity) []map[string]any {
+func traceSteps(acts []db.Activity, intentState string) []map[string]any {
 	steps := make([]map[string]any, 0, len(acts))
+	provisional := !db.IsTerminalIntentState(intentState)
 	for i := range acts {
 		step := map[string]any{
 			"step_id": acts[i].ID, "kind": acts[i].Kind, "tool": acts[i].Tool,
 			"is_error": acts[i].IsError, "summary": firstLine(acts[i].Summary, 100),
+		}
+		if provisional && acts[i].Kind == "result" {
+			step["provisional"] = true
 		}
 		if acts[i].Inherited {
 			inheritedMap(step, acts[i].SourceTaskID)
@@ -1910,7 +2110,7 @@ func traceSteps(acts []db.Activity) []map[string]any {
 // few specific steps. Thinking steps are excluded everywhere.
 func (t *ToolSet) getWorkerTrace() actool.CoreTool {
 	return t.readExpTool("get_worker_trace",
-		"查看某条意图(work)的【执行过程】（区别于 get_worker_output 只给最终结论）。三种用法：\n"+
+		"查看某条意图(work)的【执行过程】（区别于 get_worker_output 只给终态结论）。三种用法：\n"+
 			"① 只传 intent_id → 返回该 work 每一步的摘要流（summary≤100字，含 step_id；只是动作轮廓，不含完整输出）；\n"+
 			"② intent_id + q → 只返回命中关键字的步骤摘要（在摘要和完整输出里都搜；仍只给 summary，要看内容用③）；\n"+
 			"③ intent_id + step_ids → 返回这些步骤的完整内容(detail)；一次最多取 5 个，超出只返回前 5 个并在 notice/omitted_step_ids 里告知未取的。\n"+
@@ -1975,12 +2175,15 @@ func (t *ToolSet) getWorkerTrace() actool.CoreTool {
 						"step_id": acts[i].ID, "kind": acts[i].Kind, "tool": acts[i].Tool,
 						"is_error": acts[i].IsError, "detail": acts[i].Detail,
 					}
+					if acts[i].Kind == "result" && !db.IsTerminalIntentState(intentNode.State) {
+						step["provisional"] = true
+					}
 					if acts[i].Inherited {
 						inheritedMap(step, acts[i].SourceTaskID)
 					}
 					steps = append(steps, step)
 				}
-				result := map[string]any{"intent_id": id, "steps": steps, "returned_step_ids": ids}
+				result := map[string]any{"intent_id": id, "state": intentNode.State, "steps": steps, "returned_step_ids": ids}
 				if len(omitted) > 0 {
 					// returned_step_ids/omitted_step_ids let the model decide programmatically
 					// whether another call is worth it; the notice states the same in prose.
@@ -2006,7 +2209,7 @@ func (t *ToolSet) getWorkerTrace() actool.CoreTool {
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			result := map[string]any{"intent_id": id, "steps": traceSteps(acts)}
+			result := map[string]any{"intent_id": id, "state": intentNode.State, "steps": traceSteps(acts, intentNode.State)}
 			if intentNode.Inherited {
 				inheritedMap(result, intentNode.SourceTaskID)
 			}
@@ -2041,6 +2244,7 @@ func (t *ToolSet) searchAllWorkerTraces() actool.CoreTool {
 				return actool.Errorf(err.Error()), nil
 			}
 			hits := make([]map[string]any, 0, len(acts))
+			states := make(map[int64]string)
 			for i := range acts {
 				var intent int64
 				if acts[i].NodeID != nil {
@@ -2050,6 +2254,22 @@ func (t *ToolSet) searchAllWorkerTraces() actool.CoreTool {
 					"intent_id": intent, "step_id": acts[i].ID, "worker": acts[i].Worker,
 					"kind": acts[i].Kind, "tool": acts[i].Tool, "is_error": acts[i].IsError,
 					"summary": firstLine(acts[i].Summary, 100),
+				}
+				if acts[i].Kind == "result" {
+					state, ok := states[intent]
+					if !ok {
+						n, nodeErr := t.ts.GetNodeWithSources(intent)
+						if nodeErr != nil {
+							return actool.Errorf(nodeErr.Error()), nil
+						}
+						if n != nil {
+							state = n.State
+						}
+						states[intent] = state
+					}
+					if !db.IsTerminalIntentState(state) {
+						hit["provisional"] = true
+					}
 				}
 				if acts[i].Inherited {
 					inheritedMap(hit, acts[i].SourceTaskID)
@@ -2126,7 +2346,7 @@ func (t *ToolSet) PlannerTools() []actool.CoreTool {
 		// cold-digest §6.1: restore folded cold nodes (digest body → members → detail).
 		t.expandDigest(),
 		t.getWorkerOutput(), t.getWorkerTrace(), t.searchAllWorkerTraces(), t.listGoals(), t.addIntent(), t.proveGoal(), t.goalMet(),
-		t.killWorkTool(), t.steerWorkTool(),
+		t.killWorkTool(), t.steerWorkTool(), t.retryWorkTool(), t.cancelIntentTool(),
 		// report_finding：规划态势研判时若自身已确证漏洞，可直接登记（与 worker 同工具）。
 		t.addFinding(),
 		// list_companies：查看企业列表 + scope + 资产数（拿 company_id / 理解归属范围）。

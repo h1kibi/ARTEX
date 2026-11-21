@@ -16,6 +16,18 @@ import (
 // it to distinguish an expected control race (HTTP 409) from a storage failure.
 var ErrIntentStateConflict = errors.New("intent state changed concurrently")
 
+// IsTerminalIntentState reports whether an intent has left the live frontier.
+// The tool layer uses this to decide whether a result row is final output or an
+// attempt from a run that may still retry.
+func IsTerminalIntentState(state string) bool {
+	switch state {
+	case "done", "blocked", "exhausted", "stopped", "deleted":
+		return true
+	default:
+		return false
+	}
+}
+
 // utf8Clean makes a string safe for a PostgreSQL text column. It (1) replaces
 // invalid UTF-8 byte sequences with U+FFFD and (2) strips NUL (0x00) bytes.
 // Tool output (nmap/curl/… stdout) can carry raw/truncated bytes that PostgreSQL's
@@ -326,7 +338,8 @@ WHERE exploration_id=$1 AND kind='intent' AND state='running'`, s.expID)
 // done/open/running are left untouched. Returns whether a row changed. Used by "重跑".
 func (s *ExplorationStore) ReopenIntent(id int64) (bool, error) {
 	res, err := s.db.Exec(`UPDATE exploration_nodes
-SET state='open', completed_at=NULL, blocked_reason=NULL, terminal_reason=NULL
+SET state='open', completed_at=NULL, blocked_reason=NULL, terminal_reason=NULL,
+    payload=payload - 'retry_count'
 WHERE id=$1 AND exploration_id=$2 AND kind='intent'
   AND state IN ('blocked','exhausted','stopped')`, id, s.expID)
 	if err != nil {
@@ -336,11 +349,40 @@ WHERE id=$1 AND exploration_id=$2 AND kind='intent'
 	return n > 0, nil
 }
 
+// ReopenBlockedIntentForRetry is the planner retry boundary: only a blocked intent
+// may reopen automatically, and the payload records how many times it has done so.
+// The state check and the retry-count increment share one UPDATE, so concurrent
+// planner rounds cannot both reopen the same intent or exceed the limit.
+func (s *ExplorationStore) ReopenBlockedIntentForRetry(id int64, maxRetries int) (retryCount int, changed bool, err error) {
+	if maxRetries < 1 {
+		return 0, false, fmt.Errorf("maxRetries 必须大于 0")
+	}
+	err = s.db.QueryRow(`
+UPDATE exploration_nodes AS n
+SET state='open', completed_at=NULL, blocked_reason=NULL, terminal_reason=NULL,
+    content_version=content_version+1,
+    payload=jsonb_set(n.payload, '{retry_count}',
+                      to_jsonb(COALESCE((n.payload->>'retry_count')::int, 0) + 1), true)
+WHERE n.id=$1 AND n.exploration_id=$2 AND n.kind='intent' AND n.state='blocked'
+  AND COALESCE((n.payload->>'retry_count')::int, 0) < $3
+RETURNING COALESCE((n.payload->>'retry_count')::int, 0)`,
+		id, s.expID, maxRetries).Scan(&retryCount)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return retryCount, true, nil
+}
+
 // ReopenBlockedIntents flips EVERY 'blocked' intent in this exploration back to 'open'
 // (batch rerun after e.g. an LLM/network outage that blocked many at once). Returns the
 // number reopened. Workers resume from their transcripts; kept graph writes remain.
 func (s *ExplorationStore) ReopenBlockedIntents() (int64, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes SET state='open', completed_at=NULL, blocked_reason=NULL, terminal_reason=NULL
+	res, err := s.db.Exec(`UPDATE exploration_nodes
+SET state='open', completed_at=NULL, blocked_reason=NULL, terminal_reason=NULL,
+    payload=payload - 'retry_count'
 WHERE exploration_id=$1 AND kind='intent' AND state='blocked'`, s.expID)
 	if err != nil {
 		return 0, err
@@ -351,7 +393,7 @@ WHERE exploration_id=$1 AND kind='intent' AND state='blocked'`, s.expID)
 
 func (s *ExplorationStore) SetIntentState(id int64, state string) error {
 	// terminal states stamp completed_at; reopening (back to open/running) clears it.
-	terminal := state == "done" || state == "blocked" || state == "exhausted" || state == "stopped"
+	terminal := IsTerminalIntentState(state)
 	_, err := s.db.Exec(`UPDATE exploration_nodes
 SET state=$1, blocked_reason=NULL, terminal_reason=NULL, content_version=content_version+1, completed_at = CASE WHEN $4 THEN now() ELSE NULL END
 WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, state, id, s.expID, terminal)
@@ -365,11 +407,31 @@ func (s *ExplorationStore) CompareAndSetIntentState(id int64, expected, state st
 	return s.CompareAndSetIntentStateWithReason(id, expected, state, "")
 }
 
+// RestoreIntentState is the rollback counterpart used when a reopen was followed
+// by an admission failure. It only writes while the intent is still open, so a
+// worker that claimed it in the meantime is never overwritten back to a terminal
+// state. The snapshot supplies the original state and both audit reasons.
+func (s *ExplorationStore) RestoreIntentState(snapshot *Node) (bool, error) {
+	if snapshot == nil || !IsTerminalIntentState(snapshot.State) {
+		return false, fmt.Errorf("restore requires a terminal intent snapshot")
+	}
+	res, err := s.db.Exec(`UPDATE exploration_nodes
+SET state=$1, blocked_reason=NULLIF($2,''), terminal_reason=NULLIF($3,''),
+    content_version=content_version+1, completed_at=now()
+WHERE id=$4 AND exploration_id=$5 AND kind='intent' AND state='open'`,
+		snapshot.State, snapshot.BlockedReason, snapshot.TerminalReason, snapshot.ID, s.expID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 // CompareAndSetIntentStateWithReason is CompareAndSetIntentState plus the terminal
 // explanation written in the same statement. Empty reason clears the column, so
 // reopening an intent cannot inherit an old Watchdog explanation.
 func (s *ExplorationStore) CompareAndSetIntentStateWithReason(id int64, expected, state, reason string) (bool, error) {
-	terminal := state == "done" || state == "blocked" || state == "exhausted" || state == "stopped"
+	terminal := IsTerminalIntentState(state)
 	res, err := s.db.Exec(`UPDATE exploration_nodes
 SET state=$1, blocked_reason=NULL, terminal_reason=NULLIF($6,''), content_version=content_version+1, completed_at = CASE WHEN $5 THEN now() ELSE NULL END
 WHERE id=$2 AND exploration_id=$3 AND kind='intent' AND state=$4`, state, id, s.expID, expected, terminal, reason)
@@ -805,14 +867,14 @@ func (s *ExplorationStore) countByKindFiltered(kind, q string) (int, error) {
 }
 
 // CountFinishedIntents counts this exploration's intents in a terminal explored
-// state (done/blocked/exhausted) — graph_overview's done_intents_total, so the planner
-// knows recent_done_intents (capped at a recent window) is a truncated view and
-// stays cautious about "already tried" dedup. Excludes 'stopped' (killed/deleted),
-// matching exactly what recent_done_intents surfaces.
+// state (done/blocked/exhausted/stopped) — graph_overview's done_intents_total,
+// so the planner knows recent_done_intents (capped at a recent window) is a
+// truncated view and stays cautious about "already tried" dedup. Stopped includes
+// Planner cancellations; deleted stays out of the terminal history.
 func (s *ExplorationStore) CountFinishedIntents() (int, error) {
 	var n int
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM exploration_nodes
-WHERE exploration_id=$1 AND kind='intent' AND state IN ('done','blocked','exhausted')`, s.expID).Scan(&n)
+WHERE exploration_id=$1 AND kind='intent' AND state IN ('done','blocked','exhausted','stopped')`, s.expID).Scan(&n)
 	return n, err
 }
 

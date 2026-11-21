@@ -553,6 +553,11 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	s.taskAgentMu.Lock()
 	defer s.taskAgentMu.Unlock()
 	if bundle := s.taskAgents[t.ID]; bundle != nil {
+		if s.engine != nil {
+			if n := s.engine.TaskWorkerCount(t.ID); n > 0 {
+				bundle.pl.SetOpenIntentCap(2 * n)
+			}
+		}
 		return bundle
 	}
 	goalRuntime := &taskLLMRuntime{s: s, taskID: t.ID, agentKey: "goals"}
@@ -584,6 +589,16 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	pl.SetNoaEnabled(s.m.NoaCompactionEnabled) // 实验功能:noa 上下文压缩(平台级开关,每 run 读)
 	pl.SetKillWork(s.engine.KillWork)
 	pl.SetSteerWork(s.engine.SteerWork)
+	pl.SetRetryWork(func(intentID int64) (bool, error) {
+		return s.retryBlockedIntent(t, intentID)
+	})
+	taskWorkers := s.m.Workers()
+	if s.engine != nil {
+		if n := s.engine.TaskWorkerCount(t.ID); n > 0 {
+			taskWorkers = n
+		}
+	}
+	pl.SetOpenIntentCap(2 * taskWorkers)
 	pl.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
 	pl.SetWebSearch(s.webSearchFor("planner"))
 	pl.SetConstraintInject(s.constraintInjectPlanner) // 操作约束注入 planner(可配置,默认开)

@@ -1214,10 +1214,63 @@ func restoreRerunIntent(t *Task, before *db.Node) error {
 	if t == nil || before == nil {
 		return fmt.Errorf("missing intent rollback snapshot")
 	}
-	if before.State == "blocked" && before.BlockedReason != "" {
-		return t.Store.SetIntentBlockedReason(before.ID, before.BlockedReason)
+	changed, err := t.Store.RestoreIntentState(before)
+	if err != nil {
+		return err
 	}
-	return t.Store.SetIntentState(before.ID, before.State)
+	if !changed {
+		return fmt.Errorf("%w: 意图 %d 已被领取或修改，未回滚", db.ErrIntentStateConflict, before.ID)
+	}
+	return nil
+}
+
+const maxPlannerIntentRetries = 2
+
+// admitReopenedIntent starts a task after one intent was moved back to open.
+// Admission failure restores the intent snapshot so the caller does not leave a
+// queued intent behind after reporting the error.
+func (s *Server) admitReopenedIntent(t *Task, iid int64, before *db.Node) (bool, error) {
+	queued, err := s.admitTask(t, "resume")
+	if err != nil {
+		if rollbackErr := restoreRerunIntent(t, before); rollbackErr != nil {
+			err = fmt.Errorf("%w; restore intent %d after admission failure: %v", err, iid, rollbackErr)
+		}
+		return false, err
+	}
+	return queued, nil
+}
+
+// retryBlockedIntent is the planner's retry_work callback. It deliberately only
+// reopens blocked intents: exhausted/stopped can encode a Watchdog budget or a
+// human stop, so those stay on the explicit UI rerun path. The reopen CAS and
+// retry-count bump are one statement in the store; admission failure restores the
+// previous state but leaves the count conservative.
+func (s *Server) retryBlockedIntent(t *Task, iid int64) (bool, error) {
+	if !s.engine.beginTaskOperation(t.ID) {
+		return false, fmt.Errorf("任务正在删除，无法重开意图")
+	}
+	defer s.engine.decInflight(t.ID)
+
+	before, err := t.Store.GetNode(iid)
+	if err != nil {
+		return false, err
+	}
+	if before == nil {
+		return false, fmt.Errorf("意图 #%d 不存在", iid)
+	}
+	retryCount, reopened, err := t.Store.ReopenBlockedIntentForRetry(iid, maxPlannerIntentRetries)
+	if err != nil {
+		return false, err
+	}
+	if !reopened {
+		return false, fmt.Errorf("意图 #%d 不是 blocked 或已达到自动重试上限（%d）", iid, maxPlannerIntentRetries)
+	}
+	queued, err := s.admitReopenedIntent(t, iid, before)
+	if err != nil {
+		return false, err
+	}
+	log.Printf("[task] #%s 意图 #%d 已由规划者重开（第 %d 次）", t.ID, iid, retryCount)
+	return queued, nil
 }
 
 func (s *Server) rerunIntent(w http.ResponseWriter, r *http.Request) {
@@ -1250,11 +1303,8 @@ func (s *Server) rerunIntent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 409, "该意图不是可重跑状态(仅 blocked/exhausted/stopped 可重跑)")
 		return
 	}
-	queued, err := s.admitTask(t, "resume")
+	queued, err := s.admitReopenedIntent(t, iid, before)
 	if err != nil {
-		if rollbackErr := restoreRerunIntent(t, before); rollbackErr != nil {
-			err = fmt.Errorf("%w; restore intent %d after admission failure: %v", err, iid, rollbackErr)
-		}
 		writeErr(w, 500, err.Error())
 		return
 	}
@@ -2448,15 +2498,6 @@ func (s *Server) intents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"items": taskNodeDTOs(in), "has_more": hasMore})
 }
 
-func inheritedIntentResult(state string) bool {
-	switch state {
-	case "done", "blocked", "exhausted", "stopped":
-		return true
-	default:
-		return false
-	}
-}
-
 // inheritedGraphSnapshot exposes immutable source-task history without leaking
 // work that is still open or running. Edges are filtered with the nodes so the
 // response cannot contain dangling ids that reveal hidden live intent topology.
@@ -2464,7 +2505,7 @@ func inheritedGraphSnapshot(nodes []*db.Node, edges []db.Edge, sourceTaskID int6
 	visible := make(map[int64]struct{}, len(nodes))
 	filteredNodes := make([]*db.Node, 0, len(nodes))
 	for _, node := range nodes {
-		if node == nil || (node.Kind == db.KindIntent && !inheritedIntentResult(node.State)) {
+		if node == nil || (node.Kind == db.KindIntent && !db.IsTerminalIntentState(node.State)) {
 			continue
 		}
 		node.SourceTaskID = sourceTaskID
@@ -2501,7 +2542,7 @@ func taskIntentHistoryPage(store *db.ExplorationStore, before int64, limit int, 
 			return nil, false, err
 		}
 		for _, node := range page {
-			if !inheritedIntentResult(node.State) {
+			if !db.IsTerminalIntentState(node.State) {
 				continue
 			}
 			node.SourceTaskID = sourceTaskID
@@ -2743,7 +2784,7 @@ func activitySessionStore(t *Task, filter db.ActivitySessionFilter) (*db.Explora
 	if !node.Inherited {
 		return t.Store, 0, nil
 	}
-	if !inheritedIntentResult(node.State) {
+	if !db.IsTerminalIntentState(node.State) {
 		return nil, 0, nil
 	}
 	sources, err := t.Store.DirectSourceStores()

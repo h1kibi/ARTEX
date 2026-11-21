@@ -173,9 +173,10 @@ type Engine struct {
 }
 
 type taskRuntime struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	workerCount int // captured at Run; runtimeMu protects this field
 }
 
 type workExecution struct {
@@ -270,6 +271,28 @@ func (e *Engine) registerTaskRoutines(parent context.Context, taskID string, cou
 	}
 	rt.wg.Add(count)
 	return rt
+}
+
+// setTaskWorkerCount records the worker-loop count captured by Run. The planner
+// cap uses this snapshot rather than the global setting, so changing workers does
+// not resize a running task's frontier.
+func (e *Engine) setTaskWorkerCount(taskID string, count int) {
+	e.runtimeMu.Lock()
+	defer e.runtimeMu.Unlock()
+	if rt := e.runtimes[taskID]; rt != nil {
+		rt.workerCount = count
+	}
+}
+
+// TaskWorkerCount returns the worker-loop count captured for a running task.
+// Zero means the task has not started yet.
+func (e *Engine) TaskWorkerCount(taskID string) int {
+	e.runtimeMu.Lock()
+	defer e.runtimeMu.Unlock()
+	if rt := e.runtimes[taskID]; rt != nil {
+		return rt.workerCount
+	}
+	return 0
 }
 
 func runTaskRoutine(rt *taskRuntime, fn func(context.Context)) {
@@ -901,6 +924,7 @@ func (e *Engine) Run(ctx context.Context, t *Task) {
 		return
 	}
 	rt := e.registerTaskRoutines(ctx, t.ID, 1+workers)
+	e.setTaskWorkerCount(t.ID, workers)
 	e.deleteMu.RUnlock()
 	e.touch(t.ID)
 	runTaskRoutine(rt, func(loopCtx context.Context) { e.plannerLoop(loopCtx, t) })

@@ -25,21 +25,24 @@ type Planner struct {
 	findingRecorder   FindingRecorder
 	prov              llm.Provider
 	model             string
-	tx                *transcript.Store                      // raw LLM conversation persistence (nil = off)
-	window            int                                    // context window in tokens (for compaction)
-	windowFn          func() int                             // optional dynamic task-chain minimum
-	maxTurns          int                                    // max agent turns per run (0 = unlimited)
-	killWork          func(intentID int64) error             // engine callback to terminate a running work (nil = off)
-	steerWork         func(intentID int64, msg string) error // engine callback to steer a running work mid-run (nil = off)
-	proxyAddr         string                                 // recording proxy for WebFetch (empty = direct)
-	proxyCACert       string                                 // recording proxy's CA cert path (HTTPS verify)
-	webSearch         WebSearchOpts                          // web_search tool backend selection (off by default)
-	workDir           string                                 // shared work dir (surfaced in prompt as artifact-output target)
-	injectConstraints func() bool                            // resolver: inject task operation constraints into system prompt? (nil = yes)
-	nonStreamingFn    func() bool                            // resolver: use non-streaming (Complete) path? (nil = streaming)
-	noaEnabledFn      func() bool                            // resolver: use experimental noa compaction? (nil = off)
-	maxTokensFn       func() int                             // resolver: per-reply output cap (nil/0 = send no cap)
-	compactor         *Compactor                             // cold-node compaction (§7); nil = disabled
+	tx                *transcript.Store                             // raw LLM conversation persistence (nil = off)
+	window            int                                           // context window in tokens (for compaction)
+	windowFn          func() int                                    // optional dynamic task-chain minimum
+	maxTurns          int                                           // max agent turns per run (0 = unlimited)
+	openIntentCap     int                                           // planner open frontier bound (2 × task worker count; 0 = off)
+	capMu             sync.RWMutex                                  // guards openIntentCap while a cached bundle is refreshed
+	killWork          func(intentID int64) error                    // engine callback to terminate a running work (nil = off)
+	steerWork         func(intentID int64, msg string) error        // engine callback to steer a running work mid-run (nil = off)
+	retryWork         func(intentID int64) (queued bool, err error) // engine callback to reopen a blocked intent (nil = off)
+	proxyAddr         string                                        // recording proxy for WebFetch (empty = direct)
+	proxyCACert       string                                        // recording proxy's CA cert path (HTTPS verify)
+	webSearch         WebSearchOpts                                 // web_search tool backend selection (off by default)
+	workDir           string                                        // shared work dir (surfaced in prompt as artifact-output target)
+	injectConstraints func() bool                                   // resolver: inject task operation constraints into system prompt? (nil = yes)
+	nonStreamingFn    func() bool                                   // resolver: use non-streaming (Complete) path? (nil = streaming)
+	noaEnabledFn      func() bool                                   // resolver: use experimental noa compaction? (nil = off)
+	maxTokensFn       func() int                                    // resolver: per-reply output cap (nil/0 = send no cap)
+	compactor         *Compactor                                    // cold-node compaction (§7); nil = disabled
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
@@ -124,6 +127,25 @@ func (p *Planner) SetKillWork(fn func(intentID int64) error) { p.killWork = fn }
 // SetSteerWork wires the engine's per-work steering callback so the planner's
 // steer_work tool can inject a mid-run course-correction into a running worker.
 func (p *Planner) SetSteerWork(fn func(intentID int64, msg string) error) { p.steerWork = fn }
+
+// SetRetryWork wires the engine callback that reopens one blocked intent. The
+// callback owns the blocked-only CAS; the planner tool only exposes the action.
+func (p *Planner) SetRetryWork(fn func(intentID int64) (queued bool, err error)) { p.retryWork = fn }
+
+// SetOpenIntentCap bounds the Planner's open frontier. The task bundle computes
+// 2 × worker count once, so changing the global workers setting does not move
+// the bound under a running task.
+func (p *Planner) SetOpenIntentCap(cap int) {
+	p.capMu.Lock()
+	p.openIntentCap = cap
+	p.capMu.Unlock()
+}
+
+func (p *Planner) currentOpenIntentCap() int {
+	p.capMu.RLock()
+	defer p.capMu.RUnlock()
+	return p.openIntentCap
+}
 
 // renderPlannerTodos formats the persistent planning todo for injection into the
 // wake-up prompt (empty when there are no todos yet — first wake-up).
@@ -281,6 +303,13 @@ func intentSummary(ts *db.ExplorationStore, id int64) string {
 // workerOutput returns the finished worker's conclusion for an intent — the last
 // 'result' (else 'text') activity's full detail, truncated. Same source get_worker_output uses.
 func workerOutput(ts *db.ExplorationStore, id int64) string {
+	node, err := ts.GetNode(id)
+	if err != nil {
+		return "(取输出失败)"
+	}
+	if node == nil || !db.IsTerminalIntentState(node.State) {
+		return "（该意图仍在运行或排队，暂无最终结论）"
+	}
 	acts, _, err := ts.ActivityList(&id, 0, 1000)
 	if err != nil {
 		return "(取输出失败)"
@@ -358,11 +387,13 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
    - 已有 open/running 覆盖 → 不再生成（正在处理）。
    - 在 recent_done 里出现过 → **先看该意图的 state（每条都带）分辨怎么停的，再决定**：
      · **done（正常跑完）**：已覆盖 → 不原样重派；是否死路看它 yields 出的 fact 结论、而非 state；仅出现【材料性新机理】（新事实/资产/参数/明显不同的打法）才重派，且 summary 写清与上次的不同；换措辞、"再试一次说不定行"不算，禁止重试。
-     · **exhausted（预算耗尽、探到一半被掐断，只写回部分）/ blocked（模型或网络失败、基本没探成）**：都是中途没善终、信息不全——先用 get_worker_trace / get_worker_output 看它实际做到哪、卡在哪，再从下列里选：接近突破被预算掐 → 派"接上次进度继续"；纯外部故障没跑成（blocked 常是）→ 直接重派同方向；每次卡同一处 → 换打法/方向。依据永远是 trace 里的真实进度，不是 state 本身。
+     · **blocked（模型或网络失败、基本没探成）**：先用 get_worker_output / get_worker_trace 确认它已结束以及实际做到哪。确认是外部故障后，用 retry_work 重开原意图，复用原转录和已写回产物继续执行。running/open/paused 的意图不会被 retry_work 接受；running 用 steer_work，open 可等待或 cancel_intent（Planner 自有），paused 需要人工恢复。不要用 add_intent 给仍在运行的意图创建接续。
+     · **exhausted（预算耗尽、探到一半被掐断，只写回部分）/ stopped（主动终止）**：都是中途结束、信息不全——先用 get_worker_output / get_worker_trace 看实际进度。要换一种打法时，用 add_intent 并把 continuation_of 设为原意图 id；原意图仍是 open/running/paused 时该字段会被拒绝。原意图已经结束，因此不会并发执行。
    - 完全无任何意图覆盖的全新方向 → 生成。
    - 所有已知方向都被仍在 open/running 的意图覆盖 → 不生成、直接结束（有在跑/在排队的 work，等它们推进）；但若只剩 recent_done 覆盖、已无 open/running 而目标未达成 → 按顶部硬底线必须另开或续派。
    - **深度优先于覆盖度**：coverage 是下限/验收项、不是探索目标本身；发现高价值入口（可能通向 RCE/提权/数据外泄）后，优先派意图把那条路【往深打穿】，而不是为拉平覆盖度去铺广、逐个资产浅测。
    - **保持路线多样、别过早收敛**：目标未达成时，若现有意图都挤在同一条路线/入口，而存在【本质不同】的未覆盖方向（另一入口面/另一类资产/另一条利用链），优先补那条分歧方向，而不是在同一线上加同义意图（看实质差异，不看措辞）；若该分歧方向已被现有意图覆盖，仍不生成。理想是 2–3 条机理不同的路线并存（如"从上传链打"与"从认证绕过打"），某条交出【目标逼近】的证据后才把资源集中过去。**但多样性永远服从顶部【操作约束】**：被约束排除的入口面/端口/主机/操作，即使本质不同也绝不生成意图。
+   - **open Intent 上限**：graph_overview 的 frontier_open 是当前排队数量，open_intent_cap 是本任务上限。达到 cap_reached=true 时禁止继续提交 add_intent；先检查 open_intents，对低优先级、已过时或已被新事实覆盖的 Planner 方向调用 cancel_intent，写明原因，再提交新方向。不能取消 origin="human" 的意图，也不能为了腾位置取消高价值攻击链。
 
    **串行利用链：分步派，别拆成并行。** 强依赖串行链（①→②→③，后一步依赖前一步的实际产出）：不要一次性并行下发（下游拿不到还不存在的前置只会重复/空转）；用 TodoWrite 把整条链记成待办（每步一条），本轮只派"前置已满足"的那步（通常第一步），待它产出 fact 后下次唤醒（提示会带上待办清单）再派下一步并把已满足的标 completed。"同一件事"别拆两条（"确认触发点"和"触发触发点"是同一步）；只有【平行、互不依赖】的维度（如枚举多个不相关端点）才用多意图并行。
 
@@ -370,6 +401,7 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
    - **summary**：一句话自然语言描述该方向（测试目标完整地址 + 做什么 + 为什么），不套固定分类；去重主要靠它与已有意图比对。
    - **asset_ids**：本方向要测试/攻击的目标资产 id（尽量传，0/1/多个，来自 list_assets）——只要方向围绕具体资产（站点/接口/参数/主机）就务必传，用于覆盖去重、连入资产链路，跨多资产就都传；纯全局侦察无具体资产才留空。
    - **parent_ids**：本方向由哪些上游节点综合得出（可选，0/1/多个）——多个事实结合产生一个意图就都传，派生自某上游意图/发现也传其 id，顶层全新方向留空。
+   - **continuation_of**：接续一条已经结束的意图时填写原意图 id；仅用于换一种打法，原意图仍是 open/running/paused 时调用会被拒绝。外部故障恢复优先使用 retry_work。
 
 不重复、不硬凑；但目标未达成、又有未覆盖且更深的打法时，该派就派。简洁、聚焦、高效。`
 
@@ -401,6 +433,8 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	tsx.SetCoverageEnabled(as == nil || as.CoverageEnabled(taskID))
 	tsx.killWork = p.killWork   // enable kill_work tool (nil = unavailable)
 	tsx.steerWork = p.steerWork // enable steer_work tool (nil = unavailable)
+	tsx.retryWork = p.retryWork // enable retry_work tool (nil = unavailable)
+	tsx.openIntentCap = p.currentOpenIntentCap()
 	if origin, _ := ts.OriginFactID(); origin > 0 {
 		tsx.SetOwnerNode(origin) // planner-side anchors default to the task root (origin fact)
 	}

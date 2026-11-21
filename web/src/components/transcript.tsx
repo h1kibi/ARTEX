@@ -661,10 +661,19 @@ function UserRow({ step, intent, getDetail }: { step: Activity; intent?: boolean
   );
 }
 
-// AnswerBlock renders the agent's FINAL answer (kind="result") in full — never
-// collapsed. The summary is a truncated first line, so the full text is pulled
-// from the detail and shown inline.
-function AnswerBlock({ step, getDetail }: { step: Activity; getDetail: (seq: number) => Promise<string> }) {
+// AnswerBlock renders a kind="result" row. A worker's result is final only after
+// the intent reaches a terminal state; while the session is live it is an attempt
+// result and gets an explicit intermediate label. The summary is a truncated first
+// line, so the full text is pulled from the detail and shown inline.
+function AnswerBlock({
+  step,
+  getDetail,
+  provisional,
+}: {
+  step: Activity;
+  getDetail: (seq: number) => Promise<string>;
+  provisional?: boolean;
+}) {
   const [ref, inView] = useInView();
   const [full, setFull] = React.useState<string | null>(null);
   React.useEffect(() => {
@@ -683,6 +692,9 @@ function AnswerBlock({ step, getDetail }: { step: Activity; getDetail: (seq: num
   }, [inView, step.seq, getDetail, step.summary]);
   return (
     <div ref={ref} className="mb-2 mt-1 flex min-w-0 flex-col gap-1">
+      {provisional && (
+        <div className="text-xs text-muted-foreground">本次执行尚未结束，以下内容是当前尝试的中间结果。</div>
+      )}
       <div
         className={
           "min-w-0 flex-1 break-words rounded-lg bg-muted px-3 py-2 " +
@@ -713,6 +725,7 @@ function ExecView({
   onOpenIntent,
   onChanged,
   openWatchdogIDs,
+  provisionalResults,
 }: {
   activity: Activity[];
   taskId?: string;
@@ -722,6 +735,7 @@ function ExecView({
   onOpenIntent?: (intentId: string) => void;
   onChanged?: () => void;
   openWatchdogIDs?: ReadonlySet<string>;
+  provisionalResults?: boolean;
 }) {
   const showWorker = new Set(activity.map((a) => a.worker)).size > 1;
   // default detail fetcher: the task-scoped activity endpoint. The chat page passes
@@ -742,7 +756,7 @@ function ExecView({
         ) : g.type === "user" ? (
           <UserRow key={"u" + g.key} step={g.step} intent={g.intent} getDetail={getDetail} />
         ) : g.type === "answer" ? (
-          <AnswerBlock key={"a" + g.key} step={g.step} getDetail={getDetail} />
+          <AnswerBlock key={"a" + g.key} step={g.step} getDetail={getDetail} provisional={provisionalResults} />
         ) : g.type === "tool" ? (
           <ToolBlock
             key={"t" + g.key}
@@ -785,6 +799,7 @@ export function Transcript({
   onOpenIntent,
   onChanged,
   openWatchdogIDs,
+  provisionalResults,
 }: {
   activity: Activity[];
   live?: boolean;
@@ -795,6 +810,7 @@ export function Transcript({
   onOpenIntent?: (intentId: string) => void;
   onChanged?: () => void;
   openWatchdogIDs?: ReadonlySet<string>;
+  provisionalResults?: boolean;
 }) {
   const transcriptRef = React.useRef<HTMLDivElement>(null);
   const [focusPadding, setFocusPadding] = React.useState(0);
@@ -819,6 +835,7 @@ export function Transcript({
         onOpenIntent={onOpenIntent}
         onChanged={onChanged}
         openWatchdogIDs={openWatchdogIDs}
+        provisionalResults={provisionalResults}
       />
       {live && (
         <div className="flex items-center gap-2 pl-2 pt-1 text-xs text-muted-foreground">

@@ -1951,6 +1951,10 @@ export function SessionsTab({ taskId }: { taskId: string }) {
                       refreshOpenWatchdogIDs();
                     }}
                     openWatchdogIDs={openWatchdogIDs}
+                    provisionalResults={
+                      active.role === "worker" &&
+                      (active.status === "running" || active.status === "paused" || active.status === "pending")
+                    }
                   />
                 ) : (
                   <div className="pl-9 text-xs text-muted-foreground">
