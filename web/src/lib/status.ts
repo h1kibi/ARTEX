@@ -88,6 +88,19 @@ const goal: Record<string, StatusMeta> = {
   abandoned: { label: "已放弃", tone: "slate" },
 };
 
+// Route lifecycle is a projection of intent states; reuse the same color
+// semantics as the intent domain instead of a page-local palette.
+const route: Record<string, StatusMeta> = {
+  proposed: { label: "待执行", tone: "slate" },
+  active: { label: "进行中", tone: "blue" },
+  paused: { label: "已暂停", tone: "amber" },
+  succeeded: { label: "已达成", tone: "green" },
+  blocked: { label: "受阻", tone: "red" },
+  exhausted: { label: "预算耗尽", tone: "violet" },
+  stopped: { label: "已停止", tone: "slate" },
+  superseded: { label: "已被取代", tone: "slate" },
+};
+
 const audit: Record<string, StatusMeta> = {
   allow: { label: "放行", tone: "green" },
   block: { label: "拦截", tone: "red" },
@@ -116,6 +129,7 @@ const maps = {
   finding,
   engine,
   goal,
+  route,
   audit,
   node,
   delivery,

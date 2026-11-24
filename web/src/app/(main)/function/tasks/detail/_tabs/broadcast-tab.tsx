@@ -72,6 +72,12 @@ const KIND_META: Record<string, KindMeta> = {
     dot: "bg-amber-500",
     chip: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
   },
+  checkpoint: {
+    label: "检查点",
+    icon: LayersIcon,
+    dot: "bg-indigo-500",
+    chip: "bg-indigo-500/15 text-indigo-600 dark:text-indigo-400",
+  },
   finding: {
     label: "漏洞",
     icon: BugIcon,
@@ -106,6 +112,9 @@ const REL_LABEL: Record<string, string> = {
 // goal / intent 的状态语义由全局 status 表提供(StatusBadge);其余类型的状态只在
 // 图和播报里出现,这里补一份。
 const STATE_META: Record<string, Record<string, { label: string; tone: Tone }>> = {
+  checkpoint: {
+    confirmed: { label: "已记录", tone: "slate" },
+  },
   fact: {
     origin: { label: "起点", tone: "slate" },
     confirmed: { label: "已确认", tone: "green" },
@@ -125,9 +134,20 @@ const STATE_META: Record<string, Record<string, { label: string; tone: Tone }>> 
   },
 };
 
-// 任务根是 state=origin 的 fact,播报里读作「起点」。
+// 任务根是 state=origin 的 fact,播报里读作「起点」；checkpoint 是路线簿记，不是普通事实。
 function viewKind(n: TaskNode): string {
-  return n.type === "fact" && n.state === "origin" ? "begin" : n.type;
+  if (n.type === "fact" && n.state === "origin") return "begin";
+  if (n.type === "fact" && n.payload?.trim()) {
+    try {
+      const p: unknown = JSON.parse(n.payload);
+      if (p && typeof p === "object" && (p as Record<string, unknown>).fact_type === "checkpoint") {
+        return "checkpoint";
+      }
+    } catch {
+      // Non-JSON payload: keep the raw fact kind.
+    }
+  }
+  return n.type;
 }
 
 const SUMMARY_FIELDS: Record<string, string[]> = {
@@ -185,9 +205,10 @@ const clockFmt = new Intl.DateTimeFormat("zh-CN", {
 });
 
 function NodeStateBadge({ node }: { node: TaskNode }) {
-  if (node.type === "goal") return <StatusBadge domain="goal" value={node.state} dot />;
-  if (node.type === "intent") return <StatusBadge domain="intent" value={node.state} dot />;
-  const meta = STATE_META[node.type]?.[node.state];
+  const kind = viewKind(node);
+  if (kind === "goal") return <StatusBadge domain="goal" value={node.state} dot />;
+  if (kind === "intent") return <StatusBadge domain="intent" value={node.state} dot />;
+  const meta = STATE_META[kind]?.[node.state];
   if (!meta) return null;
   return (
     <span

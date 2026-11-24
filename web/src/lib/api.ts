@@ -438,16 +438,23 @@ export const api = {
   // Route Graph：route_id、阶段、Intent、Checkpoint、Finding 与预算引用。
   taskRoutes: (id: string) => get<RoutesResponse>(`/tasks/${id}/routes`),
   // Information Graph：Observation / Claim / Hypothesis / Decision / Candidate / Finding。
-  taskInformation: (id: string, query: { type?: string; routeId?: number; limit?: number } = {}) => {
+  taskInformation: (
+    id: string,
+    query: { type?: string; routeId?: number; limit?: number; includeSources?: boolean } = {},
+  ) => {
     const q = new URLSearchParams();
     if (query.type) q.set("type", query.type);
     if (query.routeId) q.set("route_id", String(query.routeId));
     if (query.limit) q.set("limit", String(query.limit));
+    if (query.includeSources) q.set("include_sources", "1");
     const qs = q.toString();
     return get<InformationResponse>(`/tasks/${id}/information${qs ? `?${qs}` : ""}`);
   },
   // Evidence Layer：事实/漏洞引用的原始材料指针及可用性。
-  taskEvidence: (id: string) => get<EvidenceResponse>(`/tasks/${id}/evidence`),
+  taskEvidence: (id: string, query: { includeSources?: boolean } = {}) => {
+    const qs = query.includeSources ? "?include_sources=1" : "";
+    return get<EvidenceResponse>(`/tasks/${id}/evidence${qs}`);
+  },
 
   // ---- workspace file manager (workDir) ----
   workspaceList: (path = "") => get<WorkspaceListing>(`/workspace/list?path=${encodeURIComponent(path)}`),

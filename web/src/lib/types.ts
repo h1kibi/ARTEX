@@ -414,6 +414,7 @@ export interface InformationNode {
   confidence?: string;
   state?: string;
   validation_state?: string;
+  alternatives_rejected?: string[];
   evidence_refs?: string[];
   source_activity_ids?: number[];
   claim_ids?: number[];
@@ -529,7 +530,7 @@ export interface Company {
 }
 
 // ---- Exploration graph (per task) ----
-export type ExploreKind = "task" | "begin" | "goal" | "intent" | "fact" | "finding" | "hint" | "digest";
+export type ExploreKind = "task" | "begin" | "goal" | "intent" | "fact" | "checkpoint" | "finding" | "hint" | "digest";
 export type GoalState = "open" | "met" | "abandoned";
 export type IntentState = "open" | "running" | "paused" | "done" | "blocked" | "exhausted" | "stopped";
 export type FindingState = "confirmed" | "dismissed";

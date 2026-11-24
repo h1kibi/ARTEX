@@ -24,8 +24,11 @@ web/next-env.d.ts
 *.swp
 *.swo
 
-# docs
-/docs/
+# docs（仅保留当前三图方案的正文进版本库）
+/docs/*
+!/docs/ARTEX-优化方案-11-24.md
+!/docs/ARTEX-施工方案-11-24.md
+!/docs/ARTEX-施工记录-11-24.md
 
 # os
 .DS_Store

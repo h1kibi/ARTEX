@@ -141,6 +141,7 @@ type FactPayload struct {
 	State             string   `json:"state,omitempty"`
 	ValidationState   string   `json:"validation_state,omitempty"`
 	ValidationActions []string `json:"validation_actions,omitempty"`
+	Alternatives      []string `json:"alternatives_rejected,omitempty"`
 	NextActions       []string `json:"next_actions,omitempty"`
 	ProgressEvent     string   `json:"progress_event,omitempty"`
 	ObservedAt        string   `json:"observed_at,omitempty"`
@@ -453,47 +454,4 @@ func CanInheritFact(n *Node, now time.Time) (bool, string) {
 		return false, "敏感或临时数据(" + sens + ")默认不可跨任务继承"
 	}
 	return true, ""
-}
-
-// CheckpointPayload builds the checkpoint fact payload. The caller supplies the
-// route and run facts; this function only centralizes the JSON shape and the
-// observed-at timestamp so engine code stays small.
-func CheckpointPayload(summary, routeKind, objective, phase, runID, settlementReason string, routeID, intentID int64, confirmed, openHypotheses, findingIDs []int64, evidenceRefs, attempted, nextActions []string, used RouteBudgetUsed) map[string]any {
-	p := map[string]any{
-		"fact_type":           FactTypeCheckpoint,
-		"summary":             summary,
-		"route_id":            routeID,
-		"route_kind":          routeKind,
-		"objective":           objective,
-		"path_phase":          phase,
-		"intent_id":           intentID,
-		"run_id":              runID,
-		"created_by_run":      runID,
-		"confirmed_claim_ids": int64Slice(confirmed),
-		"open_hypothesis_ids": int64Slice(openHypotheses),
-		"finding_ids":         int64Slice(findingIDs),
-		"evidence_refs":       stringSlice(evidenceRefs),
-		"attempted_actions":   stringSlice(attempted),
-		"next_actions":        stringSlice(nextActions),
-		"budget_used":         used,
-		"observed_at":         time.Now().UTC().Format(time.RFC3339),
-	}
-	if settlementReason != "" {
-		p["settlement_reason"] = settlementReason
-	}
-	return p
-}
-
-func int64Slice(v []int64) []int64 {
-	if v == nil {
-		return []int64{}
-	}
-	return v
-}
-
-func stringSlice(v []string) []string {
-	if v == nil {
-		return []string{}
-	}
-	return v
 }

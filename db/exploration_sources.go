@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"sort"
+	"time"
 )
 
 // DirectSourceStore binds one directly related task to its exploration store.
@@ -123,15 +124,28 @@ func (s *ExplorationStore) ListByKindPageWithSources(kind string, before int64, 
 	if err != nil {
 		return nil, false, 0, err
 	}
+	now := time.Now()
 	for _, source := range sources {
 		page, err := source.Store.listByKindPageFiltered(kind, before, limit, q)
 		if err != nil {
 			return nil, false, 0, err
 		}
 		for _, n := range page {
+			if kind == KindFact {
+				// list_facts must not show (or count) source facts that the
+				// inheritance policy blocks.
+				if ok, _ := CanInheritFact(n, now); !ok {
+					continue
+				}
+			}
 			merged = append(merged, markInheritedNode(n, source.Task.TaskID))
 		}
-		cnt, err := source.Store.countByKindFiltered(kind, q)
+		var cnt int
+		if kind == KindFact {
+			cnt, err = source.Store.countInheritableFactsFiltered(q, now)
+		} else {
+			cnt, err = source.Store.countByKindFiltered(kind, q)
+		}
 		if err != nil {
 			return nil, false, 0, err
 		}
@@ -144,6 +158,30 @@ func (s *ExplorationStore) ListByKindPageWithSources(kind string, before int64, 
 		merged = merged[:limit]
 	}
 	return merged, hasMore, total, nil
+}
+
+// countInheritableFactsFiltered counts only facts that pass CanInheritFact, so a
+// list_facts total never includes sensitive/expired/local-only source rows.
+func (s *ExplorationStore) countInheritableFactsFiltered(q string, now time.Time) (int, error) {
+	const pageSize = 500
+	total := 0
+	cursor := int64(0)
+	for {
+		page, err := s.listByKindPageFiltered(KindFact, cursor, pageSize, q)
+		if err != nil {
+			return 0, err
+		}
+		for _, n := range page {
+			if ok, _ := CanInheritFact(n, now); ok {
+				total++
+			}
+		}
+		if len(page) <= pageSize {
+			break
+		}
+		cursor = page[len(page)-1].ID
+	}
+	return total, nil
 }
 
 // GetNodeWithSources reads a node only when it belongs to this exploration or

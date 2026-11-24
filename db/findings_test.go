@@ -464,6 +464,10 @@ func TestAddFindingFollowUpIntent(t *testing.T) {
 	if node.Kind != KindIntent || node.Priority != 10 || node.State != "open" || node.Origin != "human" {
 		t.Fatalf("follow-up intent metadata: %+v", node)
 	}
+	if route := ParseIntentRoute(node); route.RouteID != intentID || route.PathPhase != "validation" ||
+		route.Budget.MaxToolCalls != DefaultRouteMaxToolCalls || route.Budget.MaxInputTokens != DefaultRouteMaxInputTokens {
+		t.Fatalf("follow-up route metadata: %+v", route)
+	}
 	var anchorCount, edgeCount int
 	if err := d.QueryRow(`SELECT COUNT(*) FROM exploration_anchors WHERE node_id=$1 AND asset_id=$2`, intentID, assetID).Scan(&anchorCount); err != nil {
 		t.Fatal(err)

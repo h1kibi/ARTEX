@@ -62,11 +62,15 @@ func TestInheritedIntentResultOnlyAllowsHistory(t *testing.T) {
 }
 
 func TestInheritedGraphSnapshotFiltersLiveIntentsAndEdges(t *testing.T) {
+	expired := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
 	nodes := []*db.Node{
 		{ID: 1, Kind: db.KindFact, State: "confirmed"},
 		{ID: 2, Kind: db.KindIntent, State: "running"},
 		{ID: 3, Kind: db.KindIntent, State: "done"},
 		{ID: 4, Kind: db.KindFinding, State: "confirmed"},
+		{ID: 5, Kind: db.KindFact, State: "confirmed", Payload: json.RawMessage(`{"fact_type":"claim","summary":"secret","sensitivity":"credential"}`)},
+		{ID: 6, Kind: db.KindFact, State: "confirmed", Payload: json.RawMessage(`{"fact_type":"observation","summary":"stale","valid_until":"` + expired + `"}`)},
+		{ID: 7, Kind: db.KindFact, State: "confirmed", Payload: json.RawMessage(`{"fact_type":"claim","summary":"local","inheritance_policy":"local_only"}`)},
 	}
 	edges := []db.Edge{
 		{From: 1, Rel: db.RelDerivedFrom, To: 2},
@@ -79,8 +83,11 @@ func TestInheritedGraphSnapshotFiltersLiveIntentsAndEdges(t *testing.T) {
 		t.Fatalf("expected fact, terminal intent and finding; got %+v", gotNodes)
 	}
 	for _, node := range gotNodes {
-		if node.ID == 2 {
+		switch node.ID {
+		case 2:
 			t.Fatal("running inherited intent leaked into graph snapshot")
+		case 5, 6, 7:
+			t.Fatalf("non-inheritable fact %d leaked into graph snapshot", node.ID)
 		}
 		if !node.Inherited || node.SourceTaskID != 77 {
 			t.Fatalf("source provenance missing: %+v", node)

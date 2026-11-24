@@ -182,6 +182,9 @@ func (t *ToolSet) normalizeFactInput(ctx context.Context, it factItem, defaultIn
 	if len(validationActions) > 0 {
 		payload["validation_actions"] = validationActions
 	}
+	if len(it.Alternatives) > 0 {
+		payload["alternatives_rejected"] = trimmedStrings(it.Alternatives)
+	}
 	if len(nextActions) > 0 {
 		payload["next_actions"] = nextActions
 	}
@@ -401,23 +404,6 @@ func (t *ToolSet) validateEvidenceRef(ctx context.Context, ref db.EvidenceRef) e
 	return nil
 }
 
-// Default cumulative route budget for a NEW route when the planner omits one.
-// Without it, route cost is bounded only by Watchdog cycles (which are off by
-// default). A continuation inherits/raises the route budget instead of getting a
-// fresh default. Tool calls/input tokens are the cheap runaway guards; wall time
-// stays unbounded because the task deadline already covers it.
-const (
-	DefaultRouteMaxToolCalls   = 240
-	DefaultRouteMaxInputTokens = 1_200_000
-)
-
-func defaultRouteBudget() db.RouteBudget {
-	return db.RouteBudget{
-		MaxToolCalls:   DefaultRouteMaxToolCalls,
-		MaxInputTokens: DefaultRouteMaxInputTokens,
-	}
-}
-
 // mergeRouteBudget preserves an existing route budget dimension when the caller
 // omits it (0) on continuation, while allowing explicit expansion (> 0).
 func mergeRouteBudget(requested, inherited db.RouteBudget) db.RouteBudget {
@@ -441,12 +427,7 @@ func exhaustedBudgetMessage(routeID int64, budget db.RouteBudget, used db.RouteB
 	if dimension == "" {
 		return ""
 	}
-	label, field := "工具调用", "max_tool_calls"
-	if dimension == "input_tokens" {
-		label, field = "输入 token", "max_input_tokens"
-	} else if dimension == "wall_seconds" {
-		label, field = "墙钟(秒)", "max_wall_seconds"
-	}
+	label, field := db.RouteBudgetDimensionMeta(dimension)
 	return fmt.Sprintf("路线 #%d 累计%s预算已耗尽（%d/%d），不追加预算时接续会在下一周期立即再次被终止；若需继续此路线，请显式传入更大的 budget.%s（须大于 %d），否则请停止该路线或改派新路线",
 		routeID, label, usedValue, limit, field, usedValue)
 }

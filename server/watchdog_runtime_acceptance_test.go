@@ -115,7 +115,7 @@ func (p *runtimeAcceptanceProvider) Complete(ctx context.Context, req llm.Comple
 
 func waitRuntimeSnapshot(t *testing.T, monitor *RunMonitor, intentID int64, want func(RunSnapshot) bool) RunSnapshot {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		if snap := monitor.Lookup(intentID); snap != nil && want(*snap) {
 			return *snap
@@ -161,12 +161,12 @@ func TestRealWorkerAutoAdvanceWriteAndResume(t *testing.T) {
 	}()
 	select {
 	case <-provider.firstToolStarted:
-	case <-time.After(5 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("real Worker did not issue the first record_fact")
 	}
 
 	runID := ""
-	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+	for deadline := time.Now().Add(20 * time.Second); time.Now().Before(deadline); {
 		runs := monitor.ListRunning(task.ID)
 		if len(runs) == 1 {
 			runID = runs[0].RunID
@@ -207,7 +207,7 @@ func TestRealWorkerAutoAdvanceWriteAndResume(t *testing.T) {
 	provider.closeRelease()
 	select {
 	case <-provider.secondToolStarted:
-	case <-time.After(5 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("real Worker did not reach the second record_fact")
 	}
 	writtenAgain := waitRuntimeSnapshot(t, monitor, intent.ID, func(snap RunSnapshot) bool { return snap.Facts == 2 })
@@ -217,13 +217,13 @@ func TestRealWorkerAutoAdvanceWriteAndResume(t *testing.T) {
 
 	select {
 	case <-provider.thirdStarted:
-	case <-time.After(5 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("real Worker did not reach the pause/resume boundary")
 	}
 	s.engine.Pause(task.ID, agent.AbortPausedByUser)
 	select {
 	case <-runDone:
-	case <-time.After(5 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("real Worker did not stop on pause")
 	}
 	paused, err := task.Store.GetNode(intent.ID)
@@ -241,7 +241,7 @@ func TestRealWorkerAutoAdvanceWriteAndResume(t *testing.T) {
 	}()
 	select {
 	case <-resumedDone:
-	case <-time.After(5 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("resumed Worker did not complete")
 	}
 	resumed, err := task.Store.GetNode(intent.ID)

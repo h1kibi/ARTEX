@@ -7,7 +7,6 @@ import {
   AlertTriangleIcon,
   CheckCircle2Icon,
   ChevronRightIcon,
-  CircleDotIcon,
   CoinsIcon,
   DatabaseIcon,
   FileSearchIcon,
@@ -23,9 +22,12 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { StatusBadge } from "@/components/status-badge";
 import { api } from "@/lib/api";
 import type {
   EvidenceRef,
@@ -69,23 +71,7 @@ const TYPE_META: Record<string, { label: string; tone: string; icon: React.Eleme
     tone: "border-rose-500/40 bg-rose-500/10 text-rose-700 dark:text-rose-300",
     icon: ShieldCheckIcon,
   },
-  checkpoint: {
-    label: "检查点",
-    tone: "border-indigo-500/40 bg-indigo-500/10 text-indigo-700 dark:text-indigo-300",
-    icon: CircleDotIcon,
-  },
   legacy_unknown: { label: "历史事实", tone: "border-border bg-muted text-muted-foreground", icon: DatabaseIcon },
-};
-
-const STATUS_META: Record<string, { label: string; tone: string }> = {
-  active: { label: "进行中", tone: "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" },
-  succeeded: { label: "已达成", tone: "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300" },
-  proposed: { label: "待执行", tone: "border-border bg-muted text-muted-foreground" },
-  paused: { label: "已暂停", tone: "border-yellow-500/40 bg-yellow-500/10 text-yellow-700 dark:text-yellow-300" },
-  blocked: { label: "受阻", tone: "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300" },
-  exhausted: { label: "预算结束", tone: "border-orange-500/40 bg-orange-500/10 text-orange-700 dark:text-orange-300" },
-  stopped: { label: "已停止", tone: "border-border bg-muted text-muted-foreground" },
-  superseded: { label: "已被取代", tone: "border-border bg-muted text-muted-foreground" },
 };
 
 const TYPE_ORDER = ["observation", "claim", "hypothesis", "decision", "finding_candidate", "finding", "legacy_unknown"];
@@ -135,7 +121,7 @@ function Chip({ children, mono, className }: { children: React.ReactNode; mono?:
   );
 }
 
-function StatCard({
+function IntelStatCard({
   icon: Icon,
   label,
   value,
@@ -164,16 +150,19 @@ function StatCard({
 
 function EmptyView({ icon: Icon, title, hint }: { icon: React.ElementType; title: string; hint: string }) {
   return (
-    <div className="flex min-h-44 flex-col items-center justify-center gap-2 rounded-lg border border-dashed p-8 text-center">
-      <Icon className="text-muted-foreground size-6" />
-      <div className="text-sm font-medium">{title}</div>
-      <div className="text-muted-foreground max-w-md text-xs leading-relaxed">{hint}</div>
-    </div>
+    <Empty className="min-h-44 border">
+      <EmptyHeader>
+        <EmptyMedia variant="icon">
+          <Icon className="size-5" />
+        </EmptyMedia>
+        <EmptyTitle>{title}</EmptyTitle>
+        <EmptyDescription className="text-xs">{hint}</EmptyDescription>
+      </EmptyHeader>
+    </Empty>
   );
 }
 
 function RouteCard({ route, selected, onSelect }: { route: TaskRoute; selected: boolean; onSelect: () => void }) {
-  const status = STATUS_META[route.status] ?? STATUS_META.proposed;
   const percent = budgetPercent(route.budget, route.budget_used);
   const latest = route.checkpoints.at(-1);
   return (
@@ -187,9 +176,7 @@ function RouteCard({ route, selected, onSelect }: { route: TaskRoute; selected: 
     >
       <div className="flex flex-wrap items-center gap-2">
         <Chip mono>route #{route.route_id}</Chip>
-        <Badge variant="outline" className={status.tone}>
-          {status.label}
-        </Badge>
+        <StatusBadge domain="route" value={route.status} />
         {route.phase ? <Chip>{route.phase}</Chip> : null}
         <ChevronRightIcon className="text-muted-foreground ml-auto size-4 shrink-0 transition-transform group-hover:translate-x-0.5" />
       </div>
@@ -221,7 +208,6 @@ function RouteCard({ route, selected, onSelect }: { route: TaskRoute; selected: 
 }
 
 function RouteDetail({ route }: { route: TaskRoute }) {
-  const status = STATUS_META[route.status] ?? STATUS_META.proposed;
   const budget = route.budget;
   const used = route.budget_used;
   return (
@@ -230,9 +216,7 @@ function RouteDetail({ route }: { route: TaskRoute }) {
         <div className="flex flex-wrap items-center gap-2">
           <RouteIcon className="text-muted-foreground size-4" />
           <span className="font-mono text-sm">route #{route.route_id}</span>
-          <Badge variant="outline" className={status.tone}>
-            {status.label}
-          </Badge>
+          <StatusBadge domain="route" value={route.status} />
           {route.route_kind ? <Chip>{route.route_kind}</Chip> : null}
           {route.phase ? <Chip>{route.phase}</Chip> : null}
         </div>
@@ -466,6 +450,11 @@ function InformationRow({ node, open, onToggle }: { node: InformationNode; open:
               关联假设：{node.hypothesis_ids.map((id) => `#${id}`).join("、")}
             </div>
           ) : null}
+          {node.alternatives_rejected?.length ? (
+            <div className="mt-1 text-muted-foreground">
+              已放弃方向：{node.alternatives_rejected.join("；")}
+            </div>
+          ) : null}
           {node.evidence_refs?.length ? (
             <div className="mt-2 flex flex-wrap gap-1">
               {node.evidence_refs.map((ref) => (
@@ -546,58 +535,115 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
   const [typeFilter, setTypeFilter] = React.useState("all");
   const [openNodeID, setOpenNodeID] = React.useState<string | null>(null);
   const [view, setView] = React.useState("routes");
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState("");
+  const [reloadTick, setReloadTick] = React.useState(0);
+
+  // Switching task must not keep the previous task's selected route/filter or
+  // stale data; reset before the new load.
+  React.useEffect(() => {
+    setRoutes([]);
+    setInformation(null);
+    setEvidence(null);
+    setSelectedRouteID(null);
+    setOpenNodeID(null);
+    setTypeFilter("all");
+    setError("");
+    setLoading(true);
+  }, [taskId]);
 
   React.useEffect(() => {
     let cancelled = false;
-    const load = () => {
-      Promise.all([api.taskRoutes(taskId), api.taskInformation(taskId), api.taskEvidence(taskId)])
-        .then(([r, i, e]) => {
-          if (cancelled) return;
-          setRoutes(r.routes ?? []);
-          setInformation(i);
-          setEvidence(e);
-          setSelectedRouteID((current) => current ?? r.routes?.[0]?.route_id ?? null);
-        })
-        .catch(() => {
-          /* keep the last good view during a transient poll failure */
-        });
+    const infoQuery = {
+      type: typeFilter === "all" ? undefined : typeFilter,
+      routeId: selectedRouteID ?? undefined,
+      includeSources: true,
     };
-    load();
-    const timer = setInterval(load, 10000);
+    const fail = (err: unknown) => {
+      if (!cancelled) setError(err instanceof Error ? err.message : "情报数据加载失败");
+    };
+    const loadRoutes = async () => {
+      try {
+        const r = await api.taskRoutes(taskId);
+        if (cancelled) return;
+        setRoutes(r.routes ?? []);
+        setSelectedRouteID((current) => current ?? r.routes?.[0]?.route_id ?? null);
+      } catch (err) {
+        fail(err);
+      }
+    };
+    const loadInformation = async () => {
+      try {
+        const i = await api.taskInformation(taskId, infoQuery);
+        if (!cancelled) setInformation(i);
+      } catch (err) {
+        fail(err);
+      }
+    };
+    const loadEvidence = async () => {
+      try {
+        const e = await api.taskEvidence(taskId, { includeSources: true });
+        if (!cancelled) setEvidence(e);
+      } catch (err) {
+        fail(err);
+      }
+    };
+    const loadAll = async () => {
+      if (!cancelled) setError("");
+      await Promise.allSettled([loadRoutes(), loadInformation(), loadEvidence()]);
+      if (!cancelled) setLoading(false);
+    };
+    loadAll();
+    // Only poll the visible tab; hidden tabs keep their last good snapshot.
+    const timer = setInterval(() => {
+      if (!cancelled) setError("");
+      if (view === "routes") void loadRoutes();
+      else if (view === "information") void loadInformation();
+      else void loadEvidence();
+    }, 10000);
     return () => {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [taskId]);
+  }, [taskId, view, typeFilter, selectedRouteID, reloadTick]);
 
   const selected = routes.find((route) => route.route_id === selectedRouteID) ?? routes[0] ?? null;
-  const nodes = (information?.nodes ?? []).filter((node) => typeFilter === "all" || node.fact_type === typeFilter);
+  const nodes = information?.nodes ?? [];
   const counts = information?.counts ?? {};
   const totalEvidence = evidence?.refs.length ?? 0;
   const missingEvidence = evidence?.refs.filter((ref) => ref.available === false).length ?? 0;
 
   return (
     <div className="flex flex-col gap-4">
+      {error ? (
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-600 dark:text-red-400">
+          <AlertTriangleIcon className="size-4 shrink-0" />
+          <span className="min-w-0 flex-1">{error}</span>
+          <Button size="sm" variant="outline" onClick={() => setReloadTick((v) => v + 1)}>
+            重试
+          </Button>
+        </div>
+      ) : null}
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard
+        <IntelStatCard
           icon={RouteIcon}
           label="攻击路线"
           value={String(routes.length)}
           hint={`${routes.filter((r) => r.active_intents > 0).length} 条进行中`}
         />
-        <StatCard
+        <IntelStatCard
           icon={CheckCircle2Icon}
           label="Claim"
           value={String(counts.claim ?? 0)}
           hint={`观察 ${counts.observation ?? 0} · 假设 ${counts.hypothesis ?? 0}`}
         />
-        <StatCard
+        <IntelStatCard
           icon={AlertTriangleIcon}
           label="候选 / 确认漏洞"
           value={`${counts.finding_candidate ?? 0} / ${counts.finding ?? 0}`}
           hint="Candidate 需人工或 Planner 复核"
         />
-        <StatCard
+        <IntelStatCard
           icon={CoinsIcon}
           label="证据引用"
           value={String(totalEvidence)}
@@ -613,7 +659,9 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
         </TabsList>
 
         <TabsContent value="routes" className="mt-3">
-          {routes.length === 0 ? (
+          {loading && routes.length === 0 ? (
+            <Skeleton className="h-44 w-full" />
+          ) : routes.length === 0 ? (
             <EmptyView
               icon={RouteIcon}
               title="还没有路线"
@@ -674,7 +722,7 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
                   onClick={() => setTypeFilter("all")}
                   label={`全部 ${information?.total ?? 0}`}
                 />
-                {TYPE_ORDER.filter((type) => (counts[type] ?? 0) > 0 || type === "finding").map((type) => (
+                {TYPE_ORDER.filter((type) => (counts[type] ?? 0) > 0).map((type) => (
                   <FilterChip
                     key={type}
                     active={typeFilter === type}
@@ -685,7 +733,13 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
               </div>
             </CardHeader>
             <CardContent className="p-3 pt-0">
-              {nodes.length === 0 ? (
+              {loading && !information ? (
+                <div className="flex flex-col gap-2">
+                  <Skeleton className="h-16 w-full" />
+                  <Skeleton className="h-16 w-full" />
+                  <Skeleton className="h-16 w-full" />
+                </div>
+              ) : nodes.length === 0 ? (
                 <EmptyView
                   icon={FileSearchIcon}
                   title="这个视图没有节点"
@@ -709,7 +763,7 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
               )}
               {information?.truncated ? (
                 <div className="text-muted-foreground mt-2 text-[11px]">
-                  当前只展示最新一页；更早节点可用 API 的 type/route_id/limit 过滤。
+                  当前只展示最新一页；可用上方类型筛选与左侧路线筛选缩小范围。
                 </div>
               ) : null}
             </CardContent>
@@ -724,7 +778,7 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
               </CardTitle>
             </CardHeader>
             <CardContent className="p-3 pt-0">
-              <EvidenceTable evidence={evidence} />
+              {loading && !evidence ? <Skeleton className="h-44 w-full" /> : <EvidenceTable evidence={evidence} />}
             </CardContent>
           </Card>
         </TabsContent>

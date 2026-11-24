@@ -9,6 +9,49 @@ import (
 	"time"
 )
 
+// CheckpointPayload builds the checkpoint fact payload. The caller supplies the
+// route and run facts; this function only centralizes the JSON shape and the
+// observed-at timestamp so engine code stays small.
+func CheckpointPayload(summary, routeKind, objective, phase, runID, settlementReason string, routeID, intentID int64, confirmed, openHypotheses, findingIDs []int64, evidenceRefs, attempted, nextActions []string, used RouteBudgetUsed) map[string]any {
+	p := map[string]any{
+		"fact_type":           FactTypeCheckpoint,
+		"summary":             summary,
+		"route_id":            routeID,
+		"route_kind":          routeKind,
+		"objective":           objective,
+		"path_phase":          phase,
+		"intent_id":           intentID,
+		"run_id":              runID,
+		"created_by_run":      runID,
+		"confirmed_claim_ids": int64Slice(confirmed),
+		"open_hypothesis_ids": int64Slice(openHypotheses),
+		"finding_ids":         int64Slice(findingIDs),
+		"evidence_refs":       stringSlice(evidenceRefs),
+		"attempted_actions":   stringSlice(attempted),
+		"next_actions":        stringSlice(nextActions),
+		"budget_used":         used,
+		"observed_at":         time.Now().UTC().Format(time.RFC3339),
+	}
+	if settlementReason != "" {
+		p["settlement_reason"] = settlementReason
+	}
+	return p
+}
+
+func int64Slice(v []int64) []int64 {
+	if v == nil {
+		return []int64{}
+	}
+	return v
+}
+
+func stringSlice(v []string) []string {
+	if v == nil {
+		return []string{}
+	}
+	return v
+}
+
 // AddNodeLinked inserts a node and one outgoing edge in the same transaction.
 // Checkpoint and candidate facts need this so a reader never sees the node
 // without its intent->yields lineage.
@@ -214,6 +257,35 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, string(extraRaw), intentID
 	return checkpointID, nil
 }
 
+// Default cumulative route budget for a NEW route when the planner omits one.
+// It bounds runaway cost even when Watchdog is off; a continuation inherits or
+// raises the route budget instead of receiving a fresh default.
+const (
+	DefaultRouteMaxToolCalls   = 240
+	DefaultRouteMaxInputTokens = 1_200_000
+)
+
+func DefaultRouteBudget() RouteBudget {
+	return RouteBudget{
+		MaxToolCalls:   DefaultRouteMaxToolCalls,
+		MaxInputTokens: DefaultRouteMaxInputTokens,
+	}
+}
+
+// RouteBudgetDimensionMeta maps an exhausted dimension to the user-facing label
+// and the JSON budget field. Kept in one place so agent errors and API rerun
+// guards cannot drift apart.
+func RouteBudgetDimensionMeta(dimension string) (label, field string) {
+	switch dimension {
+	case "input_tokens":
+		return "输入 token", "max_input_tokens"
+	case "wall_seconds":
+		return "墙钟(秒)", "max_wall_seconds"
+	default:
+		return "工具调用", "max_tool_calls"
+	}
+}
+
 // RouteBudgetExhausted reports the first exhausted dimension of a cumulative
 // route budget. Wall-clock usage is compared in milliseconds; the returned
 // values are raw counts for that dimension. A zero limit means unlimited.
@@ -245,6 +317,27 @@ ORDER BY id DESC LIMIT 1`, s.expID, fmt.Sprint(routeID)))
 		return nil, nil
 	}
 	return n, err
+}
+
+// CheckpointFactIDs returns every checkpoint fact id in this exploration. Used
+// to keep route bookkeeping out of intent yield counts without a recent-window
+// truncation leak.
+func (s *ExplorationStore) CheckpointFactIDs() (map[int64]bool, error) {
+	rows, err := s.db.Query(`SELECT id FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='fact' AND payload->>'fact_type'=$2`, s.expID, FactTypeCheckpoint)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
 }
 
 // LatestCheckpointForRoute returns the newest checkpoint fact of one route.
@@ -689,11 +782,10 @@ func (s *ExplorationStore) RouteIDsForAsset(assetID int64) ([]int64, error) {
 	if assetID <= 0 {
 		return nil, nil
 	}
-	rows, err := s.db.Query(`SELECT DISTINCT n.payload->>'route_id'
+	rows, err := s.db.Query(`SELECT DISTINCT COALESCE(NULLIF(n.payload->>'route_id',''), n.id::text)
 FROM exploration_nodes n
 JOIN exploration_anchors a ON a.node_id=n.id
-WHERE n.exploration_id=$1 AND n.kind='intent' AND a.asset_id=$2
-  AND n.payload->>'route_id' IS NOT NULL`, s.expID, assetID)
+WHERE n.exploration_id=$1 AND n.kind='intent' AND a.asset_id=$2`, s.expID, assetID)
 	if err != nil {
 		return nil, err
 	}

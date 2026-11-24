@@ -89,7 +89,7 @@ type ToolSet struct {
 	ts              *db.ExplorationStore
 	worker          string
 	taskID          int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
-	artifactRoots []string
+	artifactRoots   []string
 	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
 	// zero value (all existing ToolSet constructions) means ENABLED — matching the
 	// DB default (true). When true: graphOverviewData drops the coverage block, the
@@ -450,6 +450,11 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// derived_from — possibly several facts combined) and its yields (the
 	// facts/findings it produced). factFrom maps a fact → the intent that
 	// produced it. This is the relationship layer the flat lists lacked.
+	// Checkpoints are yielded facts too, but they are route bookkeeping. Load the
+	// full id set so yield_count and the wake-up triggers only count real
+	// exploration output (not just the recent 1000-fact window).
+	factNodes, _ := t.ts.ListByKind(db.KindFact, 1000) // newest first
+	checkpointIDs, _ := t.ts.CheckpointFactIDs()
 	edges, _ := t.ts.Edges(5000)
 	parentsOf := map[int64][]int64{}
 	yieldsOf := map[int64][]int64{}
@@ -459,6 +464,9 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 		case db.RelDerivedFrom, db.RelSpawns: // upstream: derived_from (fact/finding/intent→intent) or spawns (origin fact→goal, legacy begin→intent)
 			parentsOf[e.To] = append(parentsOf[e.To], e.From)
 		case db.RelYields: // intent --yields--> fact/finding
+			if checkpointIDs[e.To] {
+				continue
+			}
 			yieldsOf[e.From] = append(yieldsOf[e.From], e.To)
 			factFrom[e.To] = e.From
 		}
@@ -521,7 +529,6 @@ func (t *ToolSet) graphOverviewData() map[string]any {
 	// negative results) so the planner sees them in one call; full content
 	// via node_detail(id).
 	vulnNodes, _ := t.ts.ListByKind(db.KindFinding, 1000)
-	factNodes, _ := t.ts.ListByKind(db.KindFact, 1000) // newest first
 	// Checkpoints are route bookkeeping and origin facts are the task root, not
 	// exploration facts: keep both out of the planner's fact count and window
 	// (the Route block shows checkpoints; origin is implicit).
@@ -1482,7 +1489,7 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if continuation == nil && budget.Empty() {
 		// A new route gets a finite default so a run cannot rely solely on the
 		// (default-off) Watchdog cycle for cost control. Explicit values win.
-		budget = defaultRouteBudget()
+		budget = db.DefaultRouteBudget()
 	}
 	// A continuation inherits the route identity and the remaining cumulative
 	// budget. The model cannot choose a different route id here; the source intent
@@ -1905,6 +1912,7 @@ type factItem struct {
 	ValidUntil        string            `json:"valid_until"`
 	Sensitivity       string            `json:"sensitivity"`
 	InheritancePolicy string            `json:"inheritance_policy"`
+	Alternatives      []string          `json:"alternatives_rejected"`
 	NextActions       []string          `json:"next_actions"`
 	ProgressEvent     string            `json:"progress_event"`
 	NextIntentID      json.RawMessage   `json:"next_intent_id"`
@@ -1950,18 +1958,22 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 			"claim_ids":           map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "hypothesis/finding_candidate 引用的 claim 节点 id"},
 			"hypothesis_ids":      map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "decision 引用的 hypothesis 节点 id"},
 			"validation_actions":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "hypothesis 必填：至少一步可执行验证动作"},
-			"state":               map[string]any{"type": "string", "enum": []string{"open", "supported", "rejected", "expired"}, "description": "hypothesis 的语义状态"},
-			"validation_state":    map[string]any{"type": "string", "enum": []string{"pending", "rejected"}, "description": "finding_candidate 的验证状态；confirmed 只能走 report_finding"},
-			"observed_at":         str("观察时间 RFC3339（省略=当前时间）"),
-			"valid_until":         str("有效期 RFC3339（可选）"),
-			"sensitivity":         map[string]any{"type": "string", "enum": []string{"normal", "credential", "token", "secret", "internal_file", "user_data", "ephemeral_port", "task_auth"}, "description": "敏感性标签（可选）：凭据/token/内部文件/用户数据/临时端口等标上后默认不跨任务继承"},
-			"inheritance_policy":  map[string]any{"type": "string", "enum": []string{"auto", "inheritable", "local_only"}, "description": "跨任务继承策略（可选）：auto（默认按敏感性与类型判断）/ inheritable / local_only"},
-			"next_actions":        map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "下一步动作（会写入 checkpoint）"},
-			"progress_event":      map[string]any{"type": "string", "description": "可选进展事件：new_asset/new_claim/validated_weakness/privilege_change/lateral_progress/objective_milestone/finding_written 等"},
-			"next_intent_id":      idp("decision 选择的下一条意图 id"),
-			"checkpoint_fact_id":  idp("decision 引用的 checkpoint fact id"),
-			"confidence":          str("observed（输出里直接看到）| inferred（据现象推断）。claim 必填。"),
-			"asset_ids":           map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
+			"alternatives_rejected": map[string]any{
+				"type": "array", "items": map[string]any{"type": "string"},
+				"description": "decision 可选：被放弃的替代方向/原因，避免后续重复评估同一条死路",
+			},
+			"state":              map[string]any{"type": "string", "enum": []string{"open", "supported", "rejected", "expired"}, "description": "hypothesis 的语义状态"},
+			"validation_state":   map[string]any{"type": "string", "enum": []string{"pending", "rejected"}, "description": "finding_candidate 的验证状态；confirmed 只能走 report_finding"},
+			"observed_at":        str("观察时间 RFC3339（省略=当前时间）"),
+			"valid_until":        str("有效期 RFC3339（可选）"),
+			"sensitivity":        map[string]any{"type": "string", "enum": []string{"normal", "credential", "token", "secret", "internal_file", "user_data", "ephemeral_port", "task_auth"}, "description": "敏感性标签（可选）：凭据/token/内部文件/用户数据/临时端口等标上后默认不跨任务继承"},
+			"inheritance_policy": map[string]any{"type": "string", "enum": []string{"auto", "inheritable", "local_only"}, "description": "跨任务继承策略（可选）：auto（默认按敏感性与类型判断）/ inheritable / local_only"},
+			"next_actions":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "下一步动作（会写入 checkpoint）"},
+			"progress_event":     map[string]any{"type": "string", "description": "可选进展事件：new_asset/new_claim/validated_weakness/privilege_change/lateral_progress/objective_milestone/finding_written 等"},
+			"next_intent_id":     idp("decision 选择的下一条意图 id"),
+			"checkpoint_fact_id": idp("decision 引用的 checkpoint fact id"),
+			"confidence":         str("observed（输出里直接看到）| inferred（据现象推断）。claim 必填。"),
+			"asset_ids":          map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
 		}),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {

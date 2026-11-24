@@ -1281,6 +1281,11 @@ func (s *Server) retryBlockedIntent(t *Task, iid int64) (bool, error) {
 	if before == nil {
 		return false, fmt.Errorf("意图 #%d 不存在", iid)
 	}
+	if msg, err := rerunBudgetBlockMessage(t.Store, before); err != nil {
+		return false, err
+	} else if msg != "" {
+		return false, fmt.Errorf("%s", msg)
+	}
 	retryCount, reopened, err := t.Store.ReopenBlockedIntentForRetry(iid, maxPlannerIntentRetries)
 	if err != nil {
 		return false, err
@@ -1453,12 +1458,7 @@ func rerunBudgetBlockMessage(store *db.ExplorationStore, intent *db.Node) (strin
 	if dimension == "" {
 		return "", nil
 	}
-	label, field := "工具调用", "max_tool_calls"
-	if dimension == "input_tokens" {
-		label, field = "输入 token", "max_input_tokens"
-	} else if dimension == "wall_seconds" {
-		label, field = "墙钟(秒)", "max_wall_seconds"
-	}
+	label, field := db.RouteBudgetDimensionMeta(dimension)
 	return fmt.Sprintf("意图 #%d 所在路线 #%d 的累计%s预算已耗尽（%d/%d），重跑会在下一个 Fast Path tick 再次被终止；请改用 add_intent(continuation_of=%d) 并传入更大的 budget.%s，或停止该路线。",
 		intent.ID, routeID, label, usedValue, limit, intent.ID, field), nil
 }
@@ -1901,13 +1901,19 @@ func (s *Server) seed(t *Task, text string) {
 // a failure just falls back to the normal planner-driven flow.
 func (s *Server) seedFirstIntent(t *Task) {
 	summary := fmt.Sprintf("完成任务目标：%s（任务：%s）", t.Goal, t.Description)
-	id, err := t.Store.AddIntent(map[string]any{"summary": summary}, 8, nil, "seed")
+	payload := map[string]any{
+		"summary": summary, "objective": t.Goal,
+		"route_kind": "path_stage", "phase": "recon", "path_phase": "recon",
+		"budget": db.DefaultRouteBudget(),
+	}
+	var edges []db.NewEdge
+	if origin, _ := t.Store.OriginFactID(); origin > 0 {
+		edges = append(edges, db.NewEdge{From: origin, Rel: db.RelDerivedFrom})
+	}
+	id, _, err := t.Store.AddIntentWithEdges(payload, 8, nil, "seed", 0, edges)
 	if err != nil {
 		log.Printf("[seed] task %s: 下发种子意图失败: %v", t.ID, err)
 		return
-	}
-	if origin, _ := t.Store.OriginFactID(); origin > 0 {
-		_ = t.Store.Link(origin, db.RelDerivedFrom, id)
 	}
 	log.Printf("[seed] task %s: 已下发种子意图 #%d", t.ID, id)
 }
@@ -1919,6 +1925,16 @@ func (s *Server) getTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dto := taskDTO(t, s.resolvedTaskStatus(t))
+	// List and detail must agree: without the persisted metric a restarted task
+	// shows an empty "last activity" until the next in-memory heartbeat.
+	if metrics, err := s.m.PG().TaskListMetricsAll(); err == nil {
+		if metric, ok := metrics[t.ExpID]; ok {
+			dto.LastActivity = metric.LastActivity
+		}
+	}
+	if live := s.engine.LastActivity(t.ID); live > dto.LastActivity {
+		dto.LastActivity = live
+	}
 	archiveBlockers, _ := s.m.PG().TaskArchiveBlockers()
 	applyTaskArchiveBlocker(&dto, archiveBlockers)
 	writeJSON(w, 200, dto)
@@ -2633,9 +2649,17 @@ func (s *Server) intents(w http.ResponseWriter, r *http.Request) {
 func inheritedGraphSnapshot(nodes []*db.Node, edges []db.Edge, sourceTaskID int64) ([]*db.Node, []db.Edge) {
 	visible := make(map[int64]struct{}, len(nodes))
 	filteredNodes := make([]*db.Node, 0, len(nodes))
+	now := time.Now()
 	for _, node := range nodes {
 		if node == nil || (node.Kind == db.KindIntent && !db.IsTerminalIntentState(node.State)) {
 			continue
+		}
+		// Source facts are read-only inheritance: sensitive/expired/local-only or
+		// otherwise non-inheritable payloads must never reach the downstream task.
+		if node.Kind == db.KindFact {
+			if ok, _ := db.CanInheritFact(node, now); !ok {
+				continue
+			}
 		}
 		node.SourceTaskID = sourceTaskID
 		node.Inherited = true
@@ -4048,7 +4072,11 @@ func (s *Server) fallbackChat(t *Task, msg string) string {
 	switch {
 	case strings.HasPrefix(m, "意图") || strings.HasPrefix(lower, "intent"):
 		text := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(m, "意图"), "intent"))
-		_, _ = t.Store.AddIntent(map[string]any{"summary": text}, 9, nil, "human")
+		_, _, _ = t.Store.AddIntentWithEdges(map[string]any{
+			"summary": text, "objective": text,
+			"route_kind": "path_stage", "phase": "recon", "path_phase": "recon",
+			"budget": db.DefaultRouteBudget(),
+		}, 9, nil, "human", 0, nil)
 		return "已注入一条高优先级意图：" + text
 	case strings.HasPrefix(m, "提示") || strings.HasPrefix(lower, "hint"):
 		text := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(m, "提示"), "hint"))

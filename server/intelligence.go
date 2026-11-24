@@ -87,6 +87,7 @@ type InformationNodeDTO struct {
 	Confidence        string   `json:"confidence,omitempty"`
 	State             string   `json:"state,omitempty"`
 	ValidationState   string   `json:"validation_state,omitempty"`
+	Alternatives      []string `json:"alternatives_rejected,omitempty"`
 	EvidenceRefs      []string `json:"evidence_refs,omitempty"`
 	SourceActivityIDs []int64  `json:"source_activity_ids,omitempty"`
 	ClaimIDs          []int64  `json:"claim_ids,omitempty"`
@@ -390,6 +391,7 @@ func informationNodeDTO(n *db.Node, now time.Time) InformationNodeDTO {
 	dto.Summary, dto.Detail = p.Summary, p.Detail
 	dto.Confidence, dto.State = p.Confidence, p.State
 	dto.ValidationState = p.ValidationState
+	dto.Alternatives = p.Alternatives
 	dto.EvidenceRefs = p.EvidenceRefs
 	dto.SourceActivityIDs = p.SourceActivityIDs
 	dto.ClaimIDs, dto.HypothesisIDs = p.ClaimIDs, p.HypothesisIDs
@@ -542,6 +544,17 @@ func (s *Server) taskEvidence(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, EvidenceResponse{Refs: refs, TrafficEnabled: tr != nil})
 }
 
+const (
+	routeStatusProposed   = "proposed"
+	routeStatusActive     = "active"
+	routeStatusPaused     = "paused"
+	routeStatusSucceeded  = "succeeded"
+	routeStatusBlocked    = "blocked"
+	routeStatusExhausted  = "exhausted"
+	routeStatusStopped    = "stopped"
+	routeStatusSuperseded = "superseded"
+)
+
 // routeStatus projects the route lifecycle from its intents. The newest
 // non-deleted intent owns the state: on a multi-stage route I1(done) -> I2,
 // I1 must not mask I2 ending blocked/exhausted/stopped as "succeeded". A live
@@ -560,29 +573,29 @@ func routeStatus(intents []RouteIntentDTO) string {
 		}
 	}
 	if latest == nil {
-		return "proposed"
+		return routeStatusProposed
 	}
 	switch latest.State {
 	case "running":
-		return "active"
+		return routeStatusActive
 	case "paused":
-		return "paused"
+		return routeStatusPaused
 	case "open":
 		// Queued, not claimed: an open intent must not look live.
-		return "proposed"
+		return routeStatusProposed
 	case "done":
-		return "succeeded"
+		return routeStatusSucceeded
 	case "blocked":
-		return "blocked"
+		return routeStatusBlocked
 	case "exhausted":
-		return "exhausted"
+		return routeStatusExhausted
 	case "stopped":
 		if strings.EqualFold(strings.TrimSpace(latest.TerminalReason), "superseded") {
-			return "superseded"
+			return routeStatusSuperseded
 		}
-		return "stopped"
+		return routeStatusStopped
 	default:
-		return "proposed"
+		return routeStatusProposed
 	}
 }
 

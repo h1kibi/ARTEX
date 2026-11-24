@@ -126,7 +126,7 @@ func TestAddIntentDefaultsRouteBudget(t *testing.T) {
 	if err != nil || node == nil {
 		t.Fatalf("node=%+v err=%v", node, err)
 	}
-	if b := db.ParseIntentRoute(node).Budget; b.MaxToolCalls != DefaultRouteMaxToolCalls || b.MaxInputTokens != DefaultRouteMaxInputTokens {
+	if b := db.ParseIntentRoute(node).Budget; b.MaxToolCalls != db.DefaultRouteMaxToolCalls || b.MaxInputTokens != db.DefaultRouteMaxInputTokens {
 		t.Fatalf("default budget=%+v", b)
 	}
 	if err := store.SetIntentState(first, "done"); err != nil {
@@ -139,7 +139,7 @@ func TestAddIntentDefaultsRouteBudget(t *testing.T) {
 	if node, err = store.GetNode(cont); err != nil || node == nil {
 		t.Fatalf("continuation=%+v err=%v", node, err)
 	}
-	if b := db.ParseIntentRoute(node).Budget; b.MaxToolCalls != DefaultRouteMaxToolCalls {
+	if b := db.ParseIntentRoute(node).Budget; b.MaxToolCalls != db.DefaultRouteMaxToolCalls {
 		t.Fatalf("continuation budget=%+v", b)
 	}
 

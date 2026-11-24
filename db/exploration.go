@@ -1080,7 +1080,8 @@ func (s *ExplorationStore) FactsYielded(intentID int64) ([]int64, error) {
 		FROM exploration_edges e
 		JOIN exploration_nodes n ON n.id=e.dst_id AND n.exploration_id=e.exploration_id
 		WHERE e.exploration_id=$1 AND e.src_id=$2 AND e.rel=$3 AND n.kind=$4
-		ORDER BY n.id`, s.expID, intentID, RelYields, KindFact)
+		  AND COALESCE(n.payload->>'fact_type','') <> $5
+		ORDER BY n.id`, s.expID, intentID, RelYields, KindFact, FactTypeCheckpoint)
 	if err != nil {
 		return nil, err
 	}

@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/Autumn-27/artex/db"
 	actool "github.com/Autumn-27/norma/tool"
@@ -142,7 +143,21 @@ func (t *ToolSet) expandDigest() actool.CoreTool {
 			_ = json.Unmarshal(n.Payload, &p)
 			members, _ := store.DigestMembers(in.ID)
 			list := make([]map[string]any, 0, len(members))
+			now := time.Now()
 			for _, m := range members {
+				if srcTaskID > 0 {
+					// Cross-task digest members obey the same inheritance filter as
+					// direct reads; a digest must not become a bypass.
+					member, err := store.GetNode(m)
+					if err != nil || member == nil {
+						continue
+					}
+					if member.Kind == db.KindFact {
+						if ok, _ := db.CanInheritFact(member, now); !ok {
+							continue
+						}
+					}
+				}
 				entry := t.digestMemberEntry(store, m)
 				if srcTaskID > 0 { // 关联任务的成员：只读，带继承标记（§2）
 					entry["inherited"] = true
@@ -153,12 +168,17 @@ func (t *ToolSet) expandDigest() actool.CoreTool {
 			out := map[string]any{
 				"id":      in.ID,
 				"state":   n.State, // active / superseded
-				"body":    p.Body,
 				"members": list,
 			}
 			if srcTaskID > 0 {
+				// The digest body is model-authored prose summarizing members whose
+				// individual payloads may be non-inheritable; do not expand it across
+				// tasks. The filtered member list stays available.
 				out["inherited"] = true
 				out["source_task_id"] = srcTaskID
+				out["body_withheld"] = "关联任务摘要正文不跨任务展开，请按成员逐条读取"
+			} else {
+				out["body"] = p.Body
 			}
 			return jsonResult(out)
 		})

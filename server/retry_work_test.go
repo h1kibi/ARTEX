@@ -41,6 +41,46 @@ func TestRetryBlockedIntentReopensBlocked(t *testing.T) {
 	}
 }
 
+func TestRetryBlockedIntentRejectsExhaustedRoute(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	defer m.Close()
+
+	task, err := m.CreateTaskWithOptions("retry budget", "test retry budget", db.TaskCreateOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.DeleteTask(task.ID, DeleteTaskOptions{}) }()
+
+	intentID, _, err := task.Store.AddIntentWithEdges(map[string]any{
+		"summary": "blocked on spent route", "budget": map[string]any{"max_tool_calls": 5},
+	}, 5, nil, "planner", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	used := db.RouteBudgetUsed{ToolCalls: 5}
+	if _, err := task.Store.SaveRunCheckpoint(intentID, 0, 0, db.CheckpointPayload(
+		"spent", "path_stage", "retry budget", "validation", "run-r", "completed",
+		intentID, intentID, nil, nil, nil, nil, nil, nil, used,
+	), used, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := task.Store.SetIntentState(intentID, "blocked"); err != nil {
+		t.Fatal(err)
+	}
+
+	s := newAdmissionTestServer(m, nil)
+	if _, err := s.retryBlockedIntent(task, intentID); err == nil || !strings.Contains(err.Error(), "预算已耗尽") {
+		t.Fatalf("retry on exhausted route error: %v", err)
+	}
+	node, err := task.Store.GetNode(intentID)
+	if err != nil || node == nil || node.State != "blocked" {
+		t.Fatalf("blocked intent was reopened despite exhausted route: %+v err=%v", node, err)
+	}
+}
+
 func TestRetryBlockedIntentRejectsLiveIntent(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {

@@ -430,6 +430,21 @@ func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int
 		VALUES ($1,'intent',$2,10,'open','human') RETURNING id`, s.expID, raw).Scan(&intentID); err != nil {
 		return 0, Activity{}, err
 	}
+	// A follow-up is its own new route: stable route_id = intent id, explicit
+	// recon/validation phase and the same finite default budget as planner intents.
+	routeFields, err := json.Marshal(map[string]any{
+		"route_id": intentID, "route_kind": "path_stage",
+		"phase": "validation", "path_phase": "validation",
+		"objective": description, "budget": DefaultRouteBudget(),
+	})
+	if err != nil {
+		return 0, Activity{}, err
+	}
+	if _, err := tx.Exec(`UPDATE exploration_nodes
+SET payload = payload || $1::jsonb, content_version = content_version + 1
+WHERE id=$2 AND exploration_id=$3`, string(routeFields), intentID, s.expID); err != nil {
+		return 0, Activity{}, err
+	}
 	if _, err := tx.Exec(`INSERT INTO exploration_anchors(node_id,asset_id)
 		SELECT $1, asset_id FROM exploration_anchors WHERE node_id=$2
 		ON CONFLICT DO NOTHING`, intentID, liveNodeID); err != nil {

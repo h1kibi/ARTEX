@@ -30,6 +30,14 @@
 - **Route 状态误判**：只有 `running` 的意图才算进行中；`open` 显示待执行，`paused/stopped/superseded` 不再被吞成 `proposed/active`。`routes` 返回的 `intents/checkpoints/findings` 恒为数组，不再输出 `null`。
 - **Information/Evidence 查询截断与错误吞掉**：总数与分类计数改由 SQL 对全图统计，分页单独截断后返回 `truncated`；`/information`、`/evidence`、`/routes` 的数据库错误统一返回 500，不再伪装成空结果。新增 `include_sources=1` 合并可继承的来源任务数据（按有效期、敏感性、继承策略过滤）。
 - **Evidence 引用校验与展示**：`record_fact`/`report_finding` 对 `activity/node/finding/artifact` 引用做存在性校验；artifact 引用必须在当前任务工作目录内（`worker` 为 `i<intentID>` 与任务目录，`planner`/主代理为任务目录）；Route 视图展示 finding 的 `evidence_refs` 与流量绑定数量，Information 视图展示继承来源、过期与敏感性标签。
+- **跨任务继承绕过**：`/api/exploration/graph` 的来源 fact 与 `expand_digest` 的关联摘要成员统一走 `db.CanInheritFact`；关联摘要正文不再跨任务展开，只保留过滤后的成员列表。
+- **Checkpoint 统计污染**：重跑写 checkpoint 时跳过旧 checkpoint 产出；意图 `yield_count`/唤醒触发与 `FactsYielded` 排除 checkpoint，空跑意图不再被算作有产出。
+- **自动重试绕过预算**：`retry_work` 与人工 rerun 共用路线预算耗尽检查，满额后返回明确错误。
+- **非 Planner 意图缺路线元数据**：种子意图、漏洞深入验证意图、无 LLM 的「意图 ...」注入均写入 `route_id`、阶段和默认预算，资产覆盖图抽屉能关联到这些路线。
+- **历史意图路线与统计**：`RouteIDsForAsset` 对缺失 `route_id` 的意图回退到自身 id；`list_facts.total` 按 `CanInheritFact` 过滤后再计数；任务详情回填持久化的 `last_activity_unix`。
+- **情报页前端**：改为分接口加载与错误重试，不再静默吞错；透传 `type/route_id/include_sources=1`；切换任务重置筛选和选中路线；仅轮询当前子页签；路线状态复用全局 `StatusBadge`；finding 计数为 0 时隐藏筛选；checkpoint 在播报板和探索图中显示为「检查点」；弃用本地重复的 Empty/StatCard 命名。
+- **决策替代方向**：`record_fact` 新增 `alternatives_rejected`，用于记录被放弃的方向；Information 视图展示。
+- **工程卫生**：`.gitattributes` 统一 `* text=auto eol=lf`；`.gitignore` 保留 11-24 三份设计/施工文档进版本库。
 - **多阶段路线终态被首阶段 done 掩盖**：`/routes` 改由最新非删除意图决定状态（done 不再压过后续 blocked/exhausted/stopped），并按 `running/paused/open` 映射 active/paused/proposed。
 - **人工重跑绕过预算耗尽保护**：单条与批量 rerun 在重开前检查路线累计预算；已耗尽时返回 409，提示改用扩容的 continuation，不再让 Worker 在下一个 Fast Path tick 被立即再次终止。
 - **artifact 软链穿越**：校验前对根目录与目标做 `EvalSymlinks`，链接到工作目录之外的文件一律拒绝。
@@ -37,7 +45,7 @@
 
 #### 迁移
 
-- 启动时一次性刷新 `record_fact`、`add_intent`、`report_finding` 的工具 schema（设置标记 `tool_schema_refresh_v10_route_defaults`），并追加 planner/worker/watchdog 新默认提示词版本（`planner_prompt_route_handoff_v5_default_budget`、`worker_prompt_information_types_v6_progress_handoff`、`watchdog_prompt_route_budget_v2_attempted`）；旧事实、旧意图、旧 activity 仍可读。
+- 启动时一次性刷新 `record_fact`、`add_intent`、`report_finding` 的工具 schema（设置标记 `tool_schema_refresh_v11_decision_alternatives`），并追加 planner/worker/watchdog 新默认提示词版本（`planner_prompt_route_handoff_v5_default_budget`、`worker_prompt_information_types_v7_decision_alternatives`、`watchdog_prompt_route_budget_v2_attempted`）；旧事实、旧意图、旧 activity 仍可读。
 
 ### 运行看护优化（Watchdog v2）
 

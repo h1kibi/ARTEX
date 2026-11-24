@@ -76,6 +76,11 @@ func (e *Engine) writeRunCheckpoint(t *Task, intent *db.Node, runID string, star
 			addEvidence(fmt.Sprintf("finding:%d", n.ID))
 			continue
 		}
+		if n.FactType() == db.FactTypeCheckpoint {
+			// A retried run's previous checkpoint is also a yielded fact. Reusing
+			// its next_actions/evidence would snowball old runs into the new one.
+			continue
+		}
 		p := db.ParseFactPayload(n.Payload)
 		for _, ref := range p.EvidenceRefs {
 			addEvidence(ref)
