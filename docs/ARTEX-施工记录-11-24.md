@@ -99,6 +99,9 @@
 - **前端**：情报页分接口错误态 + 重试、服务端过滤、任务切换重置、仅轮询当前页签；路线状态复用全局 `StatusBadge`；checkpoint 在播报/探索图单独渲染；finding 计数为 0 时不显示筛选。
 - **决策替代方向**：`record_fact.alternatives_rejected` 写入与展示。
 - **工程卫生**：`.gitattributes` 统一 LF；11-24 三份文档取消忽略。
+- **资产抽屉**：来源 fact 按 `CanInheritFact` 过滤，checkpoint/origin 不再作为关联事实。
+- **证明/锚点**：只接受 observation/claim/legacy 与 confirmed finding；拦截 hypothesis/decision/candidate/checkpoint、过期和不可继承节点。
+- **情报页**：intent/severity/finding 使用全局 StatusBadge；错误条用 Alert；统计卡固定任务级并复用总览排版。
 
 ## 2. 迁移和兼容
 

@@ -1986,7 +1986,8 @@ SELECT en.id, en.kind, en.state, en.payload
 FROM exploration_anchors ea
 JOIN exploration_nodes en ON en.id = ea.node_id
 WHERE ea.asset_id = $1 AND en.exploration_id = $2 AND en.kind IN ('intent','fact','finding')
-ORDER BY en.id DESC`, assetID, s.expID)
+  AND NOT (en.kind='fact' AND (en.state='origin' OR COALESCE(en.payload->>'fact_type','') = $3))
+ORDER BY en.id DESC`, assetID, s.expID, FactTypeCheckpoint)
 	if err != nil {
 		return nil, err
 	}

@@ -198,6 +198,48 @@ func TestRenderPriorCheckpointHandoff(t *testing.T) {
 	}
 }
 
+func TestValidateProofAnchor(t *testing.T) {
+	ts := &ToolSet{}
+	fact := func(id int64, state, payload string) *db.Node {
+		return &db.Node{ID: id, Kind: db.KindFact, State: state, Payload: []byte(payload)}
+	}
+	allowed := []*db.Node{
+		fact(1, "confirmed", `{"fact_type":"observation","summary":"seen"}`),
+		fact(2, "confirmed", `{"fact_type":"claim","summary":"proven"}`),
+		fact(3, "confirmed", `{"summary":"legacy"}`),
+		{ID: 4, Kind: db.KindFinding, State: "confirmed"},
+	}
+	for _, n := range allowed {
+		if err := ts.validateProofAnchor(n); err != nil {
+			t.Fatalf("node %d rejected: %v", n.ID, err)
+		}
+	}
+	rejected := []*db.Node{
+		fact(10, "confirmed", `{"fact_type":"hypothesis","summary":"maybe","validation_actions":["x"]}`),
+		fact(11, "confirmed", `{"fact_type":"decision","summary":"choose"}`),
+		fact(12, "confirmed", `{"fact_type":"finding_candidate","summary":"maybe vuln"}`),
+		fact(13, "confirmed", `{"fact_type":"checkpoint","summary":"bookkeeping"}`),
+		fact(14, db.StateOrigin, `{"summary":"task root"}`),
+		{ID: 15, Kind: db.KindFinding, State: "dismissed"},
+		fact(20, "confirmed", `{"fact_type":"claim","summary":"stale","valid_until":"2000-01-01T00:00:00Z"}`),
+	}
+	for _, n := range rejected {
+		if err := ts.validateProofAnchor(n); err == nil {
+			t.Fatalf("node %d (%s/%s) was accepted as proof", n.ID, n.Kind, n.FactType())
+		}
+	}
+	inherited := &db.Node{ID: 30, Kind: db.KindFact, State: "confirmed", Inherited: true,
+		Payload: []byte(`{"fact_type":"claim","summary":"source claim"}`)}
+	if err := ts.validateProofAnchor(inherited); err != nil {
+		t.Fatalf("inheritable source claim rejected: %v", err)
+	}
+	sensitiveInherited := &db.Node{ID: 31, Kind: db.KindFact, State: "confirmed", Inherited: true,
+		Payload: []byte(`{"fact_type":"claim","summary":"source token","sensitivity":"token"}`)}
+	if err := ts.validateProofAnchor(sensitiveInherited); err == nil {
+		t.Fatal("inherited token claim accepted as proof")
+	}
+}
+
 func TestGraphOverviewExcludesCheckpointsFromFacts(t *testing.T) {
 	d := testDB(t)
 	defer d.Close()

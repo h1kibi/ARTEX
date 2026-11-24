@@ -1416,6 +1416,9 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		if n.Kind != db.KindFact && n.Kind != db.KindFinding {
 			return 0, fmt.Errorf("parent_id %d 是 %q 节点，不能作为意图锚点：意图只能锚在已确认的【事实(fact)/发现(finding)】上，不能挂在意图/目标/提示上；顶层全新方向请留空 parent_ids", pidv, n.Kind)
 		}
+		if err := t.validateProofAnchor(n); err != nil {
+			return 0, fmt.Errorf("parent_id %d 不能作为意图锚点：%w", pidv, err)
+		}
 	}
 	var continuation *db.Node
 	if it.ContinuationOf > 0 {
@@ -1734,6 +1737,9 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			evidenceNode, err := t.ts.GetNodeWithSources(ev)
 			if err != nil || evidenceNode == nil || (evidenceNode.Kind != db.KindFact && evidenceNode.Kind != db.KindFinding) {
 				return actool.Errorf("evidence_id 必须是本任务或直接关联任务的事实/漏洞节点"), nil
+			}
+			if err := t.validateProofAnchor(evidenceNode); err != nil {
+				return actool.Errorf(fmt.Sprintf("evidence_id 不能证明目标：%v", err)), nil
 			}
 			_ = t.ts.Link(ev, db.RelProves, goal)
 			_ = t.ts.SetNodeState(goal, "met")

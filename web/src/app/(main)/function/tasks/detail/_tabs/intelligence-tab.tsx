@@ -20,8 +20,9 @@ import {
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Empty, EmptyDescription, EmptyHeader, EmptyMedia, EmptyTitle } from "@/components/ui/empty";
 import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -129,21 +130,18 @@ function IntelStatCard({
 }: {
   icon: React.ElementType;
   label: string;
-  value: string;
+  value: React.ReactNode;
   hint?: string;
 }) {
   return (
-    <Card>
-      <CardContent className="flex items-start gap-3 p-4">
-        <span className="bg-muted text-muted-foreground flex size-8 shrink-0 items-center justify-center rounded-md">
-          <Icon className="size-4" />
-        </span>
-        <div className="min-w-0">
-          <div className="text-muted-foreground text-xs">{label}</div>
-          <div className="mt-0.5 truncate text-xl font-semibold tracking-tight">{value}</div>
-          {hint ? <div className="text-muted-foreground mt-0.5 truncate text-[11px]">{hint}</div> : null}
-        </div>
-      </CardContent>
+    <Card className="gap-1.5">
+      <CardHeader className="pb-0">
+        <CardDescription className="flex items-center gap-1.5">
+          <Icon className="size-3.5" /> {label}
+        </CardDescription>
+        <CardTitle className="text-2xl tabular-nums">{value}</CardTitle>
+      </CardHeader>
+      {hint ? <CardContent className="text-xs text-muted-foreground">{hint}</CardContent> : null}
     </Card>
   );
 }
@@ -308,7 +306,7 @@ function RouteDetail({ route }: { route: TaskRoute }) {
           {route.intents.map((intent) => (
             <div key={intent.id} className="flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-xs">
               <Chip mono>#{intent.id}</Chip>
-              <Chip>{intent.state}</Chip>
+              <StatusBadge domain="intent" value={intent.state} dot />
               {intent.phase ? <Chip>{intent.phase}</Chip> : null}
               <span className="min-w-40 flex-1 break-words">{intent.summary}</span>
               <span className="text-muted-foreground">{fmtDuration(intent.worker_seconds)}</span>
@@ -328,7 +326,7 @@ function RouteDetail({ route }: { route: TaskRoute }) {
               <div key={finding.id} className="flex flex-col gap-1 rounded-md border px-3 py-2 text-xs">
                 <div className="flex flex-wrap items-center gap-2">
                   <Chip mono>#{finding.id}</Chip>
-                  {finding.severity ? <Chip className="uppercase">{finding.severity}</Chip> : null}
+                  {finding.severity ? <StatusBadge domain="severity" value={finding.severity} /> : null}
                   {finding.vulnclass ? <Chip>{finding.vulnclass}</Chip> : null}
                   <span className="min-w-40 flex-1 break-words">{finding.summary}</span>
                   {finding.traffic_count ? (
@@ -337,7 +335,7 @@ function RouteDetail({ route }: { route: TaskRoute }) {
                       {finding.traffic_count} 条流量
                     </Chip>
                   ) : null}
-                  <Chip>{finding.state}</Chip>
+                  <StatusBadge domain="finding" value={finding.state} />
                 </div>
                 {finding.evidence_refs?.length ? (
                   <div className="flex flex-wrap gap-1">
@@ -530,6 +528,7 @@ function Availability({ ref_ }: { ref_: EvidenceRef }) {
 export function IntelligenceTab({ taskId }: { taskId: string }) {
   const [routes, setRoutes] = React.useState<TaskRoute[]>([]);
   const [information, setInformation] = React.useState<InformationResponse | null>(null);
+  const [summary, setSummary] = React.useState<InformationResponse | null>(null);
   const [evidence, setEvidence] = React.useState<EvidenceResponse | null>(null);
   const [selectedRouteID, setSelectedRouteID] = React.useState<number | null>(null);
   // Route-tab detail selection and the information-graph route filter are two
@@ -548,6 +547,7 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
   React.useEffect(() => {
     setRoutes([]);
     setInformation(null);
+    setSummary(null);
     setEvidence(null);
     setSelectedRouteID(null);
     setInfoRouteID(null);
@@ -594,13 +594,23 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
     }
   }, [taskId, fail]);
 
-  // Base snapshot (routes + evidence) loads only on task/retry changes; type and
-  // route filters never re-fetch these.
+  // Top stat cards stay task-wide even when the information list is filtered to
+  // one route. limit=1 keeps this cheap: the response still carries exact counts.
+  const loadSummary = React.useCallback(async () => {
+    try {
+      setSummary(await api.taskInformation(taskId, { includeSources: true, limit: 1 }));
+    } catch (err) {
+      fail(err);
+    }
+  }, [taskId, fail]);
+
+  // Base snapshot (routes + evidence + task-wide totals) loads only on task/retry
+  // changes; type and route filters never re-fetch these.
   React.useEffect(() => {
     setError("");
     setLoading(true);
-    void Promise.allSettled([loadRoutes(), loadEvidence()]).finally(() => setLoading(false));
-  }, [loadRoutes, loadEvidence, reloadTick]);
+    void Promise.allSettled([loadRoutes(), loadEvidence(), loadSummary()]).finally(() => setLoading(false));
+  }, [loadRoutes, loadEvidence, loadSummary, reloadTick]);
 
   // Information Graph reloads only when its own filters change.
   React.useEffect(() => {
@@ -610,29 +620,32 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
   // Poll only the visible tab.
   React.useEffect(() => {
     const timer = setInterval(() => {
+      void loadSummary();
       if (view === "routes") void loadRoutes();
       else if (view === "information") void loadInformation();
       else void loadEvidence();
     }, 10000);
     return () => clearInterval(timer);
-  }, [view, loadRoutes, loadInformation, loadEvidence]);
+  }, [view, loadRoutes, loadInformation, loadEvidence, loadSummary]);
 
   const selected = routes.find((route) => route.route_id === selectedRouteID) ?? routes[0] ?? null;
   const nodes = information?.nodes ?? [];
-  const counts = information?.counts ?? {};
+  const counts = (summary ?? information)?.counts ?? {};
+  const taskTotal = summary?.total ?? information?.total ?? 0;
   const totalEvidence = evidence?.refs.length ?? 0;
   const missingEvidence = evidence?.refs.filter((ref) => ref.available === false).length ?? 0;
 
   return (
     <div className="flex flex-col gap-4">
       {error ? (
-        <div className="flex flex-wrap items-center gap-2 rounded-md border border-red-500/30 bg-red-500/5 px-3 py-2 text-xs text-red-600 dark:text-red-400">
-          <AlertTriangleIcon className="size-4 shrink-0" />
-          <span className="min-w-0 flex-1">{error}</span>
-          <Button size="sm" variant="outline" onClick={() => setReloadTick((v) => v + 1)}>
-            重试
-          </Button>
-        </div>
+        <Alert variant="destructive">
+          <AlertDescription>
+            {error}
+            <Button variant="outline" size="sm" onClick={() => setReloadTick((v) => v + 1)}>
+              重试
+            </Button>
+          </AlertDescription>
+        </Alert>
       ) : null}
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <IntelStatCard
@@ -742,7 +755,7 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
                 <FilterChip
                   active={typeFilter === "all"}
                   onClick={() => setTypeFilter("all")}
-                  label={`全部 ${information?.total ?? 0}`}
+                  label={`全部 ${taskTotal}`}
                 />
                 {TYPE_ORDER.filter((type) => (counts[type] ?? 0) > 0).map((type) => (
                   <FilterChip

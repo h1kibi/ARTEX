@@ -371,6 +371,19 @@ func TestTaskAssetContextUsesDirectSourceScopeAndAnchors(t *testing.T) {
 	if _, err := d.Exploration(source.ExplorationID).AddNode(KindFact, map[string]any{"summary": "anchored-only source asset"}, 0, "confirmed", "worker", []int64{sourceAnchoredOnlyID}); err != nil {
 		t.Fatal(err)
 	}
+	// A credential fact and a checkpoint anchored to the same asset must not leak
+	// into the downstream coverage drawer.
+	if _, err := d.Exploration(source.ExplorationID).AddNode(KindFact, map[string]any{
+		"fact_type": "claim", "summary": "source credential", "sensitivity": "credential",
+	}, 0, "confirmed", "worker", []int64{sourceAnchoredOnlyID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exploration(source.ExplorationID).AddNode(KindFact, CheckpointPayload(
+		"source checkpoint", "path_stage", "source goal", "validation", "run-src", "completed",
+		0, 0, nil, nil, nil, nil, nil, nil, RouteBudgetUsed{ToolCalls: 1},
+	), 0, "confirmed", "system", []int64{sourceAnchoredOnlyID}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := d.Exploration(grand.ExplorationID).AddNode(KindFact, map[string]any{"summary": "indirect tested asset"}, 0, "confirmed", "worker", []int64{grandID}); err != nil {
 		t.Fatal(err)
 	}

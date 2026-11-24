@@ -412,9 +412,24 @@ func (s *ExplorationStore) AssetRefsWithSources(assetID int64) ([]AssetRef, erro
 		if err != nil {
 			return nil, err
 		}
+		now := time.Now()
 		for i := range refs {
 			if refs[i].Kind == KindIntent && !IsTerminalIntentState(refs[i].State) {
 				continue
+			}
+			if refs[i].Kind == KindFact {
+				// The drawer must not surface sensitive/expired/local-only source
+				// facts even though they are anchored to the same asset.
+				node, err := source.Store.GetNode(refs[i].ID)
+				if err != nil {
+					return nil, err
+				}
+				if node == nil {
+					continue
+				}
+				if ok, _ := CanInheritFact(node, now); !ok {
+					continue
+				}
 			}
 			refs[i].SourceTaskID = source.Task.TaskID
 			refs[i].Inherited = true

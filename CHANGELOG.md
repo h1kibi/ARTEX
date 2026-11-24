@@ -38,6 +38,9 @@
 - **情报页前端**：改为分接口加载与错误重试，不再静默吞错；透传 `type/route_id/include_sources=1`；切换任务重置筛选和选中路线；仅轮询当前子页签；路线状态复用全局 `StatusBadge`；finding 计数为 0 时隐藏筛选；checkpoint 在播报板和探索图中显示为「检查点」；弃用本地重复的 Empty/StatCard 命名。
 - **决策替代方向**：`record_fact` 新增 `alternatives_rejected`，用于记录被放弃的方向；Information 视图展示。
 - **工程卫生**：`.gitattributes` 统一 `* text=auto eol=lf`；`.gitignore` 保留 11-24 三份设计/施工文档进版本库。
+- **覆盖图资产抽屉**：`AssetRefsWithSources` 对来源 fact 应用 `CanInheritFact`；`AssetRefs` 排除 checkpoint 与 origin fact，覆盖图抽屉不再展示敏感/过期结论或路线簿记。
+- **证明与锚点门槛**：`prove_goal` 与 `add_intent.parent_ids` 只接受 observation/claim（或 legacy）与 confirmed finding；hypothesis/decision/candidate/checkpoint、origin、过期事实、不可继承来源事实均被拒绝。
+- **情报页一致性**：子意图/漏洞改用 `StatusBadge`；错误条复用 `Alert`；顶部统计固定为全任务口径（信息图路线筛选不再影响统计卡）；统计卡改用与总览页相同的 CardHeader/tabular-nums 排版。
 - **多阶段路线终态被首阶段 done 掩盖**：`/routes` 改由最新非删除意图决定状态（done 不再压过后续 blocked/exhausted/stopped），并按 `running/paused/open` 映射 active/paused/proposed。
 - **人工重跑绕过预算耗尽保护**：单条与批量 rerun 在重开前检查路线累计预算；已耗尽时返回 409，提示改用扩容的 continuation，不再让 Worker 在下一个 Fast Path tick 被立即再次终止。
 - **artifact 软链穿越**：校验前对根目录与目标做 `EvalSymlinks`，链接到工作目录之外的文件一律拒绝。

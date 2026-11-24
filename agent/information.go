@@ -287,6 +287,52 @@ func (t *ToolSet) normalizeFactInput(ctx context.Context, it factItem, defaultIn
 	return payload, intentID, nil
 }
 
+// anchorableFactType limits proof/anchor evidence to confirmed observations and
+// claims. Hypothesis, decision, finding_candidate, checkpoint and origin facts
+// all live under KindFact but are not confirmed evidence.
+func anchorableFactType(ft string) bool {
+	switch ft {
+	case db.FactTypeObservation, db.FactTypeClaim, db.FactTypeLegacyUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+// validateProofAnchor verifies an evidence/parent node is confirmed knowledge and,
+// when inherited from a source task, passes the cross-task inheritance policy.
+func (t *ToolSet) validateProofAnchor(n *db.Node) error {
+	if n == nil {
+		return fmt.Errorf("节点不存在")
+	}
+	if n.Kind == db.KindFinding {
+		if n.State != "confirmed" {
+			return fmt.Errorf("漏洞节点 #%d 状态为 %q，只有 confirmed 漏洞能作为已确认证据", n.ID, n.State)
+		}
+		return nil
+	}
+	if n.Kind != db.KindFact {
+		return fmt.Errorf("节点 #%d 是 %q，不能作为已确认事实/锚点", n.ID, n.Kind)
+	}
+	if n.State == db.StateOrigin {
+		return fmt.Errorf("节点 #%d 是任务根事实，不能作为已确认证据", n.ID)
+	}
+	if ft := n.FactType(); !anchorableFactType(ft) {
+		return fmt.Errorf("节点 #%d 的 fact_type 是 %s，只有 observation/claim（或历史 legacy_unknown）能作为已确认证据；hypothesis/decision/finding_candidate/checkpoint 都不能证明目标", n.ID, ft)
+	}
+	if db.IsFactExpired(db.ParseFactPayload(n.Payload), time.Now()) {
+		return fmt.Errorf("节点 #%d 已超过 valid_until 有效期，不能作为已确认证据", n.ID)
+	}
+	if n.Inherited {
+		if ok, why := db.CanInheritFact(n, time.Now()); !ok {
+			return fmt.Errorf("节点 #%d 来自关联任务，但受继承策略限制（%s），不能作为已确认证据", n.ID, why)
+		}
+	}
+	return nil
+}
+
+// validateInformationNodes checks the supplied ids are fact nodes of the allowed
+// information types in this task.
 func (t *ToolSet) validateInformationNodes(ids []int64, allowed []string, field string) error {
 	if len(ids) == 0 {
 		return nil
