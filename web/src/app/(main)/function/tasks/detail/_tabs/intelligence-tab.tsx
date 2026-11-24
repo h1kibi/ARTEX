@@ -532,6 +532,10 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
   const [information, setInformation] = React.useState<InformationResponse | null>(null);
   const [evidence, setEvidence] = React.useState<EvidenceResponse | null>(null);
   const [selectedRouteID, setSelectedRouteID] = React.useState<number | null>(null);
+  // Route-tab detail selection and the information-graph route filter are two
+  // different states: defaulting the filter to the first route hid every other
+  // route (and disabled include_sources, which is skipped when route_id > 0).
+  const [infoRouteID, setInfoRouteID] = React.useState<number | null>(null);
   const [typeFilter, setTypeFilter] = React.useState("all");
   const [openNodeID, setOpenNodeID] = React.useState<string | null>(null);
   const [view, setView] = React.useState("routes");
@@ -546,66 +550,72 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
     setInformation(null);
     setEvidence(null);
     setSelectedRouteID(null);
+    setInfoRouteID(null);
     setOpenNodeID(null);
     setTypeFilter("all");
     setError("");
     setLoading(true);
   }, [taskId]);
 
+  const fail = React.useCallback((err: unknown) => {
+    setError(err instanceof Error ? err.message : "情报数据加载失败");
+  }, []);
+
+  const loadRoutes = React.useCallback(async () => {
+    try {
+      const r = await api.taskRoutes(taskId);
+      setRoutes(r.routes ?? []);
+      // Only the route-tab detail selection defaults to the first route.
+      setSelectedRouteID((current) => current ?? r.routes?.[0]?.route_id ?? null);
+    } catch (err) {
+      fail(err);
+    }
+  }, [taskId, fail]);
+
+  const loadInformation = React.useCallback(async () => {
+    try {
+      const i = await api.taskInformation(taskId, {
+        type: typeFilter === "all" ? undefined : typeFilter,
+        routeId: infoRouteID ?? undefined,
+        includeSources: true,
+      });
+      setInformation(i);
+    } catch (err) {
+      fail(err);
+    }
+  }, [taskId, typeFilter, infoRouteID, fail]);
+
+  const loadEvidence = React.useCallback(async () => {
+    try {
+      const e = await api.taskEvidence(taskId, { includeSources: true });
+      setEvidence(e);
+    } catch (err) {
+      fail(err);
+    }
+  }, [taskId, fail]);
+
+  // Base snapshot (routes + evidence) loads only on task/retry changes; type and
+  // route filters never re-fetch these.
   React.useEffect(() => {
-    let cancelled = false;
-    const infoQuery = {
-      type: typeFilter === "all" ? undefined : typeFilter,
-      routeId: selectedRouteID ?? undefined,
-      includeSources: true,
-    };
-    const fail = (err: unknown) => {
-      if (!cancelled) setError(err instanceof Error ? err.message : "情报数据加载失败");
-    };
-    const loadRoutes = async () => {
-      try {
-        const r = await api.taskRoutes(taskId);
-        if (cancelled) return;
-        setRoutes(r.routes ?? []);
-        setSelectedRouteID((current) => current ?? r.routes?.[0]?.route_id ?? null);
-      } catch (err) {
-        fail(err);
-      }
-    };
-    const loadInformation = async () => {
-      try {
-        const i = await api.taskInformation(taskId, infoQuery);
-        if (!cancelled) setInformation(i);
-      } catch (err) {
-        fail(err);
-      }
-    };
-    const loadEvidence = async () => {
-      try {
-        const e = await api.taskEvidence(taskId, { includeSources: true });
-        if (!cancelled) setEvidence(e);
-      } catch (err) {
-        fail(err);
-      }
-    };
-    const loadAll = async () => {
-      if (!cancelled) setError("");
-      await Promise.allSettled([loadRoutes(), loadInformation(), loadEvidence()]);
-      if (!cancelled) setLoading(false);
-    };
-    loadAll();
-    // Only poll the visible tab; hidden tabs keep their last good snapshot.
+    setError("");
+    setLoading(true);
+    void Promise.allSettled([loadRoutes(), loadEvidence()]).finally(() => setLoading(false));
+  }, [loadRoutes, loadEvidence, reloadTick]);
+
+  // Information Graph reloads only when its own filters change.
+  React.useEffect(() => {
+    void loadInformation();
+  }, [loadInformation, reloadTick]);
+
+  // Poll only the visible tab.
+  React.useEffect(() => {
     const timer = setInterval(() => {
-      if (!cancelled) setError("");
       if (view === "routes") void loadRoutes();
       else if (view === "information") void loadInformation();
       else void loadEvidence();
     }, 10000);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [taskId, view, typeFilter, selectedRouteID, reloadTick]);
+    return () => clearInterval(timer);
+  }, [view, loadRoutes, loadInformation, loadEvidence]);
 
   const selected = routes.find((route) => route.route_id === selectedRouteID) ?? routes[0] ?? null;
   const nodes = information?.nodes ?? [];
@@ -716,6 +726,18 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
               <CardTitle className="flex items-center gap-2 text-sm">
                 <FileSearchIcon className="size-4" /> Information Graph
               </CardTitle>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-muted-foreground text-[11px]">路线</span>
+                <FilterChip active={infoRouteID === null} onClick={() => setInfoRouteID(null)} label="全部" />
+                {routes.map((route) => (
+                  <FilterChip
+                    key={route.route_id}
+                    active={infoRouteID === route.route_id}
+                    onClick={() => setInfoRouteID(route.route_id)}
+                    label={`route #${route.route_id}`}
+                  />
+                ))}
+              </div>
               <div className="flex flex-wrap gap-1.5">
                 <FilterChip
                   active={typeFilter === "all"}
@@ -763,7 +785,7 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
               )}
               {information?.truncated ? (
                 <div className="text-muted-foreground mt-2 text-[11px]">
-                  当前只展示最新一页；可用上方类型筛选与左侧路线筛选缩小范围。
+                  当前只展示最新一页；可用上方路线与类型筛选缩小范围。
                 </div>
               ) : null}
             </CardContent>
