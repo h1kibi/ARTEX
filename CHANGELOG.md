@@ -4,6 +4,41 @@
 
 ## [Unreleased]
 
+### 三图语义与路线交接（11-24）
+
+#### 新增的功能
+
+- **Information 类型**：`record_fact` 增加 `fact_type`（observation / claim / hypothesis / decision / finding_candidate），按类型校验来源与引用：observation 必须带 activity/evidence 引用，claim 必须带 observation 或 evidence，hypothesis 必须带验证动作，finding_candidate 不能写成 confirmed。历史 fact 没有该字段时读取为 `legacy_unknown`，不自动改写。
+- **路线与 checkpoint**：`add_intent` 支持 objective、phase、expected_evidence、success_condition、budget；新意图的 `route_id` 等于自身 id，`continuation_of` 自动继承 route_id、预算余额和最近 checkpoint。每个 Worker Run 结束时写入 `fact_type=checkpoint` fact，记录阶段、确认 claim、未解决 hypothesis、证据引用、已尝试动作、下一步和累计预算。
+- **ProgressEvent 与预算**：RunMonitor 记录工具调用、token、重复动作、高价值进展和路线累计预算；只有 validated_weakness / privilege_change / objective_milestone / finding_written 等高价值事件重置观察周期，普通 observation/claim/asset 不重置。Fast Path 在路线预算耗尽时走 Settlement 结束，后续可由 Planner 用 continuation_of 继续同一路线。
+- **Finding Candidate 对账**：Worker Run 结束且没有确认 finding 时，将本次 claim/hypothesis 合并为一条 `finding_candidate`（validation_state=pending），供 Planner 复核；确认漏洞仍只通过 `report_finding` 写入 findings 表，且必须提供 evidence 或可回查 evidence_refs。
+- **冷压缩保护**：active Route 的 checkpoint 及其引用的 claim/hypothesis/finding 保持 hot；settled Route 的 checkpoint 可以进入 digest，但 digest payload 保留 checkpoint_id、route_id 和 evidence_refs。删除意图时，被 checkpoint/candidate/decision 引用的节点不会被物理删除。
+- **查询视图**：新增 `GET /api/tasks/{id}/routes`、`/information`、`/evidence`，任务详情新增「情报」页，展示路线阶段、checkpoint、信息类型、候选漏洞和证据引用；资产覆盖图抽屉显示关联路线。
+- **Worker 续跑交接**：`continuation_of` 意图启动时，Worker 系统提示会内联前序 Checkpoint 的结论、已确认 claim、未解决 hypothesis、`attempted_actions`、`next_actions` 和证据引用，避免新 Run 重复上一阶段已排除的探测。
+- **ProgressEvent 引导**：Worker 提示词明确 `progress_event` 的取值与触发时机（validated_weakness / credential_obtained / privilege_change / lateral_progress / objective_milestone / finding_written / cleanup_completed），普通观察与资产写入不再误判为阶段突破；收尾提示词要求用 `next_actions` / `validation_actions` 交接未完成方向。
+- **默认路线预算与无 Watchdog 兜底**：`add_intent` 新路线未填 budget 时默认 `max_tool_calls=240`、`max_input_tokens=1200000`；Run 结束后即使 Watchdog 关闭，累计预算耗尽也会把意图标记为 `exhausted`，不再需要 Fast Path 才能止损。
+- **Evidence 流量绑定**：`/evidence` 合并 `finding_traffic_bindings`，返回 `traffic:<id>`、证据版本与快照 ID；前端证据表显示版本。
+- **长运行与概览修正**：checkpoint 活动读取分页（不再只取前 2000 条）；`graph_overview` 的 `facts` 与 `recent_facts` 排除 checkpoint 与任务根 origin fact，避免路线簿记挤占规划者窗口。
+
+#### 修复
+
+- **任务详情「最近活动」恒为空**：详情页从 stats 回填 `last_activity`，不再只依赖 `last_activity_unix`。
+- **运行时工作区打断全量构建**：`data/` 下自动写入嵌套 `go.mod`，`go build ./...` / `go test ./...` 不再把 agent 生成的 Go 文件当作本项目包。
+- **路线累计预算耗尽后无限重启**：`add_intent` 接续时合并原路线预算，并从最新 checkpoint 读取累计用量；任一维度已耗尽时拒绝不带更大 `budget` 的接续，返回明确错误，避免新 Run 在下一个 Fast Path tick 再次被终止。
+- **rejected candidate 被对账重开**：`reconcileFindingCandidate` 不再把 `rejected/confirmed/expired` 的候选改回 `pending`；同时支持只有 hypothesis、没有 claim 的 Run 生成候选，且不写空的 `claim_ids`/`hypothesis_ids`。
+- **Checkpoint 与意图游标不一致**：checkpoint fact、`intent -> checkpoint` 边、前一 checkpoint 血缘和 intent 的 `checkpoint_fact_id/route_budget_used` 改为同一事务提交；任一失败整体回滚。
+- **Route 状态误判**：只有 `running` 的意图才算进行中；`open` 显示待执行，`paused/stopped/superseded` 不再被吞成 `proposed/active`。`routes` 返回的 `intents/checkpoints/findings` 恒为数组，不再输出 `null`。
+- **Information/Evidence 查询截断与错误吞掉**：总数与分类计数改由 SQL 对全图统计，分页单独截断后返回 `truncated`；`/information`、`/evidence`、`/routes` 的数据库错误统一返回 500，不再伪装成空结果。新增 `include_sources=1` 合并可继承的来源任务数据（按有效期、敏感性、继承策略过滤）。
+- **Evidence 引用校验与展示**：`record_fact`/`report_finding` 对 `activity/node/finding/artifact` 引用做存在性校验；artifact 引用必须在当前任务工作目录内（`worker` 为 `i<intentID>` 与任务目录，`planner`/主代理为任务目录）；Route 视图展示 finding 的 `evidence_refs` 与流量绑定数量，Information 视图展示继承来源、过期与敏感性标签。
+- **多阶段路线终态被首阶段 done 掩盖**：`/routes` 改由最新非删除意图决定状态（done 不再压过后续 blocked/exhausted/stopped），并按 `running/paused/open` 映射 active/paused/proposed。
+- **人工重跑绕过预算耗尽保护**：单条与批量 rerun 在重开前检查路线累计预算；已耗尽时返回 409，提示改用扩容的 continuation，不再让 Worker 在下一个 Fast Path tick 被立即再次终止。
+- **artifact 软链穿越**：校验前对根目录与目标做 `EvalSymlinks`，链接到工作目录之外的文件一律拒绝。
+- **迁移开关未递增**：二轮新增 `sensitivity/inheritance_policy` 与预算扩容提示词后，一次性开关升为 `tool_schema_refresh_v9_information_refs`、`planner_prompt_route_handoff_v4_budget_expansion`，存量库升级会真正刷新。
+
+#### 迁移
+
+- 启动时一次性刷新 `record_fact`、`add_intent`、`report_finding` 的工具 schema（设置标记 `tool_schema_refresh_v10_route_defaults`），并追加 planner/worker/watchdog 新默认提示词版本（`planner_prompt_route_handoff_v5_default_budget`、`worker_prompt_information_types_v6_progress_handoff`、`watchdog_prompt_route_budget_v2_attempted`）；旧事实、旧意图、旧 activity 仍可读。
+
 ### 运行看护优化（Watchdog v2）
 
 #### 新增的功能

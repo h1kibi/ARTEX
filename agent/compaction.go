@@ -344,10 +344,47 @@ func loadColdGraph(ts *db.ExplorationStore) (*coldGraph, map[int64]*db.Node, err
 	if err != nil {
 		return nil, nil, err
 	}
+	activeRoute := map[int64]bool{}
+	for _, n := range nodes {
+		if n.Kind == db.KindIntent {
+			r := db.ParseIntentRoute(n)
+			if r.RouteID > 0 && isLiveIntent(cgNode{ID: n.ID, Kind: n.Kind, State: n.State}) {
+				activeRoute[r.RouteID] = true
+			}
+		}
+	}
+	// An active route's checkpoint is a handoff source, and the claims/hypotheses
+	// it references remain readable while the route is live. Protect both from
+	// folding.
+	protected := map[int64]bool{}
+	for _, n := range nodes {
+		if n.Kind != db.KindFact || n.FactType() != db.FactTypeCheckpoint {
+			continue
+		}
+		p := db.ParseFactPayload(n.Payload)
+		if !activeRoute[p.RouteID] {
+			continue
+		}
+		protected[n.ID] = true
+		for _, ids := range [][]int64{p.ConfirmedClaimIDs, p.OpenHypothesisIDs, p.FindingIDs} {
+			for _, id := range ids {
+				if id > 0 {
+					protected[id] = true
+				}
+			}
+		}
+	}
 	cgNodes := make([]cgNode, 0, len(nodes))
 	byID := make(map[int64]*db.Node, len(nodes))
 	for _, n := range nodes {
-		cgNodes = append(cgNodes, cgNode{ID: n.ID, Kind: n.Kind, State: n.State})
+		cn := cgNode{ID: n.ID, Kind: n.Kind, State: n.State}
+		if n.Kind == db.KindFact {
+			p := db.ParseFactPayload(n.Payload)
+			cn.FactType = n.FactType()
+			cn.RouteID = p.RouteID
+			cn.Protected = protected[n.ID]
+		}
+		cgNodes = append(cgNodes, cn)
 		byID[n.ID] = n
 	}
 	cgEdges := make([]cgEdge, 0, len(edges))
@@ -385,20 +422,35 @@ func applyStampsInPlace(stamps map[int64]*int64, ops []stampOp) {
 // the anchor ids, the generation, and the change-detection signature.
 func digestPayload(body string, b block, nodeByID map[int64]*db.Node, generation int, signature string) map[string]any {
 	var facts, intents []int64
+	var checkpointRefs []map[string]any
 	for _, m := range b.Members {
-		if n := nodeByID[m]; n != nil && n.Kind == db.KindIntent {
+		n := nodeByID[m]
+		if n != nil && n.Kind == db.KindIntent {
 			intents = append(intents, m)
-		} else {
-			facts = append(facts, m)
+			continue
+		}
+		facts = append(facts, m)
+		if n != nil && n.FactType() == db.FactTypeCheckpoint {
+			p := db.ParseFactPayload(n.Payload)
+			checkpointRefs = append(checkpointRefs, map[string]any{
+				"checkpoint_id": m,
+				"route_id":      p.RouteID,
+				"evidence_refs": p.EvidenceRefs,
+			})
 		}
 	}
-	return map[string]any{
+	out := map[string]any{
 		"body":       body,
 		"member_ids": map[string]any{"facts": facts, "intents": intents},
 		"anchor_ids": b.Anchors,
 		"generation": generation,
 		"signature":  signature,
 	}
+	if len(checkpointRefs) > 0 {
+		// A digest replaces the body, never the references it compressed.
+		out["checkpoint_refs"] = checkpointRefs
+	}
+	return out
 }
 
 func digestSigGen(n *db.Node) (string, int) {
@@ -468,6 +520,8 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 		kind := "fact"
 		if n != nil && n.Kind == db.KindIntent {
 			kind = "intent"
+		} else if n != nil && n.FactType() == db.FactTypeCheckpoint {
+			kind = "checkpoint"
 		}
 		state := ""
 		if n != nil {

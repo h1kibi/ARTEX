@@ -369,7 +369,7 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 
 **每次唤醒的决策流程**：
 
-1. **完整态势已附在本提示下方**（就是 graph_overview 的返回，无需再调它）：task（原始标题+目标/根节点）、资产计数、goals+状态、open/running/recent_done 意图、sites_without_endpoints（无端点的站点，提示可能待探的方向）、facts（探索事实数，与漏洞是两类）、recent_facts（{id,summary,confidence?}）。
+1. **完整态势已附在本提示下方**（就是 graph_overview 的返回，无需再调它）：task（原始标题+目标/根节点）、资产计数、goals+状态、open/running/recent_done 意图、routes（route_id/phase/objective/预算/最近 checkpoint）、checkpoints（阶段交接）、finding_candidates（待确认漏洞）、sites_without_endpoints（无端点的站点，提示可能待探的方向）、facts（探索事实数，与漏洞是两类）、recent_facts（{id,summary,confidence?}）。**路线优先**：接续已结束意图时看它的 route_id/checkpoint；同一 route 的后续阶段用 continuation_of，阶段与下一步动作写清。
    - **范围**：探索节点（goals/意图/facts/findings）只含本任务；**资产图全局共享**（多任务同一份，资产计数是全局在范围内的、非本任务独有）——出现非本任务相关的资产时忽略。
    - **血缘**：每个意图带 parents（上游：派生自哪些事实/意图）和 yields（下游：产生了哪些事实/发现），recent_facts 每条带 from_intent；据此理解"哪些事实来自哪个方向、能否综合出新方向"。
    - **否定/存疑观察**（recent_facts 里"端口关闭/不可注入"等）是 worker 的观察、不是定论：采信前先 node_detail(id) 看 evidence——evidence 扎实、confidence=observed 且手段已穷尽的才视为该方向暂时封住；evidence 缺失、只是"看起来像/只探一次"、或 confidence=inferred 的，按【尚未探明】处理，若在范围内且无其它意图覆盖，默认派一条复核意图去证实或推翻（**同一否定方向至多复核一次**；复核后仍为否定、且证据合理，就尊重该结论、不再派）。
@@ -403,7 +403,9 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
    - **summary**：一句话自然语言描述该方向（测试目标完整地址 + 做什么 + 为什么），不套固定分类；去重主要靠它与已有意图比对。
    - **asset_ids**：本方向要测试/攻击的目标资产 id（尽量传，0/1/多个，来自 list_assets）——只要方向围绕具体资产（站点/接口/参数/主机）就务必传，用于覆盖去重、连入资产链路，跨多资产就都传；纯全局侦察无具体资产才留空。
    - **parent_ids**：本方向由哪些上游节点综合得出（可选，0/1/多个）——多个事实结合产生一个意图就都传，派生自某上游意图/发现也传其 id，顶层全新方向留空。
-   - **continuation_of**：接续一条已经结束的意图时填写原意图 id；仅用于换一种打法，原意图仍是 open/running/paused 时调用会被拒绝。外部故障恢复优先使用 retry_work。
+   - **continuation_of**：接续一条已经结束的意图时填写原意图 id；仅用于换一种打法，原意图仍是 open/running/paused 时调用会被拒绝。外部故障恢复优先使用 retry_work。接续会自动继承原路线的 route_id、预算余额和最近 checkpoint，不需要你手填 route_id。
+   - **objective / phase / expected_evidence / success_condition**：新路线建议填写。phase 用 recon/validation/exploitation/privilege/lateral/objective/verification/evidence/cleanup；success_condition 写"确认什么或排除什么"，让下一个 worker 和 Watchdog 能判断阶段是否推进。
+   - **budget**：新路线可给 max_tool_calls/max_input_tokens/max_wall_seconds；这是整条路线的累计预算，接续默认继承剩余额度，不要每轮重置。**省略时新路线自动获得默认 240 次工具调用 / 120 万输入 token**，避免成本只靠 Watchdog 周期控制；确需更大范围再显式提高。若因单次步数或周期结束且路线仍有剩余预算，可直接用 continuation_of 继承剩余额度；若已是路线累计预算耗尽，接续时必须在 budget 中显式传入高于已用量的更大上限才能继续（否则会被拒绝），或转而停止该路线。
 
 不重复、不硬凑；但目标未达成、又有未覆盖且更深的打法时，该派就派。简洁、聚焦、高效。`
 
@@ -459,6 +461,7 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	}
 	// 本任务的工作目录 <workDir>/tasks/<taskID>，先建好。
 	taskDir := ensureRunDir(p.workDir, taskID, 0)
+	tsx.SetArtifactRoots(taskDir)
 	ctx = intercept.WithReviewContext(ctx, taskDir, intercept.ReviewBackground{})
 	sysBody := plannerSystem(goal, p.workDir, taskDir)
 	if p.wantConstraints() {

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/Autumn-27/artex/db"
@@ -172,5 +173,44 @@ func TestStampOps(t *testing.T) {
 	}
 	if o, ok := got[3]; !ok || o.Set {
 		t.Fatalf("node 3 revived (not cold) → stamp must be cleared, got %+v", got[3])
+	}
+}
+
+// An active route's checkpoint and the claims it references stay out of the cold
+// set; a settled route's checkpoint can fold but its digest keeps the references.
+func TestCheckpointProtection(t *testing.T) {
+	checkpoint := cgNode{ID: 90, Kind: db.KindFact, State: "confirmed",
+		FactType: db.FactTypeCheckpoint, RouteID: 7, Protected: true}
+	claim := fact(91)
+	g := newColdGraph([]cgNode{checkpoint, claim}, []cgEdge{yields(90, 91)})
+	hot := g.hotSet()
+	if !hot[90] {
+		t.Fatal("active checkpoint must be hot")
+	}
+	cold := g.structuralCold(hot)
+	if cold[90] {
+		t.Fatal("active checkpoint must not be structurally cold")
+	}
+	settled := cgNode{ID: 92, Kind: db.KindFact, State: "confirmed",
+		FactType: db.FactTypeCheckpoint, RouteID: 8}
+	g2 := newColdGraph([]cgNode{settled, fact(93)}, []cgEdge{yields(92, 93)})
+	if !g2.structuralCold(g2.hotSet())[92] {
+		t.Fatal("settled route checkpoint should be foldable")
+	}
+}
+
+func TestDigestPayloadPreservesCheckpointRefs(t *testing.T) {
+	raw, _ := json.Marshal(map[string]any{
+		"fact_type": db.FactTypeCheckpoint, "route_id": 7,
+		"evidence_refs": []string{"traffic:x-1"},
+	})
+	n := &db.Node{ID: 90, Kind: db.KindFact, Payload: raw}
+	p := digestPayload("body", block{Members: []int64{90}}, map[int64]*db.Node{90: n}, 1, "sig")
+	refs, ok := p["checkpoint_refs"].([]map[string]any)
+	if !ok || len(refs) != 1 || refs[0]["route_id"] != int64(7) {
+		t.Fatalf("checkpoint refs=%#v", p["checkpoint_refs"])
+	}
+	if ev, ok := refs[0]["evidence_refs"].([]string); !ok || len(ev) != 1 || ev[0] != "traffic:x-1" {
+		t.Fatalf("checkpoint evidence=%#v", refs[0]["evidence_refs"])
 	}
 }

@@ -168,6 +168,36 @@ func TestFindingTrafficAPIAndExport(t *testing.T) {
 	if w = req("PUT", base+"/order", fmt.Sprintf(`{"version":2,"binding_ids":["%d"]}`, first)); w.Code != 409 {
 		t.Fatal(w.Code, w.Body)
 	}
+	// The Evidence view must include refs stored in finding_traffic_bindings,
+	// not only payload.evidence_refs.
+	evFinding, err := s.m.pg.GetFinding(f.FindingID)
+	if err != nil || evFinding == nil || evFinding.TaskID == nil {
+		t.Fatalf("finding=%+v err=%v", evFinding, err)
+	}
+	evTask, err := s.m.pg.GetTask(*evFinding.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w = req("GET", fmt.Sprintf("/api/tasks/%d/evidence", evTask.ID), ""); w.Code != 200 {
+		t.Fatalf("evidence: %d %s", w.Code, w.Body)
+	}
+	var evidence EvidenceResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &evidence); err != nil {
+		t.Fatal(err)
+	}
+	foundBound := false
+	for _, ref := range evidence.Refs {
+		if ref.Ref != "traffic:a" {
+			continue
+		}
+		foundBound = true
+		if !containsString(ref.SourceKinds, "finding_traffic") || len(ref.EvidenceVersions) == 0 || len(ref.SnapshotIDs) == 0 {
+			t.Fatalf("bound evidence lost version/snapshot: %+v", ref)
+		}
+	}
+	if !foundBound {
+		t.Fatalf("finding traffic binding missing from evidence view: %+v", evidence.Refs)
+	}
 	if w = req("GET", fmt.Sprintf("%s/%d", base, first), ""); w.Code != 200 || !strings.Contains(w.Body.String(), `"binary":true`) {
 		t.Fatal(w.Code, w.Body)
 	}

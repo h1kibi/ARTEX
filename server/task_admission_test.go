@@ -532,6 +532,51 @@ func TestRerunAdmissionFailureRestoresIntentState(t *testing.T) {
 	}
 }
 
+func TestRerunExhaustedRouteRejected(t *testing.T) {
+	m, err := NewManager(t.TempDir(), "")
+	if err != nil {
+		t.Skipf("postgres unavailable (%v) - skipping", err)
+	}
+	defer m.Close()
+	task, err := m.CreateTask("exhausted rerun", "route budget guard", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = m.DeleteTask(task.ID, DeleteTaskOptions{}) }()
+	store := task.Store
+	intentID, _, err := store.AddIntentWithEdges(map[string]any{
+		"summary": "spend the route budget", "path_phase": "validation",
+		"budget": map[string]any{"max_tool_calls": 10},
+	}, 5, nil, "planner", 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	used := db.RouteBudgetUsed{ToolCalls: 10}
+	if _, err := store.SaveRunCheckpoint(intentID, 0, 0, db.CheckpointPayload(
+		"budget spent", "path_stage", "guard rerun", "validation",
+		"run-a", "exhausted", intentID, intentID, nil, nil, nil,
+		nil, nil, nil, used,
+	), used, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetIntentState(intentID, "exhausted"); err != nil {
+		t.Fatal(err)
+	}
+	s := newAdmissionTestServer(m, nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/tasks/1/intents/1/rerun", nil)
+	req.SetPathValue("id", task.ID)
+	req.SetPathValue("iid", fmt.Sprintf("%d", intentID))
+	rec := httptest.NewRecorder()
+	s.rerunIntent(rec, req)
+	if rec.Code != http.StatusConflict || !bytes.Contains(rec.Body.Bytes(), []byte("预算已耗尽")) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	node, err := store.GetNode(intentID)
+	if err != nil || node == nil || node.State != "exhausted" {
+		t.Fatalf("intent was reopened despite exhausted route: %+v err=%v", node, err)
+	}
+}
+
 func TestTaskLLMResolutionRejectsInvalidExplicitProfile(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {

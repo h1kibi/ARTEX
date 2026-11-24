@@ -249,6 +249,12 @@ END $$;
 CREATE INDEX IF NOT EXISTS idx_expnodes_part     ON exploration_nodes(exploration_id, kind);
 CREATE INDEX IF NOT EXISTS idx_expnodes_frontier ON exploration_nodes(exploration_id, priority DESC)
     WHERE kind='intent' AND state='open';
+-- Information / Route Graph views read fact_type and route_id out of payload.
+-- Both are logical fields on the existing fact/intent nodes, not new tables.
+CREATE INDEX IF NOT EXISTS idx_expnodes_fact_type ON exploration_nodes(exploration_id, (payload->>'fact_type'))
+    WHERE kind='fact';
+CREATE INDEX IF NOT EXISTS idx_expnodes_route_id ON exploration_nodes(exploration_id, (payload->>'route_id'))
+    WHERE kind IN ('fact','intent');
 DROP TRIGGER IF EXISTS trg_expnodes_upd ON exploration_nodes;
 CREATE TRIGGER trg_expnodes_upd BEFORE UPDATE ON exploration_nodes
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();

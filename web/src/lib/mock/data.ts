@@ -3965,8 +3965,109 @@ export function assetRefsFor(_assetId: number) {
     ],
     facts: [{ id: 34, kind: "fact", state: "confirmed", summary: "search?q= 参数可注入，报错回显 MySQL 语法错误" }],
     findings: [{ id: 41, kind: "finding", state: "confirmed", summary: "[高] SQL 注入 www.acme.com/search?q=" }],
+    routes: [
+      { route_id: 12, phase: "exploitation", objective: "验证搜索参数的 SQL 注入与数据读取边界" },
+      { route_id: 18, phase: "validation", objective: "验证订单接口的对象级授权" },
+    ],
   };
 }
+
+// Route / Information / Evidence Graph 的 demo 数据。与 explorationGraph 的
+// intent/finding 节点保持同一套编号，页面之间可以互相跳转。
+export const taskRoutes = {
+  routes: [
+    {
+      route_id: 12,
+      route_kind: "path_stage",
+      objective: "验证搜索参数的 SQL 注入与数据读取边界",
+      phase: "exploitation",
+      success_condition: "拿到可复现的跨表读取证据或排除注入",
+      expected_evidence: ["报错回显", "布尔/时间差异", "数据读取结果"],
+      status: "succeeded",
+      budget: { max_tool_calls: 60, max_input_tokens: 120000 },
+      budget_used: { tool_calls: 42, input_tokens: 88120, output_tokens: 9120, wall_ms: 742000 },
+      intent_count: 3,
+      active_intents: 0,
+      asset_ids: [4, 5],
+      intents: [
+        { id: "12", summary: "对 www.acme.com 搜索接口做 SQL 注入探测", state: "done", phase: "validation", asset_ids: [4], worker_seconds: 318, worker_runs: 1, checkpoint_fact_id: 101, created_at: "2026-07-26T02:10:00Z" },
+        { id: "16", summary: "从报错注入升级到 UNION 读取用户表", state: "done", phase: "exploitation", asset_ids: [4], worker_seconds: 602, worker_runs: 2, checkpoint_fact_id: 102, created_at: "2026-07-26T02:24:00Z" },
+        { id: "21", summary: "验证读取范围并整理可复现请求", state: "done", phase: "evidence", asset_ids: [4], worker_seconds: 190, worker_runs: 1, checkpoint_fact_id: 103, created_at: "2026-07-26T02:41:00Z" },
+      ],
+      checkpoints: [
+        { id: "101", route_id: 12, intent_id: 12, run_id: "run-demo-1", path_phase: "validation", summary: "确认 search?q= 存在报错注入，尚未确认读取范围", confirmed_claim_ids: [34], open_hypothesis_ids: [35], evidence_refs: ["traffic:x-2", "activity:88"], next_actions: ["尝试 UNION 读取 users 表"], budget_used: { tool_calls: 18, input_tokens: 38000, output_tokens: 4200, wall_ms: 318000 }, created_at: "2026-07-26T02:18:00Z" },
+        { id: "102", route_id: 12, intent_id: 16, run_id: "run-demo-2", path_phase: "exploitation", summary: "UNION 读取到 users 表字段，拿到 3 条演示数据", confirmed_claim_ids: [36], evidence_refs: ["traffic:x-2", "traffic:x-3"], next_actions: ["确认影响范围并上报"], budget_used: { tool_calls: 36, input_tokens: 76000, output_tokens: 8100, wall_ms: 660000 }, created_at: "2026-07-26T02:39:00Z" },
+      ],
+      findings: [
+        { id: "41", finding_id: "f-1", summary: "SQL 注入 www.acme.com/search?q=", severity: "high", vulnclass: "SQLi", state: "confirmed", evidence_refs: ["traffic:x-2", "traffic:x-3"], traffic_count: 2 },
+      ],
+      created_at: "2026-07-26T02:10:00Z",
+    },
+    {
+      route_id: 18,
+      route_kind: "path_stage",
+      objective: "验证订单接口的对象级授权",
+      phase: "validation",
+      success_condition: "确认跨用户读取或排除该假设",
+      expected_evidence: ["不同用户对象的响应差异"],
+      status: "active",
+      budget: { max_tool_calls: 80, max_input_tokens: 160000 },
+      budget_used: { tool_calls: 27, input_tokens: 51200, output_tokens: 6600, wall_ms: 402000 },
+      intent_count: 1,
+      active_intents: 1,
+      asset_ids: [5],
+      intents: [
+        { id: "18", summary: "枚举 api.acme.com 的对象越权 (IDOR)", state: "running", phase: "validation", asset_ids: [5], worker_seconds: 402, worker_runs: 1, checkpoint_fact_id: 201, created_at: "2026-07-26T03:02:00Z" },
+      ],
+      checkpoints: [
+        { id: "201", route_id: 18, intent_id: 18, run_id: "run-demo-3", path_phase: "validation", summary: "本人订单可读，尚未验证他人订单", confirmed_claim_ids: [], open_hypothesis_ids: [52], evidence_refs: ["traffic:x-8", "traffic:x-9"], next_actions: ["改用 id=1002 比较响应差异"], budget_used: { tool_calls: 14, input_tokens: 26000, output_tokens: 3100, wall_ms: 210000 }, created_at: "2026-07-26T03:06:00Z" },
+      ],
+      findings: [],
+      created_at: "2026-07-26T03:02:00Z",
+    },
+    {
+      route_id: 30,
+      route_kind: "path_stage",
+      objective: "梳理 acme.com 的登录面与认证前入口",
+      phase: "recon",
+      status: "proposed",
+      budget_used: {},
+      intent_count: 1,
+      active_intents: 0,
+      asset_ids: [1, 4],
+      intents: [
+        { id: "30", summary: "枚举登录面与认证前可达接口", state: "open", phase: "recon", asset_ids: [1, 4], worker_seconds: 0, worker_runs: 0, created_at: "2026-07-26T03:20:00Z" },
+      ],
+      checkpoints: [],
+      findings: [],
+      created_at: "2026-07-26T03:20:00Z",
+    },
+  ],
+};
+
+export const taskInformation = {
+  nodes: [
+    { id: "52", kind: "fact", fact_type: "hypothesis", summary: "订单接口可能存在对象级授权缺失", confidence: "medium", state: "open", evidence_refs: ["traffic:x-8"], route_id: 18, intent_id: 18, created_at: "2026-07-26T03:06:00Z" },
+    { id: "36", kind: "fact", fact_type: "claim", summary: "UNION 注入可以读取 users 表字段", confidence: "observed", state: "confirmed", evidence_refs: ["traffic:x-2", "traffic:x-3"], route_id: 12, intent_id: 16, created_at: "2026-07-26T02:39:00Z" },
+    { id: "35", kind: "fact", fact_type: "hypothesis", summary: "搜索参数的注入点可以进一步读取用户表", confidence: "inferred", state: "supported", evidence_refs: ["activity:88"], route_id: 12, intent_id: 12, created_at: "2026-07-26T02:18:00Z" },
+    { id: "34", kind: "fact", fact_type: "claim", summary: "search?q= 参数可注入，报错回显 MySQL 语法错误", confidence: "observed", state: "confirmed", evidence_refs: ["traffic:x-2"], route_id: 12, intent_id: 12, created_at: "2026-07-26T02:18:00Z" },
+    { id: "33", kind: "fact", fact_type: "observation", summary: "搜索接口返回 500 并回显 MySQL 语法错误", confidence: "observed", state: "confirmed", evidence_refs: ["traffic:x-2"], route_id: 12, intent_id: 12, created_at: "2026-07-26T02:16:00Z" },
+    { id: "41", kind: "finding", fact_type: "finding", summary: "SQL 注入 www.acme.com/search?q=", severity: "high", vulnclass: "SQLi", state: "confirmed", finding_id: "f-1", evidence_refs: ["traffic:x-2", "traffic:x-3"], route_id: 12, intent_id: 16, created_at: "2026-07-26T02:40:00Z" },
+  ],
+  total: 6,
+  counts: { observation: 1, claim: 2, hypothesis: 2, finding_candidate: 0, finding: 1 },
+  truncated: false,
+};
+
+export const taskEvidence = {
+  traffic_enabled: true,
+  refs: [
+    { ref: "activity:88", kind: "activity", id: "88", available: true, source_node_ids: [35], source_kinds: ["fact"] },
+    { ref: "traffic:x-2", kind: "traffic", id: "x-2", available: true, source_node_ids: [33, 34, 41], source_kinds: ["fact", "finding"] },
+    { ref: "traffic:x-3", kind: "traffic", id: "x-3", available: true, source_node_ids: [36, 41], source_kinds: ["fact", "finding"] },
+    { ref: "traffic:x-8", kind: "traffic", id: "x-8", available: true, source_node_ids: [52], source_kinds: ["fact"] },
+  ],
+};
 
 // ── 工作空间文件管理器（/workspace/*，demo：静态示例树）──
 const WS_TREE: Record<string, { name: string; dir: boolean; size: number; content?: string }[]> = {

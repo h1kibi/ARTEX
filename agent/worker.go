@@ -164,7 +164,7 @@ func (w *Worker) RunTimeout() time.Duration { return w.runTimeout }
 // settleWrapUpPrompt is injected by the SDK settlement phase when a worker hits its
 // turn/time budget: stop probing, write back what was found, then end with a
 // plain-text one-liner (which becomes this run's displayed result).
-const settleWrapUpPrompt = "你即将因预算耗尽被终止。不要再运行任何命令/探测。请依次：(1) 把你上面已识别但还没写回的内容逐条写回——新资产用 insert_assets、探索结论/事实用 record_fact、确认漏洞用 report_finding；(2) **最后单独用一句话纯文本**总结你做了什么、得到哪些关键结论（这句会作为本次运行的结果展示，务必输出）。"
+const settleWrapUpPrompt = "你即将因预算耗尽被终止。不要再运行任何命令/探测。请依次：(1) 把你上面已识别但还没写回的内容逐条写回——新资产用 insert_assets、探索结论/事实用 record_fact、确认漏洞用 report_finding；本意图没做完、还有明确的下一步时，在 record_fact 的 next_actions 里写清（最多 10 条），未验证的假设用 hypothesis + validation_actions 留下；(2) **最后单独用一句话纯文本**总结你做了什么、得到哪些关键结论（这句会作为本次运行的结果展示，务必输出）。"
 
 func NewWorker(prov llm.Provider, model, workDir string, tx *transcript.Store, window, maxTurns int, extra ...actool.CoreTool) *Worker {
 	return &Worker{prov: prov, model: model, workDir: workDir, tx: tx, window: window, maxTurns: maxTurns, extraTools: extra}
@@ -271,8 +271,14 @@ const workerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 
 **边发现边写回**（写进图才算数，脑子/文字里的不算；每得一个结果立刻写，别攒到最后被步数耗尽丢掉）。三种写回，别串图：
 - **新资产/资源 → insert_assets（资产图）**：子域 / service / endpoint / 指纹 / 凭据 等一切资产【本身】。**这里只登记资产；探索结论/判断不写这里，用 record_fact。**
-- **探索结论/事实 → record_fact（探索图，传 intent_id）**：都用它。**多个观察汇总成【一条】事实**（summary 一句总结 + detail写对总结的拓展，依靠真实的执行过程），不要一个属性一条、一意图通常只一条，拆碎会让图谱无限膨胀——**默认就写一条，能并进 detail 的都并进去**；仅当确有【彼此完全独立、无法归并】的结论时才用 facts 数组分条，这是极少数例外，不是常规。**只写增量**：只记这次【新得到】的，别把已有事实换措辞重记（只印证已有、无新增就不必记）。**只写真实看到的**：给 evidence（一行：命令+最能证明的一两行输出，简洁，细节在 detail）、标 confidence（observed=直接看到 / inferred=据现象推断）。
-- **确认漏洞 → report_finding（探索图，含 PoC，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条 inferred 事实（嫌疑点+为何未触发）交规划者，别硬记成 finding。
+- **探索结论/事实 → record_fact（探索图，传 intent_id）**：都用它。**先选 fact_type**：observation（直接看到的环境反馈）/ claim（带 evidence_refs 或 observation_ids 的归纳）/ hypothesis（待验证假设，必须给 validation_actions）/ decision（有支撑的选择）/ finding_candidate（有证据但尚未确认的漏洞，validation_state=pending）。**多个观察汇总成【一条】事实**（summary 一句总结 + detail写对总结的拓展），不要一个属性一条、一意图通常只一条，拆碎会让图谱无限膨胀——**默认就写一条，能并进 detail 的都并进去**；仅当确有【彼此完全独立、无法归并】的结论时才用 facts 数组分条，这是极少数例外，不是常规。**只写增量**：只记这次【新得到】的，别把已有事实换措辞重记（只印证已有、无新增就不必记）。**只写真实看到的**：给 evidence（一行：命令+最能证明的一两行输出，简洁，细节在 detail）、标 confidence（observed=直接看到 / inferred=据现象推断）。有对应流量/文件/步骤时，尽量填 evidence_refs（traffic:<id> / artifact:<path>）或 source_activity_ids（get_worker_trace 的 step_id）；省略时系统会自动挂本次最近一条 tool_result。确认漏洞仍必须走 report_finding，不能把 finding_candidate 当已确认漏洞。
+- **确认漏洞 → report_finding（探索图，含 PoC，传 intent_id）**：**只有你本次真实触发过、拿到可复现证据（请求/响应或命令输出）才用**。严禁把"版本/指纹匹配到 CVE""参数看起来可注入""外部漏洞库/更新日志/代码 diff 推断"当已确认，也不要用查 CVE 库或对比补丁版本替代实际触发。触发不了但有嫌疑 → 用 record_fact 记一条 fact_type=hypothesis 或 finding_candidate（validation_state=pending）交规划者，别硬记成 finding。report_finding 的 evidence 必填（命令输出/日志/复现步骤）；有真实流量或文件时用 evidence_refs（traffic:<id> / artifact:<path>）补齐可回查引用，没有流量时在 evidence 说明。
+
+**阶段突破 → progress_event（直接决定 Watchdog 是否重置观察周期）**：
+- 只在**本意图确实取得阶段性突破**时，给 record_fact 填 progress_event；普通 observation、资产登记、普通 claim 不要填。
+- 可用值：validated_weakness（确认弱点/未授权访问）、credential_obtained（拿到可用凭据/token）、privilege_change（权限提升）、lateral_progress（横向到新主机/新权限域）、objective_milestone（直接推进本意图目标）、finding_written（确认漏洞已登记）、cleanup_completed（清理完成）。
+- 若一条 claim 直接印证了本意图 objective（例如“确认该接口可跨用户读取”），按 validated_weakness 或 objective_milestone 标注；漏填会让高价值突破被当作普通写入，运行仍按旧周期被施压甚至终止。
+- 不夸大：只是“看起来可能”“待验证”就不要填这些高价值事件，用 hypothesis / finding_candidate 交接。
 
 
 完成本意图后用一句话总结你做了什么、写回了哪些事实。`
@@ -352,6 +358,89 @@ func renderIntentTask(intent *db.Node) string {
 	return fmt.Sprintf("\n\n【你领到的意图（本次唯一任务：只做这一条、只产生事实、做完即停）】：\n%s\n意图 id: %d（写回 record_fact / report_finding 时传它）", string(intent.Payload), intent.ID)
 }
 
+// renderPriorCheckpoint inlines the previous Run's checkpoint into the worker's
+// system prompt. A continuation intent only carries checkpoint_fact_id; without
+// this block the new Worker re-probes what the previous Run already ruled out.
+// The block is bounded and reference-based (full bodies stay in node_detail).
+func renderPriorCheckpoint(ts *db.ExplorationStore, intent *db.Node) string {
+	if ts == nil || intent == nil {
+		return ""
+	}
+	route := db.ParseIntentRoute(intent)
+	if route.CheckpointFactID <= 0 {
+		return ""
+	}
+	n, err := ts.GetNode(route.CheckpointFactID)
+	if err != nil || n == nil || n.FactType() != db.FactTypeCheckpoint {
+		return ""
+	}
+	p := db.ParseFactPayload(n.Payload)
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n\n【前序 Run 的 Checkpoint 交接（#%d，阶段 %s）】这不是新任务，是同一路线上一阶段的结论。先读它，再决定本次怎么做：", n.ID, p.PathPhase)
+	if p.Summary != "" {
+		b.WriteString("\n- 上一阶段结论：" + firstLine(p.Summary, 600))
+	}
+	if p.Objective != "" && p.Objective != route.Objective {
+		b.WriteString("\n- 路线目标：" + firstLine(p.Objective, 300))
+	}
+	appendFactRefs := func(label string, ids []int64) {
+		if len(ids) == 0 {
+			return
+		}
+		lines := make([]string, 0, 5)
+		for i, id := range ids {
+			if i >= 5 {
+				lines = append(lines, fmt.Sprintf("…另有 %d 条见 node_detail/checkpoint", len(ids)-5))
+				break
+			}
+			summary := ""
+			if fn, err := ts.GetNode(id); err == nil && fn != nil {
+				summary = db.ParseFactPayload(fn.Payload).Summary
+			}
+			if summary == "" {
+				lines = append(lines, fmt.Sprintf("#%d", id))
+			} else {
+				lines = append(lines, fmt.Sprintf("#%d %s", id, firstLine(summary, 180)))
+			}
+		}
+		b.WriteString("\n- " + label + "：" + strings.Join(lines, "；"))
+	}
+	appendFactRefs("已确认 claim", p.ConfirmedClaimIDs)
+	appendFactRefs("未解决 hypothesis", p.OpenHypothesisIDs)
+	if len(p.AttemptedActions) > 0 {
+		b.WriteString("\n- 上一阶段已经尝试过的动作（**不要原样重复**，除非有新参数或新证据）：")
+		for i, action := range p.AttemptedActions {
+			if i >= 12 {
+				b.WriteString(fmt.Sprintf("\n  …另有 %d 条见 node_detail(#%d)", len(p.AttemptedActions)-12, n.ID))
+				break
+			}
+			b.WriteString("\n  - " + firstLine(action, 200))
+		}
+	}
+	if len(p.NextActions) > 0 {
+		b.WriteString("\n- 上一阶段建议的下一步（优先从这里继续）：")
+		for i, action := range p.NextActions {
+			if i >= 8 {
+				break
+			}
+			b.WriteString("\n  - " + firstLine(action, 200))
+		}
+	}
+	if len(p.EvidenceRefs) > 0 {
+		refs := p.EvidenceRefs
+		if len(refs) > 8 {
+			refs = refs[:8]
+		}
+		b.WriteString("\n- 可回查证据：" + strings.Join(refs, "、"))
+	}
+	if p.BudgetUsed.ToolCalls > 0 || p.BudgetUsed.InputTokens > 0 {
+		fmt.Fprintf(&b, "\n- 路线累计用量：tool_calls=%d input_tokens=%d（预算见意图 payload；耗尽快用尽时先做最高价值验证并写回交接）",
+			p.BudgetUsed.ToolCalls, p.BudgetUsed.InputTokens)
+	}
+	b.WriteString("\n- 需要完整正文时用 node_detail(#" + strconv.FormatInt(n.ID, 10) + ")。")
+	return b.String()
+}
+
 // renderWorkerGraphOverview folds the global situational snapshot into the worker's
 // launch USER message for AWARENESS ONLY. The framing is deliberately strong: the overview
 // must NOT widen the worker's job — it still does only its assigned intent. Its sole
@@ -413,7 +502,10 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// worker 刻意不给 MultiEdit/Glob/Grep：文件精改用 Edit、检索走 Bash(grep/find)，
 	// 收敛工具面、减少低价值调用。其余 SDK 默认工具(Read/Write/Edit/LS/Bash/Sleep)照常。
 	base = append(base, defaultToolsExcept("MultiEdit", "Glob", "Grep")...)
-	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts), IntentID: intent.ID})
+	ri := RunInfoFrom(ctx)
+	ri.TaskID, ri.ExplorationID, ri.IntentID = taskID, explorationID(ts), intent.ID
+	ri.RouteID = db.ParseIntentRoute(intent).RouteID
+	ctx = WithRunInfo(ctx, ri)
 	tools, def, cleanup := AugmentTools(ctx, "worker", base)
 	defer cleanup()
 
@@ -425,6 +517,8 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	// worker 有。仅【全局态势 overview】留在启动 user 消息里——它可降级、容忍 stale，压掉无碍。
 	// 本次意图的专属工作目录 <workDir>/tasks/<taskID>/i<intentID>，引擎侧先建好。
 	runDir := ensureRunDir(w.workDir, taskID, intent.ID)
+	taskDir := ensureRunDir(w.workDir, taskID, 0)
+	tsx.SetArtifactRoots(runDir, taskDir)
 	// The run-wide intent is not the current tool action. Do not forward it or
 	// inherit a parent run's background into the action reviewer.
 	ctx = intercept.WithReviewContext(ctx, runDir, intercept.ReviewBackground{})
@@ -435,6 +529,7 @@ func (w *Worker) execute(ctx context.Context, name string, taskID int64, as *db.
 	}
 	// 意图块 → 意图锚定资产块 → 启动指令，依次追加到 system 尾部（与 constraintBlock 同一套追加法）。
 	sysBody += renderIntentTask(intent)
+	sysBody += renderPriorCheckpoint(ts, intent)
 	if as != nil {
 		if ids := intentAssetIDs(intent); len(ids) > 0 {
 			if assets, err := as.GetByIDs(ids); err == nil && len(assets) > 0 {

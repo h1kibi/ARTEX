@@ -44,6 +44,7 @@ import { BroadcastTab } from "./_tabs/broadcast-tab";
 import { CoverageGraphTab } from "./_tabs/coverage-graph-tab";
 import { FindingsTab } from "./_tabs/findings-tab";
 import { GraphTab } from "./_tabs/graph-tab";
+import { IntelligenceTab } from "./_tabs/intelligence-tab";
 import { InterceptTab } from "./_tabs/intercept-tab";
 import { OverviewTab } from "./_tabs/overview-tab";
 import { ReportTab } from "./_tabs/report-tab";
@@ -54,6 +55,7 @@ const TABS = [
   { value: "sessions", label: "会话" },
   { value: "overview", label: "总览" },
   { value: "graph", label: "探索链路" },
+  { value: "intelligence", label: "情报" },
   { value: "broadcast", label: "播报板" },
   { value: "findings", label: "发现" },
   { value: "retests", label: "复测" },
@@ -255,6 +257,12 @@ function TaskDetailInner() {
           base.goals_met = at.goals_met;
           base.engine_mode = s?.engine_mode ?? at.engine_mode;
           base.paused = at.paused;
+          const lastActivity: unknown = at.last_activity;
+          if (typeof lastActivity === "string" && lastActivity) {
+            base.last_activity = lastActivity;
+          } else if (typeof lastActivity === "number" && lastActivity > 0) {
+            base.last_activity = new Date(lastActivity * 1000).toISOString();
+          }
         }
         setTask(base);
         setPaused(at?.paused ?? base.paused ?? false);
@@ -425,6 +433,9 @@ function TaskDetailInner() {
         </TabsContent>
         <TabsContent value="graph" className="mt-0">
           <GraphTab taskId={id} />
+        </TabsContent>
+        <TabsContent value="intelligence" className="mt-0">
+          <IntelligenceTab taskId={id} />
         </TabsContent>
         <TabsContent value="broadcast" className="mt-0">
           <BroadcastTab taskId={id} />

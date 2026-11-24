@@ -191,6 +191,26 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	// Wire DB-stored prompt templates into the agents (新版方案 §3.3 / §5a). With no
 	// override row, agents keep their built-in defaults — behavior is unchanged.
 	if m.pg != nil {
+		// Evidence refs are validated at the write boundary: traffic ids must exist
+		// in the local recorder; artifact/activity refs are structural plus
+		// task-scoped checks inside the agent layer.
+		agent.EvidenceRefValidator = func(_ context.Context, ref db.EvidenceRef) error {
+			if ref.Kind != "traffic" {
+				return nil
+			}
+			tr := m.Traffic()
+			if tr == nil {
+				return fmt.Errorf("流量记录未启用，不能引用 traffic:%s；请改用 artifact:<path> 或 activity:<id>", ref.ID)
+			}
+			ok, err := tr.Exists(ref.ID)
+			if err != nil {
+				return fmt.Errorf("校验流量引用失败: %w", err)
+			}
+			if !ok {
+				return fmt.Errorf("流量引用 traffic:%s 不存在于本机记录", ref.ID)
+			}
+			return nil
+		}
 		agent.PromptOverride = func(key string) (string, bool) {
 			a, err := m.pg.GetAgentByKey(key)
 			if err != nil || a == nil {
@@ -724,6 +744,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/task-archives/delete/batch", s.deleteTaskArchivesBatch)
 	mux.HandleFunc("GET /api/tasks/{id}/coverage", s.taskCoverage)
 	mux.HandleFunc("GET /api/tasks/{id}/coverage-graph", s.taskCoverageGraph)
+	mux.HandleFunc("GET /api/tasks/{id}/routes", s.taskRoutes)
+	mux.HandleFunc("GET /api/tasks/{id}/information", s.taskInformation)
+	mux.HandleFunc("GET /api/tasks/{id}/evidence", s.taskEvidence)
 	mux.HandleFunc("GET /api/tasks/{id}/asset-refs", s.taskAssetRefs)
 	mux.HandleFunc("POST /api/tasks/{id}/assets", s.attachTaskAssets)
 	mux.HandleFunc("DELETE /api/tasks/{id}/assets/{assetID}", s.detachTaskAsset)
@@ -1294,6 +1317,15 @@ func (s *Server) rerunIntent(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	if before != nil {
+		if msg, err := rerunBudgetBlockMessage(t.Store, before); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		} else if msg != "" {
+			writeErr(w, 409, msg)
+			return
+		}
+	}
 	reopened, err := t.Store.ReopenIntent(iid)
 	if err != nil {
 		writeErr(w, 500, err.Error())
@@ -1331,15 +1363,32 @@ func (s *Server) rerunBlocked(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	before := make([]*db.Node, 0)
+	skipped := make([]int64, 0)
+	var n int64
 	for _, intent := range intents {
-		if intent.State == "blocked" {
-			copy := *intent
+		if intent.State != "blocked" {
+			continue
+		}
+		if msg, err := rerunBudgetBlockMessage(t.Store, intent); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		} else if msg != "" {
+			skipped = append(skipped, intent.ID)
+			continue
+		}
+		copy := *intent
+		ok, err := t.Store.ReopenIntent(intent.ID)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if ok {
 			before = append(before, &copy)
+			n++
 		}
 	}
-	n, err := t.Store.ReopenBlockedIntents()
-	if err != nil {
-		writeErr(w, 500, err.Error())
+	if n == 0 && len(skipped) > 0 {
+		writeErr(w, 409, fmt.Sprintf("以下意图所在路线的累计预算已耗尽，重跑会被立即再次终止：%s；请改用扩容的 continuation 或停止该路线", formatIntentIDs(skipped)))
 		return
 	}
 	queued := false
@@ -1361,6 +1410,65 @@ func (s *Server) rerunBlocked(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[task] #%s 批量重开 %d 条 blocked 意图", t.ID, n)
 	}
 	writeJSON(w, 200, map[string]any{"id": t.ID, "reopened": n, "queued": queued})
+}
+
+// rerunBudgetBlockMessage reports why reopening this intent would be killed by
+// the next Fast Path tick: the route's cumulative budget is already spent.
+// A user-triggered rerun bypasses add_intent's continuation guard, so it needs
+// the same check at the reopen boundary.
+func rerunBudgetBlockMessage(store *db.ExplorationStore, intent *db.Node) (string, error) {
+	if store == nil || intent == nil {
+		return "", nil
+	}
+	route := db.ParseIntentRoute(intent)
+	routeID := route.RouteID
+	if routeID <= 0 {
+		routeID = intent.ID
+	}
+	budget, used := route.Budget, route.BudgetUsed
+	latest, err := store.LatestIntentForRoute(routeID)
+	if err != nil {
+		return "", err
+	}
+	if latest != nil {
+		lr := db.ParseIntentRoute(latest)
+		if !lr.Budget.Empty() {
+			budget = lr.Budget // a continuation may have raised the limit
+		}
+		if lr.BudgetUsed != (db.RouteBudgetUsed{}) {
+			used = lr.BudgetUsed
+		}
+	}
+	if cp, err := store.LatestCheckpointForRoute(routeID); err != nil {
+		return "", err
+	} else if cp != nil {
+		if u := db.ParseFactPayload(cp.Payload).BudgetUsed; u != (db.RouteBudgetUsed{}) {
+			used = u
+		}
+	}
+	if budget.Empty() {
+		return "", nil
+	}
+	dimension, usedValue, limit := db.RouteBudgetExhausted(budget, used)
+	if dimension == "" {
+		return "", nil
+	}
+	label, field := "工具调用", "max_tool_calls"
+	if dimension == "input_tokens" {
+		label, field = "输入 token", "max_input_tokens"
+	} else if dimension == "wall_seconds" {
+		label, field = "墙钟(秒)", "max_wall_seconds"
+	}
+	return fmt.Sprintf("意图 #%d 所在路线 #%d 的累计%s预算已耗尽（%d/%d），重跑会在下一个 Fast Path tick 再次被终止；请改用 add_intent(continuation_of=%d) 并传入更大的 budget.%s，或停止该路线。",
+		intent.ID, routeID, label, usedValue, limit, intent.ID, field), nil
+}
+
+func formatIntentIDs(ids []int64) string {
+	parts := make([]string, 0, len(ids))
+	for _, id := range ids {
+		parts = append(parts, fmt.Sprintf("#%d", id))
+	}
+	return strings.Join(parts, "、")
 }
 
 // getLLM returns the current LLM config (key never exposed).
@@ -1897,7 +2005,28 @@ func (s *Server) taskAssetRefs(w http.ResponseWriter, r *http.Request) {
 			findings = append(findings, dto)
 		}
 	}
-	writeJSON(w, 200, map[string]any{"intents": intents, "facts": facts, "findings": findings})
+	routes := []map[string]any{}
+	if ids, err := t.Store.RouteIDsForAsset(assetID); err == nil && len(ids) > 0 {
+		intentNodes, _ := t.Store.ListByKind(db.KindIntent, 1000)
+		byID := map[int64]map[string]any{}
+		for _, n := range intentNodes {
+			r := db.ParseIntentRoute(n)
+			if _, ok := byID[r.RouteID]; ok {
+				continue
+			}
+			byID[r.RouteID] = map[string]any{
+				"route_id": r.RouteID, "phase": r.PathPhase, "objective": r.Objective,
+			}
+		}
+		for _, id := range ids {
+			if m := byID[id]; m != nil {
+				routes = append(routes, m)
+			} else {
+				routes = append(routes, map[string]any{"route_id": id})
+			}
+		}
+	}
+	writeJSON(w, 200, map[string]any{"intents": intents, "facts": facts, "findings": findings, "routes": routes})
 }
 
 // taskScopeList returns a task's scope rows (coverage denominator sources).

@@ -1171,7 +1171,9 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		return true
 	}
 	runID := "run-" + uuid.NewString()
+	route := db.ParseIntentRoute(intent)
 	emit := func(r db.Activity) {
+		r.Metadata = withRunActivityMetadata(r.Metadata, runID, route.RouteID)
 		e.emitActivity(t, r)
 		if e.monitor != nil {
 			e.monitor.Observe(runID, r)
@@ -1179,6 +1181,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	if e.monitor != nil {
 		e.monitor.Register(t.ID, intent.ID, runID, name)
+		e.monitor.SetRoute(runID, db.ParseIntentRoute(intent))
 		defer e.monitor.Finish(runID, db.WorkerRunStateFinished)
 	}
 	// per-work child context so the planner's kill_work can stop just this work.
@@ -1207,6 +1210,12 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		label:     label,
 	}
 	wTaskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	ri := agent.RunInfoFrom(workCtx)
+	ri.RunID = runID
+	ri.RouteID = db.ParseIntentRoute(intent).RouteID
+	ri.TaskID, ri.ExplorationID, ri.IntentID = wTaskID, t.ExpID, intent.ID
+	workCtx = agent.WithRunInfo(workCtx, ri)
+	startActivityID, _ := t.Store.ActivityMaxID()
 	if e.monitor != nil {
 		e.monitor.Phase(runID, db.WorkerRunPhaseLLM, "")
 	}
@@ -1258,6 +1267,16 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// work would be wrongly marked stopped.
 	workCause := context.Cause(workCtx)
 	killed := workCtx.Err() != nil && ectx.Err() == nil
+	checkpointReason := string(reason)
+	if workCause != nil {
+		checkpointReason = workCause.Error()
+	}
+	if _, cpErr := e.writeRunCheckpoint(t, intent, runID, workStarted, startActivityID, checkpointReason); cpErr != nil {
+		log.Printf("[worker %s] task %s 意图 #%d 写入 checkpoint 失败: %v", name, t.ID, intent.ID, cpErr)
+	}
+	if _, rcErr := e.reconcileFindingCandidate(t, intent, runID); rcErr != nil {
+		log.Printf("[worker %s] task %s 意图 #%d 对账 finding_candidate 失败: %v", name, t.ID, intent.ID, rcErr)
+	}
 	if wd := watchdogAbortCause(workCause); wd != nil {
 		_, settled := e.settleWatchdogTermination(t, name, intent, runID, wd.Text, wd.TerminalState)
 		_, completeWork := e.detachWork(intent.ID)
@@ -1392,6 +1411,12 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		state = "exhausted"
 		log.Printf("[worker %s] intent %d 运行超时(exhausted)，收尾后写回 %s", name, intent.ID, wrote)
 	}
+	// Even with the Watchdog disabled, a run that just spent the route's
+	// cumulative budget must not be reported done: the next continuation would be
+	// silently over budget. The checkpoint above persisted route_budget_used.
+	if state == "done" {
+		state = routeBudgetTerminalState(t.Store, intent.ID, state)
+	}
 	if state == "blocked" && isTaskLLMChainExhausted(err) {
 		_ = t.Store.SetIntentBlockedReason(intent.ID, db.IntentBlockedLLMQuota)
 	} else {
@@ -1404,6 +1429,25 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	recordWork()
 	t.NotifyDone(intent.ID) // results changed the graph -> wake the planner (with the just-finished intent id)
 	return true
+}
+
+// routeBudgetTerminalState downgrades a successful run to exhausted when the
+// route's cumulative budget has been spent. Called after the checkpoint has
+// persisted route_budget_used, so it works with the Watchdog disabled too.
+func routeBudgetTerminalState(store *db.ExplorationStore, intentID int64, state string) string {
+	if store == nil || intentID <= 0 {
+		return state
+	}
+	n, err := store.GetNode(intentID)
+	if err != nil || n == nil {
+		return state
+	}
+	r := db.ParseIntentRoute(n)
+	if dim, used, limit := db.RouteBudgetExhausted(r.Budget, r.BudgetUsed); dim != "" {
+		log.Printf("[worker] intent %d 路线累计预算耗尽(%s %d/%d)，标记 exhausted", intentID, dim, used, limit)
+		return "exhausted"
+	}
+	return state
 }
 
 // runDetachedIntent runs one paused intent OUTSIDE the worker pool in its own

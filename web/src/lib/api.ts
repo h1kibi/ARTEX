@@ -33,6 +33,7 @@ import type {
   DeleteTaskResult,
   Edge,
   EvidenceBodyPreview,
+  EvidenceResponse,
   ExplorationNodePage,
   ExplorationNodeQuery,
   Finding,
@@ -46,6 +47,7 @@ import type {
   FindingsPage,
   FindingTraffic,
   FindingTrafficDetail,
+  InformationResponse,
   IntentAsset,
   InterceptApprovalFilter,
   InterceptApprovalRow,
@@ -71,6 +73,7 @@ import type {
   NotificationMeta,
   PromptVar,
   PromptVersion,
+  RoutesResponse,
   SessionTokenUsage,
   Settings,
   Severity,
@@ -430,8 +433,21 @@ export const api = {
     post<TaskScopeRow>(`/tasks/${id}/scope`, { kind, value, reason }),
   // 删除本任务的一条测试范围。
   deleteTaskScope: (id: string, scopeId: number) => del<{ ok: boolean }>(`/tasks/${id}/scope/${scopeId}`),
-  // 某资产在本任务里关联的意图 / 事实 / 发现（覆盖图节点抽屉用）。
+  // 某资产在本任务里关联的意图 / 事实 / 发现 / 路线（覆盖图节点抽屉用）。
   taskAssetRefs: (id: string, assetId: number) => get<CoverageAssetRefs>(`/tasks/${id}/asset-refs?asset_id=${assetId}`),
+  // Route Graph：route_id、阶段、Intent、Checkpoint、Finding 与预算引用。
+  taskRoutes: (id: string) => get<RoutesResponse>(`/tasks/${id}/routes`),
+  // Information Graph：Observation / Claim / Hypothesis / Decision / Candidate / Finding。
+  taskInformation: (id: string, query: { type?: string; routeId?: number; limit?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (query.type) q.set("type", query.type);
+    if (query.routeId) q.set("route_id", String(query.routeId));
+    if (query.limit) q.set("limit", String(query.limit));
+    const qs = q.toString();
+    return get<InformationResponse>(`/tasks/${id}/information${qs ? `?${qs}` : ""}`);
+  },
+  // Evidence Layer：事实/漏洞引用的原始材料指针及可用性。
+  taskEvidence: (id: string) => get<EvidenceResponse>(`/tasks/${id}/evidence`),
 
   // ---- workspace file manager (workDir) ----
   workspaceList: (path = "") => get<WorkspaceListing>(`/workspace/list?path=${encodeURIComponent(path)}`),

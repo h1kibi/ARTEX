@@ -1518,6 +1518,16 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (seg[0] === "tasks" && seg[2] === "coverage" && seg.length === 3) return D.coverage;
   if (seg[0] === "tasks" && seg[2] === "coverage-graph") return D.coverageGraph;
   if (seg[0] === "tasks" && seg[2] === "asset-refs") return D.assetRefsFor(Number(q.get("asset_id") ?? 0));
+  if (seg[0] === "tasks" && seg[2] === "routes") return D.taskRoutes;
+  if (seg[0] === "tasks" && seg[2] === "evidence") return D.taskEvidence;
+  if (seg[0] === "tasks" && seg[2] === "information") {
+    const type = q.get("type") || "";
+    const routeID = Number(q.get("route_id") || 0);
+    const nodes = D.taskInformation.nodes.filter(
+      (node) => (!type || type === "all" || node.fact_type === type) && (!routeID || node.route_id === routeID),
+    );
+    return { ...D.taskInformation, nodes, total: nodes.length };
+  }
 
   // ── 任务测试范围（增删查）──
   if (seg[0] === "tasks" && seg[2] === "scope" && seg.length === 3 && m === "GET") {

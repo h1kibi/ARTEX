@@ -131,6 +131,49 @@ func newWatchdogFast(s *Server, monitor *RunMonitor) *watchdogFast {
 	return &watchdogFast{s: s, monitor: monitor, now: time.Now}
 }
 
+// routeBudgetExceeded compares the current route usage (previous checkpoints +
+// this run) against the intent's declared budget. Zero means unlimited.
+func candidateSnapshot(n *db.Node, p db.FactPayload) map[string]any {
+	m := map[string]any{
+		"id": n.ID, "summary": p.Summary, "route_id": p.RouteID,
+		"validation_state": p.ValidationState, "confidence": p.Confidence,
+	}
+	if len(p.ClaimIDs) > 0 {
+		m["claim_ids"] = p.ClaimIDs
+	}
+	if len(p.EvidenceRefs) > 0 {
+		m["evidence_refs"] = p.EvidenceRefs
+	}
+	return m
+}
+
+func routeBudgetExceeded(snap RunSnapshot, now time.Time) (string, bool) {
+	b := snap.RouteBudget
+	if b.Empty() {
+		return "", false
+	}
+	usedCalls := snap.RouteUsedBase.ToolCalls + snap.ToolCalls
+	usedInput := snap.RouteUsedBase.InputTokens + snap.InputTokens
+	started := snap.StartedAt
+	if started.IsZero() {
+		started = snap.HeartbeatAt
+	}
+	usedWall := snap.RouteUsedBase.WallMS
+	if !started.IsZero() {
+		usedWall += now.Sub(started).Milliseconds()
+	}
+	switch {
+	case b.MaxToolCalls > 0 && usedCalls >= b.MaxToolCalls:
+		return fmt.Sprintf("路线 #%d 工具调用预算耗尽（%d/%d）", snap.RouteID, usedCalls, b.MaxToolCalls), true
+	case b.MaxInputTokens > 0 && usedInput >= b.MaxInputTokens:
+		return fmt.Sprintf("路线 #%d 输入 token 预算耗尽（%d/%d）", snap.RouteID, usedInput, b.MaxInputTokens), true
+	case b.MaxWallSeconds > 0 && usedWall >= int64(b.MaxWallSeconds)*1000:
+		return fmt.Sprintf("路线 #%d 墙钟预算耗尽（%ds/%ds）", snap.RouteID, usedWall/1000, b.MaxWallSeconds), true
+	default:
+		return "", false
+	}
+}
+
 // Tick runs once per 5 seconds. Flush happens even while the watchdog is
 // disabled, so worker_runs stays useful for the API and diagnostics.
 func (f *watchdogFast) Tick(ctx context.Context) {
@@ -157,6 +200,14 @@ func (f *watchdogFast) Tick(ctx context.Context) {
 		// 审批等待与供应商错误不属于停滞：一个在等人，一个由模型链处理。
 		if snap.Phase == db.WorkerRunPhaseApproval || snap.Phase == db.WorkerRunPhasePaused ||
 			snap.Phase == db.WorkerRunPhaseSettling {
+			continue
+		}
+		if reason, exceeded := routeBudgetExceeded(snap, now); exceeded {
+			// A route budget is a fixed control input, not a semantic judgment.
+			// Settle the run (the Worker keeps its wrap-up rounds and writes a
+			// checkpoint), then the Planner can continue the route with a new
+			// intent; the cumulative budget is not refreshed.
+			f.terminateAsync(ctx, snap, reason, "exhausted")
 			continue
 		}
 		cycleStart := snap.CycleStart
@@ -529,18 +580,68 @@ func (s *Server) buildWatchdogSnapshot(t *Task, snap RunSnapshot) (json.RawMessa
 		}
 		steps = append(steps, item)
 	}
+	route := db.ParseIntentRoute(intent)
+	routeID := route.RouteID
+	if routeID <= 0 {
+		routeID = snap.IntentID
+	}
+	var checkpoint any
+	var checkpointRefs []string
+	checkpointData := map[string]any{}
+	if latest, err := t.Store.LatestCheckpointForRoute(routeID); err == nil && latest != nil {
+		cp := db.ParseFactPayload(latest.Payload)
+		checkpointData = map[string]any{
+			"id": latest.ID, "route_id": cp.RouteID, "path_phase": cp.PathPhase,
+			"summary": cp.Summary, "next_actions": cp.NextActions,
+			"attempted_actions": cp.AttemptedActions,
+			"evidence_refs":     cp.EvidenceRefs, "confirmed_claim_ids": cp.ConfirmedClaimIDs,
+			"open_hypothesis_ids": cp.OpenHypothesisIDs, "finding_ids": cp.FindingIDs,
+			"budget_used": cp.BudgetUsed, "settlement_reason": cp.SettlementReason,
+			"created_by_run": cp.CreatedByRun,
+		}
+		checkpoint = checkpointData
+		checkpointRefs = cp.EvidenceRefs
+	}
+	candidates := []map[string]any{}
+	if list, err := t.Store.ListFactsByType(db.FactTypeFindingCandidate, 10); err == nil {
+		for _, n := range list {
+			p := db.ParseFactPayload(n.Payload)
+			if p.RouteID != routeID && p.RouteID != 0 {
+				continue
+			}
+			candidates = append(candidates, candidateSnapshot(n, p))
+		}
+	}
+	used := db.RouteBudgetUsed{
+		ToolCalls:    snap.RouteUsedBase.ToolCalls + snap.ToolCalls,
+		InputTokens:  snap.RouteUsedBase.InputTokens + snap.InputTokens,
+		OutputTokens: snap.RouteUsedBase.OutputTokens + snap.OutputTokens,
+		WallMS:       snap.RouteUsedBase.WallMS,
+	}
+	if !snap.StartedAt.IsZero() {
+		used.WallMS += time.Since(snap.StartedAt).Milliseconds()
+	}
 	snapshot := map[string]any{
 		"task_id": t.ID, "goal": t.Goal, "description": t.Description,
 		"intent_id": snap.IntentID, "intent": rawString(intent.Payload),
-		"run_id": snap.RunID, "worker_name": snap.WorkerName,
+		"route_id": routeID, "route_kind": route.RouteKind,
+		"route_objective": route.Objective, "route_phase": route.PathPhase,
+		"route_budget": route.Budget, "route_budget_used": used,
+		"checkpoint": checkpoint, "evidence_refs": checkpointRefs,
+		"finding_candidates": candidates,
+		"run_id":             snap.RunID, "worker_name": snap.WorkerName,
 		"phase": snap.Phase, "tool": snap.Tool,
-		"phase_started_at": optionalTime(snap.PhaseStartedAt),
-		"heartbeat_at":     optionalTime(snap.HeartbeatAt),
-		"last_event_at":    optionalTime(snap.LastEventAt),
-		"last_output_at":   optionalTime(snap.LastOutputAt),
-		"cycle_no":         snap.CycleNo, "cycle_start": optionalTime(snap.CycleStart),
+		"phase_started_at":   optionalTime(snap.PhaseStartedAt),
+		"heartbeat_at":       optionalTime(snap.HeartbeatAt),
+		"last_event_at":      optionalTime(snap.LastEventAt),
+		"last_output_at":     optionalTime(snap.LastOutputAt),
+		"last_high_value_at": optionalTime(snap.LastHighValueAt),
+		"cycle_no":           snap.CycleNo, "cycle_start": optionalTime(snap.CycleStart),
 		"facts": snap.Facts, "assets": snap.Assets, "findings": snap.Findings,
-		"recent_steps": steps,
+		"tool_calls": snap.ToolCalls, "input_tokens": snap.InputTokens,
+		"output_tokens": snap.OutputTokens, "duplicate_actions": snap.DuplicateActions,
+		"progress_events": snap.ProgressEvents,
+		"recent_steps":    steps,
 	}
 	return json.Marshal(snapshot)
 }

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -256,6 +257,8 @@ func TestWatchdogCycleResetReleasesJobKey(t *testing.T) {
 	// An effective write resets the run to a fresh C0 at a new start. The old
 	// (run, cycle) row must be removed, or the new 10-minute job is suppressed.
 	now = now.Add(time.Minute)
+	monitor.Observe(runID, db.Activity{Kind: "tool_use", Tool: "record_fact",
+		Detail: `{"fact_type":"claim","progress_event":"validated_weakness"}`})
 	monitor.Observe(runID, db.Activity{Kind: "tool_result", Tool: "record_fact", Detail: `{"id":1}`})
 	if old, err := m.pg.WatchdogJobByCycle(context.Background(), runID, 0); err != nil || old != nil {
 		t.Fatalf("old cycle job survived reset: %+v err=%v", old, err)
@@ -712,5 +715,32 @@ func TestWatchdogProcessCycleTerminateDoesNotBlockTick(t *testing.T) {
 	node, err := task.Store.GetNode(intent.ID)
 	if err != nil || node == nil || node.State != "stopped" {
 		t.Fatalf("intent=%+v err=%v, want stopped", node, err)
+	}
+}
+
+func TestRouteBudgetExceeded(t *testing.T) {
+	now := time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)
+	snap := RunSnapshot{
+		RouteID: 7, StartedAt: now.Add(-2 * time.Second),
+		RouteBudget:   db.RouteBudget{MaxToolCalls: 10, MaxInputTokens: 1000, MaxWallSeconds: 60},
+		RouteUsedBase: db.RouteBudgetUsed{ToolCalls: 3, InputTokens: 200},
+		ToolCalls:     2, InputTokens: 100,
+	}
+	if reason, exceeded := routeBudgetExceeded(snap, now); exceeded || reason != "" {
+		t.Fatalf("budget tripped early: %s", reason)
+	}
+	snap.ToolCalls = 9
+	if reason, exceeded := routeBudgetExceeded(snap, now); !exceeded || !strings.Contains(reason, "工具调用") {
+		t.Fatalf("tool budget not enforced: %s", reason)
+	}
+	snap.ToolCalls = 0
+	snap.InputTokens = 900
+	if reason, exceeded := routeBudgetExceeded(snap, now); !exceeded || !strings.Contains(reason, "token") {
+		t.Fatalf("token budget not enforced: %s", reason)
+	}
+	snap.InputTokens = 0
+	snap.StartedAt = now.Add(-70 * time.Second)
+	if reason, exceeded := routeBudgetExceeded(snap, now); !exceeded || !strings.Contains(reason, "墙钟") {
+		t.Fatalf("wall budget not enforced: %s", reason)
 	}
 }

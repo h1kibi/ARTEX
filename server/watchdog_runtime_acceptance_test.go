@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"iter"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -40,11 +41,14 @@ func (p *runtimeAcceptanceProvider) closeRelease() {
 
 func (p *runtimeAcceptanceProvider) factInput(summary string) string {
 	input, _ := json.Marshal(map[string]any{
-		"summary":    summary,
-		"intent_id":  p.intentID,
-		"detail":     "deterministic runtime acceptance fixture",
-		"evidence":   "fixture provider",
-		"confidence": "observed",
+		"summary":        summary,
+		"fact_type":      "claim",
+		"intent_id":      p.intentID,
+		"detail":         "deterministic runtime acceptance fixture",
+		"evidence":       "fixture provider",
+		"confidence":     "observed",
+		"evidence_refs":  []string{"artifact:runtime-fixture.txt"},
+		"progress_event": "validated_weakness",
 	})
 	return string(input)
 }
@@ -129,6 +133,16 @@ func TestRealWorkerAutoAdvanceWriteAndResume(t *testing.T) {
 	s := newAdmissionTestServer(m, nil)
 	s.watchdog = &watchdogRuntime{s: s, monitor: monitor, fast: newWatchdogFast(s, monitor)}
 	s.engine.SetRunMonitor(monitor)
+
+	// record_fact now verifies artifact references against the task working
+	// directories. Keep the fixture honest instead of disabling validation.
+	taskDir := filepath.Join(m.dir, "tasks", task.ID)
+	if err := os.MkdirAll(taskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(taskDir, "runtime-fixture.txt"), []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	provider := &runtimeAcceptanceProvider{
 		intentID:          intent.ID,

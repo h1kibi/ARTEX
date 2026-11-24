@@ -943,6 +943,18 @@ func (t *Traffic) Page(f PageQuery, page, size int) (rows []ExchangeMeta, total 
 	return rows, total, rs.Err()
 }
 
+// Exists reports whether a traffic exchange id is present in the local index.
+// It is the cheap evidence-reference check used by agent fact/finding validation;
+// it does not read bodies.
+func (t *Traffic) Exists(id string) (bool, error) {
+	if t == nil || t.db == nil || strings.TrimSpace(id) == "" {
+		return false, nil
+	}
+	var ok bool
+	err := t.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM exchanges WHERE id=?)`, id).Scan(&ok)
+	return ok, err
+}
+
 // Get returns the full request/response text of one exchange. Bodies come from
 // the database; rows recorded before bodies moved into SQLite carry a non-empty
 // path and are read from the legacy on-disk tree instead, so history stays

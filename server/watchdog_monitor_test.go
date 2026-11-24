@@ -41,14 +41,39 @@ func TestRunMonitorPhasesAndEffectiveOutputResetCycle(t *testing.T) {
 	m.SetCycle("run-a", 2, now.Add(-10*time.Minute), true, db.SlowPathDone, db.WatchdogDecisionOpen)
 	m.Observe("run-a", db.Activity{Kind: "thinking"})
 	now = now.Add(5 * time.Minute)
+	m.Observe("run-a", db.Activity{Kind: "tool_use", Tool: "record_fact", Detail: `{"fact_type":"claim","progress_event":"validated_weakness"}`})
 	m.Observe("run-a", db.Activity{Kind: "tool_result", Tool: "record_fact", Detail: `{"id":1}`})
 	snap = *m.Lookup(113)
 	if snap.CycleNo != 0 || snap.AutoCyclesUsed != 2 || snap.PressureSent || snap.SlowPathState != db.SlowPathNone ||
 		snap.DecisionState != db.WatchdogDecisionNone || snap.Facts != 1 {
-		t.Fatalf("effective output did not reset cycle without resetting budget: %+v", snap)
+		t.Fatalf("high-value output did not reset cycle without resetting budget: %+v", snap)
 	}
-	if !snap.LastOutputAt.Equal(now) {
-		t.Fatalf("last_output_at=%v want %v", snap.LastOutputAt, now)
+	if !snap.LastOutputAt.Equal(now) || !snap.LastHighValueAt.Equal(now) {
+		t.Fatalf("output timestamps=%v/%v want %v", snap.LastOutputAt, snap.LastHighValueAt, now)
+	}
+	if len(snap.ProgressEvents) == 0 || snap.ProgressEvents[len(snap.ProgressEvents)-1] != "validated_weakness" {
+		t.Fatalf("progress events=%v", snap.ProgressEvents)
+	}
+}
+
+func TestRunMonitorLowValueWritesDoNotResetCycle(t *testing.T) {
+	now := time.Date(2026, 11, 17, 10, 0, 0, 0, time.UTC)
+	m := newTestMonitor(t, &now, nil)
+	m.Register("2", 15, "run-low", "work#1")
+	now = now.Add(5 * time.Minute)
+	m.SetCycle("run-low", 2, now.Add(-5*time.Minute), true, db.SlowPathDone, db.WatchdogDecisionOpen)
+	m.Observe("run-low", db.Activity{Kind: "tool_use", Tool: "record_fact", Detail: `{"fact_type":"observation"}`})
+	m.Observe("run-low", db.Activity{Kind: "tool_result", Tool: "record_fact", Detail: `{"id":2}`})
+	snap := *m.Lookup(15)
+	if snap.CycleNo != 2 || snap.Facts != 1 || !snap.LastHighValueAt.IsZero() {
+		t.Fatalf("low-value write changed cycle/high-value marker: %+v", snap)
+	}
+	m.Observe("run-low", db.Activity{Kind: "tool_use", Tool: "Bash", Detail: `{"command":"id"}`})
+	m.Observe("run-low", db.Activity{Kind: "tool_result", Tool: "Bash", Detail: `uid=0`})
+	m.Observe("run-low", db.Activity{Kind: "tool_use", Tool: "Bash", Detail: `{"command":"id"}`})
+	snap = *m.Lookup(15)
+	if snap.DuplicateActions != 1 || snap.ToolCalls != 3 {
+		t.Fatalf("duplicate/tool counters=%+v", snap)
 	}
 }
 

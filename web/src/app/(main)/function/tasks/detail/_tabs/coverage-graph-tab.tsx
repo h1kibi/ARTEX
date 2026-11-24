@@ -372,11 +372,24 @@ function AssetSheet({
                     {node.asset_id ? <span className="font-mono text-xs">{node.asset_id}</span> : undefined}
                   </DetailRow>
                 </section>
-                {refs && (refs.intents.length > 0 || refs.facts.length > 0 || refs.findings.length > 0) && (
+                {refs && (refs.intents.length > 0 || refs.facts.length > 0 || refs.findings.length > 0 || (refs.routes?.length ?? 0) > 0) && (
                   <section className="flex flex-col gap-3 border-t pt-3">
                     <RefList title="关联意图" items={refs.intents} />
                     <RefList title="关联事实" items={refs.facts} />
                     <RefList title="关联发现" items={refs.findings} />
+                    {refs.routes && refs.routes.length > 0 ? (
+                      <div>
+                        <h4 className="text-muted-foreground mb-1 text-xs font-medium">关联路线（{refs.routes.length}）</h4>
+                        <div className="flex flex-wrap gap-1">
+                          {refs.routes.map((route) => (
+                            <Badge key={route.route_id} variant="outline" className="font-mono text-[11px]">
+                              route #{route.route_id}
+                              {route.phase ? ` · ${route.phase}` : ""}
+                            </Badge>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
                   </section>
                 )}
                 <section className="border-t pt-3">

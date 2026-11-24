@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
 )
 
@@ -46,6 +47,8 @@ type runState struct {
 	HeartbeatAt      time.Time
 	LastEventAt      time.Time
 	LastOutputAt     time.Time
+	LastHighValueAt  time.Time
+	StartedAt        time.Time
 	CycleStart       time.Time
 	CycleNo          int
 	AutoCyclesUsed   int
@@ -58,11 +61,26 @@ type runState struct {
 	Facts            int
 	Assets           int
 	Findings         int
+	ToolCalls        int
+	InputTokens      int
+	OutputTokens     int
+	DuplicateActions int
+	ProgressEvents   []string
+	RouteID          int64
+	RouteKind        string
+	RoutePhase       string
+	RouteObjective   string
+	RouteBudget      db.RouteBudget
+	RouteUsedBase    db.RouteBudgetUsed
 	ProviderError    string
 	SlowPathClass    string
 	SlowPathSummary  string
 	SlowPathEvidence []string
 	SlowPathCycle    int
+	pendingTool      string
+	pendingInput     string
+	lastSignature    string
+	lastSigCount     int
 	dirty            bool
 	finishNotified   bool // the finish hook ran once for this run
 }
@@ -70,32 +88,45 @@ type runState struct {
 // RunSnapshot is a copy of one run at a point in time. The Fast Path, API and
 // termination result all read this shape instead of touching the live state.
 type RunSnapshot struct {
-	TaskID           string    `json:"task_id"`
-	IntentID         int64     `json:"intent_id"`
-	RunID            string    `json:"run_id"`
-	WorkerName       string    `json:"worker_name"`
-	Phase            string    `json:"phase"`
-	PhaseStartedAt   time.Time `json:"phase_started_at"`
-	HeartbeatAt      time.Time `json:"heartbeat_at"`
-	LastEventAt      time.Time `json:"last_event_at"`
-	LastOutputAt     time.Time `json:"last_output_at"`
-	CycleStart       time.Time `json:"cycle_start"`
-	CycleNo          int       `json:"cycle_no"`
-	AutoCyclesUsed   int       `json:"auto_cycles_used"`
-	PressureSent     bool      `json:"pressure_sent"`
-	SlowPathState    string    `json:"slow_path_state"`
-	DecisionState    string    `json:"decision_state"`
-	State            string    `json:"state"`
-	Tool             string    `json:"tool,omitempty"`
-	Facts            int       `json:"facts"`
-	Assets           int       `json:"assets"`
-	Findings         int       `json:"findings"`
-	ProviderError    string    `json:"provider_error,omitempty"`
-	SlowPathClass    string    `json:"slow_path_class,omitempty"`
-	SlowPathSummary  string    `json:"slow_path_summary,omitempty"`
-	SlowPathEvidence []string  `json:"slow_path_evidence,omitempty"`
-	SlowPathCycle    int       `json:"slow_path_cycle,omitempty"`
-	LeaseUntil       time.Time `json:"lease_until,omitempty"`
+	TaskID           string             `json:"task_id"`
+	IntentID         int64              `json:"intent_id"`
+	RunID            string             `json:"run_id"`
+	WorkerName       string             `json:"worker_name"`
+	Phase            string             `json:"phase"`
+	PhaseStartedAt   time.Time          `json:"phase_started_at"`
+	HeartbeatAt      time.Time          `json:"heartbeat_at"`
+	LastEventAt      time.Time          `json:"last_event_at"`
+	LastOutputAt     time.Time          `json:"last_output_at"`
+	LastHighValueAt  time.Time          `json:"last_high_value_at"`
+	StartedAt        time.Time          `json:"started_at"`
+	CycleStart       time.Time          `json:"cycle_start"`
+	CycleNo          int                `json:"cycle_no"`
+	AutoCyclesUsed   int                `json:"auto_cycles_used"`
+	PressureSent     bool               `json:"pressure_sent"`
+	SlowPathState    string             `json:"slow_path_state"`
+	DecisionState    string             `json:"decision_state"`
+	State            string             `json:"state"`
+	Tool             string             `json:"tool,omitempty"`
+	Facts            int                `json:"facts"`
+	Assets           int                `json:"assets"`
+	Findings         int                `json:"findings"`
+	ToolCalls        int                `json:"tool_calls"`
+	InputTokens      int                `json:"input_tokens"`
+	OutputTokens     int                `json:"output_tokens"`
+	DuplicateActions int                `json:"duplicate_actions"`
+	ProgressEvents   []string           `json:"progress_events,omitempty"`
+	RouteID          int64              `json:"route_id,omitempty"`
+	RouteKind        string             `json:"route_kind,omitempty"`
+	RoutePhase       string             `json:"route_phase,omitempty"`
+	RouteObjective   string             `json:"route_objective,omitempty"`
+	RouteBudget      db.RouteBudget     `json:"route_budget,omitempty"`
+	RouteUsedBase    db.RouteBudgetUsed `json:"route_used_base,omitempty"`
+	ProviderError    string             `json:"provider_error,omitempty"`
+	SlowPathClass    string             `json:"slow_path_class,omitempty"`
+	SlowPathSummary  string             `json:"slow_path_summary,omitempty"`
+	SlowPathEvidence []string           `json:"slow_path_evidence,omitempty"`
+	SlowPathCycle    int                `json:"slow_path_cycle,omitempty"`
+	LeaseUntil       time.Time          `json:"lease_until,omitempty"`
 }
 
 func (r *runState) snapshot() RunSnapshot {
@@ -103,11 +134,17 @@ func (r *runState) snapshot() RunSnapshot {
 	return RunSnapshot{
 		TaskID: r.TaskID, IntentID: r.IntentID, RunID: r.RunID, WorkerName: r.WorkerName,
 		Phase: r.Phase, PhaseStartedAt: r.PhaseStartedAt, HeartbeatAt: r.HeartbeatAt,
-		LastEventAt: r.LastEventAt, LastOutputAt: r.LastOutputAt, CycleStart: r.CycleStart,
+		LastEventAt: r.LastEventAt, LastOutputAt: r.LastOutputAt, LastHighValueAt: r.LastHighValueAt,
+		StartedAt: r.StartedAt, CycleStart: r.CycleStart,
 		CycleNo: r.CycleNo, AutoCyclesUsed: r.AutoCyclesUsed,
 		PressureSent: r.PressureSent, SlowPathState: r.SlowPathState,
 		DecisionState: r.DecisionState, State: r.State, Tool: r.Tool,
 		Facts: r.Facts, Assets: r.Assets, Findings: r.Findings,
+		ToolCalls: r.ToolCalls, InputTokens: r.InputTokens, OutputTokens: r.OutputTokens,
+		DuplicateActions: r.DuplicateActions,
+		ProgressEvents:   append([]string(nil), r.ProgressEvents...),
+		RouteID:          r.RouteID, RouteKind: r.RouteKind, RoutePhase: r.RoutePhase,
+		RouteObjective: r.RouteObjective, RouteBudget: r.RouteBudget, RouteUsedBase: r.RouteUsedBase,
 		ProviderError: r.ProviderError, SlowPathClass: r.SlowPathClass,
 		SlowPathSummary: r.SlowPathSummary, SlowPathEvidence: evidence,
 		SlowPathCycle: r.SlowPathCycle, LeaseUntil: r.LeaseUntil,
@@ -140,7 +177,7 @@ func (m *RunMonitor) Register(taskID string, intentID int64, runID, workerName s
 	state := &runState{
 		TaskID: taskID, IntentID: intentID, RunID: runID, WorkerName: workerName,
 		Phase: db.WorkerRunPhaseIdle, PhaseStartedAt: now, HeartbeatAt: now,
-		LastEventAt: now, CycleStart: now, CycleNo: 0,
+		LastEventAt: now, StartedAt: now, CycleStart: now, CycleNo: 0,
 		SlowPathState: db.SlowPathNone, DecisionState: db.WatchdogDecisionNone,
 		LeaseUntil: now.Add(runMonitorLease), State: db.WorkerRunStateRunning,
 		dirty: true,
@@ -154,6 +191,26 @@ func (m *RunMonitor) Register(taskID string, intentID int64, runID, workerName s
 }
 
 const runMonitorLease = 30 * time.Second
+
+// SetRoute attaches the intent's route identity and the cumulative budget already
+// consumed by earlier runs on the same route. Fast Path reads this without a DB
+// query every 5 seconds; the checkpoint remains the durable source.
+func (m *RunMonitor) SetRoute(runID string, route db.IntentRoute) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if r := m.runs[runID]; r != nil {
+		r.RouteID = route.RouteID
+		r.RouteKind = route.RouteKind
+		r.RoutePhase = route.PathPhase
+		r.RouteObjective = route.Objective
+		r.RouteBudget = route.Budget
+		r.RouteUsedBase = route.BudgetUsed
+		r.dirty = true
+	}
+	m.mu.Unlock()
+}
 
 // HeartbeatTask refreshes the heartbeat for every live run of a task. The worker
 // loop calls it on each iteration, so a long tool call still proves the worker
@@ -228,6 +285,16 @@ func (m *RunMonitor) Observe(runID string, a db.Activity) {
 	case "tool_use":
 		r.Phase, r.Tool, r.PhaseStartedAt = db.WorkerRunPhaseTool, a.Tool, now
 		r.LastEventAt = now
+		r.ToolCalls++
+		r.pendingTool, r.pendingInput = a.Tool, a.Detail
+		sig := a.Tool + "\x00" + firstLine(a.Detail, 4096)
+		if sig == r.lastSignature {
+			r.lastSigCount++
+			r.DuplicateActions++
+			m.appendProgressLocked(r, "duplicate_action")
+		} else {
+			r.lastSignature, r.lastSigCount = sig, 1
+		}
 		r.dirty = true
 	case "tool_result":
 		r.Phase, r.Tool, r.PhaseStartedAt = db.WorkerRunPhaseLLM, "", now
@@ -236,13 +303,33 @@ func (m *RunMonitor) Observe(runID string, a db.Activity) {
 			switch a.Tool {
 			case "record_fact":
 				r.Facts++
+				factType := agent.FactTypeFromInput(json.RawMessage(r.pendingInput))
+				event := progressEventFromInput(json.RawMessage(r.pendingInput))
+				if event == "" {
+					switch factType {
+					case db.FactTypeObservation:
+						event = "observation"
+					case db.FactTypeClaim:
+						event = "new_claim"
+					case db.FactTypeHypothesis:
+						event = "hypothesis"
+					case db.FactTypeFindingCandidate:
+						event = "new_claim"
+					}
+				}
 				m.markOutputLocked(r, now)
-				if hadControl {
-					reset = m.cycleResetSnapshot(r)
+				if event != "" {
+					m.appendProgressLocked(r, event)
+				}
+				if agent.IsHighValueProgress(event) {
+					m.markHighValueLocked(r, now)
+					if hadControl {
+						reset = m.cycleResetSnapshot(r)
+					}
 				}
 			case "insert_assets":
 				// 一次调用可以批量登记多条资产；结果里的 results 数组长度才是
-				// 本次实际写入量。解析失败时按一次调用计 1，仍算有效写入。
+				// 本次实际写入量。解析失败时按一次调用计 1。
 				count := 1
 				var out struct {
 					Results []json.RawMessage `json:"results"`
@@ -252,29 +339,37 @@ func (m *RunMonitor) Observe(runID string, a db.Activity) {
 				}
 				r.Assets += count
 				m.markOutputLocked(r, now)
-				if hadControl {
-					reset = m.cycleResetSnapshot(r)
-				}
+				m.appendProgressLocked(r, "new_asset")
 			case "report_finding":
 				r.Findings++
 				m.markOutputLocked(r, now)
+				m.appendProgressLocked(r, "finding_written")
+				m.markHighValueLocked(r, now)
 				if hadControl {
 					reset = m.cycleResetSnapshot(r)
 				}
 			}
 		}
+		r.pendingTool, r.pendingInput = "", ""
 	case "thinking", "text":
 		r.Phase, r.Tool, r.PhaseStartedAt = db.WorkerRunPhaseLLM, "", now
 		r.LastEventAt = now
 		r.dirty = true
-	case "result":
-		r.Phase, r.Tool, r.PhaseStartedAt = db.WorkerRunPhaseSettling, "", now
+	case "usage", "result":
+		// Usage frames are cumulative for the run; keep the latest frame instead of
+		// summing them. A result frame also closes the current phase.
+		if a.Kind == "result" {
+			r.Phase, r.Tool, r.PhaseStartedAt = db.WorkerRunPhaseSettling, "", now
+		}
+		if a.InputTokens != nil {
+			r.InputTokens = *a.InputTokens
+		}
+		if a.OutputTokens != nil {
+			r.OutputTokens = *a.OutputTokens
+		}
 		r.LastEventAt = now
 		if !a.IsError {
 			m.markOutputLocked(r, now)
-			if hadControl {
-				reset = m.cycleResetSnapshot(r)
-			}
 		}
 	case "intercept_request":
 		r.Phase, r.Tool, r.PhaseStartedAt = db.WorkerRunPhaseApproval, "", now
@@ -293,12 +388,52 @@ func (m *RunMonitor) Observe(runID string, a db.Activity) {
 	}
 }
 
-// markOutputLocked records an effective write. It resets only the current
-// cycle; AutoCyclesUsed is a run-wide budget and must survive every cycle reset.
+// markOutputLocked records a write without restoring the observation timer.
+// Ordinary facts and assets are useful output, but only a high-value ProgressEvent
+// (validated weakness, privilege change, objective milestone, finding) resets the
+// cycle. AutoCyclesUsed remains a run-wide budget and survives every reset.
 func (m *RunMonitor) markOutputLocked(r *runState, now time.Time) {
 	r.LastOutputAt = now
+	r.dirty = true
+}
+
+func (m *RunMonitor) markHighValueLocked(r *runState, now time.Time) {
+	r.LastOutputAt = now
+	r.LastHighValueAt = now
 	m.resetCycleLocked(r, now)
 	r.dirty = true
+}
+
+func (m *RunMonitor) appendProgressLocked(r *runState, event string) {
+	if event == "" {
+		return
+	}
+	r.ProgressEvents = append(r.ProgressEvents, event)
+	if len(r.ProgressEvents) > 20 {
+		r.ProgressEvents = r.ProgressEvents[len(r.ProgressEvents)-20:]
+	}
+	r.dirty = true
+}
+
+func progressEventFromInput(raw json.RawMessage) string {
+	var a struct {
+		ProgressEvent string `json:"progress_event"`
+		Facts         []struct {
+			ProgressEvent string `json:"progress_event"`
+		} `json:"facts"`
+	}
+	if json.Unmarshal(raw, &a) != nil {
+		return ""
+	}
+	if a.ProgressEvent != "" {
+		return a.ProgressEvent
+	}
+	for _, f := range a.Facts {
+		if f.ProgressEvent != "" {
+			return f.ProgressEvent
+		}
+	}
+	return ""
 }
 
 func (m *RunMonitor) resetCycleLocked(r *runState, now time.Time) {

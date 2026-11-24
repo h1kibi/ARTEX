@@ -328,6 +328,131 @@ export interface CoverageAssetRefs {
   intents: CoverageAssetRef[];
   facts: CoverageAssetRef[];
   findings: CoverageAssetRef[];
+  routes?: { route_id: number; phase?: string; objective?: string }[];
+}
+
+// ---- Route / Information / Evidence views ----
+export interface RouteBudget {
+  max_tool_calls?: number;
+  max_input_tokens?: number;
+  max_wall_seconds?: number;
+}
+export interface RouteBudgetUsed {
+  tool_calls?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  wall_ms?: number;
+}
+export interface RouteIntent {
+  id: string;
+  summary: string;
+  state: string;
+  origin?: string;
+  phase?: string;
+  asset_ids?: number[];
+  worker_seconds: number;
+  worker_runs: number;
+  checkpoint_fact_id?: number;
+  terminal_reason?: string;
+  delete_reason?: string;
+  created_at: string;
+}
+export interface RouteCheckpoint {
+  id: string;
+  route_id: number;
+  intent_id?: number;
+  run_id?: string;
+  path_phase?: string;
+  summary: string;
+  settlement_reason?: string;
+  confirmed_claim_ids?: number[];
+  open_hypothesis_ids?: number[];
+  finding_ids?: number[];
+  evidence_refs?: string[];
+  attempted_actions?: string[];
+  next_actions?: string[];
+  budget_used: RouteBudgetUsed;
+  created_at: string;
+}
+export interface RouteFinding {
+  id: string;
+  finding_id?: string;
+  summary: string;
+  severity?: string;
+  vulnclass?: string;
+  state: string;
+  evidence_refs?: string[];
+  traffic_count?: number;
+}
+export interface TaskRoute {
+  route_id: number;
+  route_kind?: string;
+  objective?: string;
+  phase?: string;
+  success_condition?: string;
+  expected_evidence?: string[];
+  status: "proposed" | "active" | "succeeded" | "blocked" | "exhausted" | "paused" | "stopped" | "superseded" | string;
+  budget?: RouteBudget;
+  budget_used: RouteBudgetUsed;
+  intent_count: number;
+  active_intents: number;
+  asset_ids?: number[];
+  intents: RouteIntent[];
+  checkpoints: RouteCheckpoint[];
+  findings: RouteFinding[];
+  created_at: string;
+}
+export interface RoutesResponse {
+  routes: TaskRoute[];
+}
+export interface InformationNode {
+  id: string;
+  kind: "fact" | "finding";
+  fact_type: string;
+  summary: string;
+  detail?: string;
+  confidence?: string;
+  state?: string;
+  validation_state?: string;
+  evidence_refs?: string[];
+  source_activity_ids?: number[];
+  claim_ids?: number[];
+  hypothesis_ids?: number[];
+  route_id?: number;
+  intent_id?: number;
+  run_id?: string;
+  observed_at?: string;
+  valid_until?: string;
+  sensitivity?: string;
+  inheritance_policy?: string;
+  expired?: boolean;
+  origin?: string;
+  severity?: string;
+  vulnclass?: string;
+  finding_id?: string;
+  inherited?: boolean;
+  source_task_id?: string;
+  created_at: string;
+}
+export interface InformationResponse {
+  nodes: InformationNode[];
+  total: number;
+  counts: Record<string, number>;
+  truncated: boolean;
+}
+export interface EvidenceRef {
+  ref: string;
+  kind: string;
+  id: string;
+  available?: boolean;
+  source_node_ids: number[];
+  source_kinds?: string[];
+  evidence_versions?: number[];
+  snapshot_ids?: string[];
+}
+export interface EvidenceResponse {
+  refs: EvidenceRef[];
+  traffic_enabled: boolean;
 }
 
 // ---- Workspace file manager (workDir) ----

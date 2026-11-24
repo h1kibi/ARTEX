@@ -397,6 +397,18 @@ flowchart LR
 
 > 分工：**planner** 读探索图态势、判目标、只在有未覆盖的新方向时派**意图**进 frontier；**worker** 领**一条意图**、用真实工具执行、把新资产/事实/漏洞写回两图后即停。资产图是共享事实，探索图是每任务的推进链。
 
+#### 逻辑视图：Route / Information / Evidence
+
+在现有双图之上提供三个只读逻辑视图，不复制正文：
+
+- **Route Graph**：意图 payload 带 `route_id / phase / objective / success_condition / budget`。新意图的 `route_id` 等于自身 id；`continuation_of` 继承同一 route、剩余预算和最近 checkpoint。Checkpoint 是 `fact_type=checkpoint` 的 fact，记录确认 claim、未解决 hypothesis、证据引用、已尝试动作、下一步和累计预算。续跑 Worker 启动时会把前序 Checkpoint 的结论、已尝试动作和下一步直接内联进系统提示，不需要重新探测上一阶段已排除的路径。
+- **预算与状态不变量**：预算是**整条路线累计**，不是单 Run。新路线省略 budget 时默认 `max_tool_calls=240`、`max_input_tokens=1200000`。接续时 `add_intent` 从最新 checkpoint 读取已用量：若某维度已耗尽，必须显式传更大的 `budget` 才允许继续，否则直接拒绝。Run 结束写回 checkpoint 后，即使 Watchdog 关闭，累计预算耗尽也会把意图标记为 `exhausted`——不再依赖 Fast Path 才能止损。Route 状态只由意图状态投影：`running` 才是「进行中」，`open` 为待执行，`paused/stopped/superseded` 分别展示，不新增并行状态机。
+- **Checkpoint 原子性**：checkpoint fact、`intent -> checkpoint` 边、前一 checkpoint 血缘和意图的 `checkpoint_fact_id/route_budget_used` 在同一事务提交，规划者和重试 Run 不会读到半套状态。
+- **Information Graph**：fact payload 的 `fact_type` 区分 `observation / claim / hypothesis / decision / finding_candidate`；历史 fact 没有该字段时读取为 `legacy_unknown`。确认漏洞仍只写入 `findings` 表。`/information` 的总数与分类计数由 SQL 对全图统计，分页只截断列表并返回 `truncated`；`include_sources=1` 合并来源任务，按有效期、敏感性和继承策略过滤。
+- **Evidence Layer**：checkpoint、claim、finding 只保存 `traffic:<id>`、`artifact:<path>`、`activity:<id>` 等引用和摘要，原始材料仍由流量记录、`evidence.Store`、activity detail 和工作目录保存。写入时校验 `activity/node/finding` 是否存在；`artifact` 必须是当前任务工作目录内真实存在的文件。查询视图展示引用可用性、finding 的流量绑定数量与快照版本、继承来源；`report_finding(traffic_refs=...)` 绑定的流量会合并进 `/evidence`，即使节点 payload 没有 `evidence_refs`。
+
+任务详情的「情报」页分别展示路线、信息类型和证据引用；`GET /api/tasks/{id}/routes`、`/information`、`/evidence` 返回同样的查询视图。资产覆盖图抽屉会显示该资产关联的路线。
+
 ### 引擎与意图生命周期（一次探索的闭环）
 
 引擎是**事件驱动**的闭环：图一变就唤醒 planner，planner 派意图，worker 领意图执行并写回，写回又触发下一轮——直到目标被证明（`prove_goal`）。

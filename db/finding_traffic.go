@@ -329,6 +329,9 @@ type RecordFindingInput struct {
 	TaskID, ExplorationID, IntentID                      int64
 	VulnClass, Name, Severity, Summary, Evidence, Worker string
 	AssetIDs                                             []int64
+	EvidenceRefs                                         []string
+	RouteID                                              int64
+	RunID                                                string
 }
 
 type RecordedFinding struct {
@@ -361,7 +364,20 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 			return nil, errors.New("intent_id 必须是本任务的意图（关联任务意图只读）")
 		}
 	}
-	payload, _ := json.Marshal(map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}})
+	payloadMap := map[string]any{"vulnclass": in.VulnClass, "name": in.Name, "severity": in.Severity, "summary": in.Summary, "evidence": map[string]any{"by": in.Worker, "poc": in.Evidence}}
+	if len(in.EvidenceRefs) > 0 {
+		payloadMap["evidence_refs"] = in.EvidenceRefs
+	}
+	if in.RouteID > 0 {
+		payloadMap["route_id"] = in.RouteID
+	}
+	if in.IntentID > 0 {
+		payloadMap["intent_id"] = in.IntentID
+	}
+	if in.RunID != "" {
+		payloadMap["run_id"] = in.RunID
+	}
+	payload, _ := json.Marshal(payloadMap)
 	out := &RecordedFinding{}
 	if err := tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
 VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string(payload), in.Worker).Scan(&out.NodeID); err != nil {
@@ -417,6 +433,43 @@ func (s *ExplorationStore) RecordFinding(ctx context.Context, in RecordFindingIn
 func (d *DB) FindingIDByNodeID(nodeID int64) (id int64, err error) {
 	err = d.QueryRow(`SELECT id FROM findings WHERE node_id=$1`, nodeID).Scan(&id)
 	return
+}
+
+// BoundTrafficRef is one finding_traffic_bindings row projected for the read-only
+// Evidence view. The binding itself stores no traffic id; the snapshot does.
+type BoundTrafficRef struct {
+	NodeID          int64
+	FindingID       int64
+	TrafficID       string
+	SnapshotID      string
+	EvidenceVersion int64
+}
+
+// FindingTrafficRefs lists every traffic binding attached to a finding node in
+// this exploration. report_finding stores refs in findings/traffic tables, not
+// in payload.evidence_refs, so the Evidence view needs this separate query.
+func (s *ExplorationStore) FindingTrafficRefs() ([]BoundTrafficRef, error) {
+	rows, err := s.db.Query(`SELECT f.node_id, f.id, COALESCE(s.source_traffic_id,''), b.snapshot_id,
+       COALESCE(f.evidence_version, 0)
+FROM findings f
+JOIN exploration_nodes n ON n.id = f.node_id AND n.exploration_id = $1
+JOIN finding_traffic_bindings b ON b.finding_id = f.id
+JOIN traffic_evidence_snapshots s ON s.id = b.snapshot_id
+WHERE COALESCE(s.source_traffic_id,'') <> ''
+ORDER BY f.node_id, b.position, b.id`, s.expID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []BoundTrafficRef{}
+	for rows.Next() {
+		var r BoundTrafficRef
+		if err := rows.Scan(&r.NodeID, &r.FindingID, &r.TrafficID, &r.SnapshotID, &r.EvidenceVersion); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // PopulateFindingTrafficIDs only enriches already-visible nodes. It performs no

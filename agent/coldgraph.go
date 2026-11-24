@@ -24,9 +24,12 @@ import (
 
 // cgNode is the minimal node view the cold-graph algorithms need.
 type cgNode struct {
-	ID    int64
-	Kind  string
-	State string
+	ID        int64
+	Kind      string
+	State     string
+	FactType  string
+	RouteID   int64
+	Protected bool // active-route checkpoint: never fold while its route is live
 }
 
 // cgEdge is one exploration edge (From = parent/upstream, To = child/downstream).
@@ -96,6 +99,17 @@ func isLiveIntent(n cgNode) bool {
 // only fact and settled intent; finding/goal/hint/begin/digest never fold).
 func foldableKind(k string) bool { return k == db.KindIntent || k == db.KindFact }
 
+// foldableNode adds the route rule: an active Route's checkpoint is the handoff
+// source for the next Planner round and stays hot. A settled route's older
+// checkpoints may fold like any other fact; their references survive in the
+// digest payload.
+func foldableNode(n cgNode) bool {
+	if n.Protected {
+		return false
+	}
+	return foldableKind(n.Kind)
+}
+
 // hotSet computes the hot nodes (§2 rule 1+2): a node is hot iff it can reach a
 // live intent by going downstream (it is an ancestor of a live intent), OR it is
 // a live intent, OR it is a direct child of a live intent (rule 1: an open/
@@ -106,7 +120,7 @@ func (g *coldGraph) hotSet() map[int64]bool {
 	hot := map[int64]bool{}
 	var stack []int64
 	for _, n := range g.nodes {
-		if isLiveIntent(n) {
+		if isLiveIntent(n) || n.Protected {
 			stack = append(stack, n.ID)
 		}
 	}
@@ -136,7 +150,7 @@ func (g *coldGraph) hotSet() map[int64]bool {
 func (g *coldGraph) structuralCold(hot map[int64]bool) map[int64]bool {
 	cold := map[int64]bool{}
 	for id, n := range g.nodes {
-		if foldableKind(n.Kind) && !hot[id] {
+		if foldableNode(n) && !hot[id] {
 			cold[id] = true
 		}
 	}

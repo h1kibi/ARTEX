@@ -19,6 +19,8 @@ type RunInfo struct {
 	TaskID        int64  // task registry id; 0 for non-task runs (chat sessions)
 	ExplorationID int64  // exploration id; 0 when unknown
 	IntentID      int64  // worker's intent node; 0 for planner/mainagent/chat
+	RunID         string // current worker run id; empty for planner/mainagent/chat
+	RouteID       int64  // route id carried by the intent; 0 when absent
 	SessionID     string // chat conversation id; empty for task runs
 }
 

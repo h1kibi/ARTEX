@@ -379,21 +379,6 @@ RETURNING COALESCE((n.payload->>'retry_count')::int, 0)`,
 	return retryCount, true, nil
 }
 
-// ReopenBlockedIntents flips EVERY 'blocked' intent in this exploration back to 'open'
-// (batch rerun after e.g. an LLM/network outage that blocked many at once). Returns the
-// number reopened. Workers resume from their transcripts; kept graph writes remain.
-func (s *ExplorationStore) ReopenBlockedIntents() (int64, error) {
-	res, err := s.db.Exec(`UPDATE exploration_nodes
-SET state='open', completed_at=NULL, blocked_reason=NULL, terminal_reason=NULL,
-    payload=payload - 'retry_count'
-WHERE exploration_id=$1 AND kind='intent' AND state='blocked'`, s.expID)
-	if err != nil {
-		return 0, err
-	}
-	n, _ := res.RowsAffected()
-	return n, nil
-}
-
 func (s *ExplorationStore) SetIntentState(id int64, state string) error {
 	// terminal states stamp completed_at; reopening (back to open/running) clears it.
 	terminal := IsTerminalIntentState(state)
@@ -548,6 +533,16 @@ func (s *ExplorationStore) CancelIntent(id int64) (IntentCleanup, error) {
 	nrows.Close()
 	if err := nrows.Err(); err != nil {
 		return out, err
+	}
+	// A Claim / Hypothesis / Finding referenced by a checkpoint, candidate or
+	// decision remains readable even when the intent that produced it is removed.
+	// The reference is a protection set; it never creates a second fact source.
+	referenced, err := s.referencedNodeIDsTx(tx)
+	if err != nil {
+		return out, err
+	}
+	for id := range referenced {
+		protected[id] = true
 	}
 
 	parentsOf := map[int64][]int64{} // dst -> 所有指向它的边的 src(任意 rel,含 covers:被 digest 覆盖的成员因此有 digest 父而被保留)
