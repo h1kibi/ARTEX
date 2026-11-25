@@ -542,9 +542,31 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
   const [error, setError] = React.useState("");
   const [reloadTick, setReloadTick] = React.useState(0);
 
+  // A response from a previous task/filter must never overwrite the current
+  // view. currentTaskRef flips during render; infoSeq invalidates older
+  // information requests when the route/type filter changes quickly.
+  const currentTaskRef = React.useRef(taskId);
+  currentTaskRef.current = taskId;
+  const infoSeqRef = React.useRef(0);
+  const endpointErrors = React.useRef<Record<string, string>>({});
+  const syncError = React.useCallback(() => {
+    setError(Object.values(endpointErrors.current).join("；"));
+  }, []);
+  const markError = React.useCallback((key: string, err: unknown) => {
+    endpointErrors.current[key] = err instanceof Error ? err.message : "情报数据加载失败";
+    syncError();
+  }, [syncError]);
+  const clearEndpointError = React.useCallback((key: string) => {
+    if (!endpointErrors.current[key]) return;
+    delete endpointErrors.current[key];
+    syncError();
+  }, [syncError]);
+
   // Switching task must not keep the previous task's selected route/filter or
   // stale data; reset before the new load.
   React.useEffect(() => {
+    infoSeqRef.current++;
+    endpointErrors.current = {};
     setRoutes([]);
     setInformation(null);
     setSummary(null);
@@ -557,56 +579,65 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
     setLoading(true);
   }, [taskId]);
 
-  const fail = React.useCallback((err: unknown) => {
-    setError(err instanceof Error ? err.message : "情报数据加载失败");
-  }, []);
-
   const loadRoutes = React.useCallback(async () => {
     try {
       const r = await api.taskRoutes(taskId);
+      if (currentTaskRef.current !== taskId) return;
       setRoutes(r.routes ?? []);
       // Only the route-tab detail selection defaults to the first route.
       setSelectedRouteID((current) => current ?? r.routes?.[0]?.route_id ?? null);
+      clearEndpointError("routes");
     } catch (err) {
-      fail(err);
+      if (currentTaskRef.current === taskId) markError("routes", err);
     }
-  }, [taskId, fail]);
+  }, [taskId, markError, clearEndpointError]);
 
   const loadInformation = React.useCallback(async () => {
+    const seq = ++infoSeqRef.current;
     try {
       const i = await api.taskInformation(taskId, {
         type: typeFilter === "all" ? undefined : typeFilter,
         routeId: infoRouteID ?? undefined,
         includeSources: true,
       });
+      if (currentTaskRef.current !== taskId || seq !== infoSeqRef.current) return;
       setInformation(i);
+      clearEndpointError("information");
     } catch (err) {
-      fail(err);
+      if (currentTaskRef.current === taskId && seq === infoSeqRef.current) {
+        markError("information", err);
+      }
     }
-  }, [taskId, typeFilter, infoRouteID, fail]);
+  }, [taskId, typeFilter, infoRouteID, markError, clearEndpointError]);
 
   const loadEvidence = React.useCallback(async () => {
     try {
       const e = await api.taskEvidence(taskId, { includeSources: true });
+      if (currentTaskRef.current !== taskId) return;
       setEvidence(e);
+      clearEndpointError("evidence");
     } catch (err) {
-      fail(err);
+      if (currentTaskRef.current === taskId) markError("evidence", err);
     }
-  }, [taskId, fail]);
+  }, [taskId, markError, clearEndpointError]);
 
   // Top stat cards stay task-wide even when the information list is filtered to
   // one route. limit=1 keeps this cheap: the response still carries exact counts.
   const loadSummary = React.useCallback(async () => {
     try {
-      setSummary(await api.taskInformation(taskId, { includeSources: true, limit: 1 }));
+      const s = await api.taskInformation(taskId, { includeSources: true, limit: 1 });
+      if (currentTaskRef.current !== taskId) return;
+      setSummary(s);
+      clearEndpointError("summary");
     } catch (err) {
-      fail(err);
+      if (currentTaskRef.current === taskId) markError("summary", err);
     }
-  }, [taskId, fail]);
+  }, [taskId, markError, clearEndpointError]);
 
   // Base snapshot (routes + evidence + task-wide totals) loads only on task/retry
   // changes; type and route filters never re-fetch these.
   React.useEffect(() => {
+    endpointErrors.current = {};
     setError("");
     setLoading(true);
     void Promise.allSettled([loadRoutes(), loadEvidence(), loadSummary()]).finally(() => setLoading(false));
@@ -760,7 +791,7 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
                   onClick={() => setTypeFilter("all")}
                   label={`全部 ${filterTotal}`}
                 />
-                {TYPE_ORDER.filter((type) => (filterCounts[type] ?? 0) > 0).map((type) => (
+                {TYPE_ORDER.filter((type) => (filterCounts[type] ?? 0) > 0 || typeFilter === type).map((type) => (
                   <FilterChip
                     key={type}
                     active={typeFilter === type}

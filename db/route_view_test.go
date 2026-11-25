@@ -68,4 +68,11 @@ func TestRouteIDsForAssetIncludesImplicitRouteID(t *testing.T) {
 	if len(ids) != 1 || ids[0] != intentID {
 		t.Fatalf("RouteIDsForAsset=%v want [%d]", ids, intentID)
 	}
+	active, err := store.ActiveIntentForRoute(intentID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active == nil || active.ID != intentID {
+		t.Fatalf("ActiveIntentForRoute=%+v want #%d", active, intentID)
+	}
 }

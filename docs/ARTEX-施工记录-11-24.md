@@ -103,6 +103,8 @@
 - **证明/锚点**：只接受 observation/claim/legacy 与 confirmed finding；拦截 hypothesis/decision/candidate/checkpoint、过期和不可继承节点。
 - **派生血缘**：add_intent 使用独立锚点规则，允许 open/supported hypothesis、pending candidate、decision；prove_goal 仍保持严格证明门槛。
 - **情报页**：intent/severity/finding 使用全局 StatusBadge；错误条用 Alert；统计卡固定任务级并复用总览排版；信息图类型计数随路线筛选。
+- **播报板**：checkpoint 使用 summary 字段，不再渲染整段 JSON。
+- **异步与细节**：情报页丢弃过期任务/筛选响应，接口成功后自动清除错误；当前类型筛选不被隐藏；finding 补 dismissed 中文标签；ActiveIntentForRoute 兼容隐式 route_id；来源信息页 truncated 标志向上传递。
 
 ## 2. 迁移和兼容
 

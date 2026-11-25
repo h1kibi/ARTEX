@@ -156,6 +156,7 @@ const SUMMARY_FIELDS: Record<string, string[]> = {
   goal: ["text"],
   intent: ["summary"],
   fact: ["summary"],
+  checkpoint: ["summary"],
   finding: ["name", "summary"],
   hint: ["text", "summary"],
   digest: ["body", "summary"],

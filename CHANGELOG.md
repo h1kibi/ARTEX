@@ -42,6 +42,10 @@
 - **证明与锚点门槛**：`prove_goal` 与 `add_intent.parent_ids` 只接受 observation/claim（或 legacy）与 confirmed finding；hypothesis/decision/candidate/checkpoint、origin、过期事实、不可继承来源事实均被拒绝。
 - **派生血缘回调**：`add_intent.parent_ids` 与 `prove_goal` 拆分为两套门槛；意图可派生自 open/supported hypothesis、pending candidate 与 decision，只拦 checkpoint/origin/rejected/expired/不可继承节点，恢复“从候选生成验证意图”的正向链路。
 - **情报页统计口径**：顶部统计卡固定全任务 counts；信息图内的类型筛选按钮改用当前路线筛选后的 `information.counts/total`，不再出现按钮数字与列表条数不一致。
+- **播报板检查点摘要**：`SUMMARY_FIELDS` 补 `checkpoint: ["summary"]`，时间线不再把整段 checkpoint JSON 当标题。
+- **情报页异步守卫**：任务切换/筛选快速变化时丢弃过期响应；错误按接口记录，轮询恢复成功后自动清除。
+- **筛选与状态细节**：当前选中的类型筛选始终保留按钮；finding 域补 `dismissed=已排除`，不再回退英文。
+- **路线串行锁与截断**：`ActiveIntentForRoute` 兼容隐式 `route_id`；关联任务节点超过 2000 条时 `truncated` 标志向上传递。
 - **情报页一致性**：子意图/漏洞改用 `StatusBadge`；错误条复用 `Alert`；顶部统计固定为全任务口径（信息图路线筛选不再影响统计卡）；统计卡改用与总览页相同的 CardHeader/tabular-nums 排版。
 - **多阶段路线终态被首阶段 done 掩盖**：`/routes` 改由最新非删除意图决定状态（done 不再压过后续 blocked/exhausted/stopped），并按 `running/paused/open` 映射 active/paused/proposed。
 - **人工重跑绕过预算耗尽保护**：单条与批量 rerun 在重开前检查路线累计预算；已耗尽时返回 409，提示改用扩容的 continuation，不再让 Worker 在下一个 Fast Path tick 被立即再次终止。

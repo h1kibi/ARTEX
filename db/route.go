@@ -379,7 +379,8 @@ func (s *ExplorationStore) ActiveIntentForRoute(routeID int64) (*Node, error) {
 	}
 	n, err := scanNode(s.db.QueryRow(`SELECT `+nodeCols+` FROM exploration_nodes
 WHERE exploration_id=$1 AND kind='intent'
-  AND payload->>'route_id'=$2 AND state IN ('open','running','paused')
+  AND COALESCE(NULLIF(payload->>'route_id',''), id::text) = $2
+  AND state IN ('open','running','paused')
 ORDER BY id LIMIT 1`, s.expID, fmt.Sprint(routeID)))
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -625,10 +626,11 @@ func (s *ExplorationStore) InformationQueryWithSources(factType string, routeID 
 	}
 	now := time.Now()
 	for _, src := range sources {
-		srcNodes, _, err := src.Store.InformationNodesPage("", 0, 2000)
+		srcNodes, srcTruncated, err := src.Store.InformationNodesPage("", 0, 2000)
 		if err != nil {
 			return nil, nil, 0, false, err
 		}
+		truncated = truncated || srcTruncated
 		for _, n := range srcNodes {
 			if n.Kind == KindFact {
 				if ok, _ := CanInheritFact(n, now); !ok {

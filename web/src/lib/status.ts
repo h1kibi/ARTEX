@@ -70,6 +70,7 @@ const finding: Record<string, StatusMeta> = {
   resolved: { label: "已处理", tone: "green" },
   fixed: { label: "已修复", tone: "green" },
   false_positive: { label: "误报", tone: "slate" },
+  dismissed: { label: "已排除", tone: "slate" },
   ignored: { label: "忽略", tone: "neutral" },
   duplicate: { label: "重复", tone: "neutral" },
   risk_accepted: { label: "风险接受", tone: "violet" },
