@@ -101,7 +101,8 @@
 - **工程卫生**：`.gitattributes` 统一 LF；11-24 三份文档取消忽略。
 - **资产抽屉**：来源 fact 按 `CanInheritFact` 过滤，checkpoint/origin 不再作为关联事实。
 - **证明/锚点**：只接受 observation/claim/legacy 与 confirmed finding；拦截 hypothesis/decision/candidate/checkpoint、过期和不可继承节点。
-- **情报页**：intent/severity/finding 使用全局 StatusBadge；错误条用 Alert；统计卡固定任务级并复用总览排版。
+- **派生血缘**：add_intent 使用独立锚点规则，允许 open/supported hypothesis、pending candidate、decision；prove_goal 仍保持严格证明门槛。
+- **情报页**：intent/severity/finding 使用全局 StatusBadge；错误条用 Alert；统计卡固定任务级并复用总览排版；信息图类型计数随路线筛选。
 
 ## 2. 迁移和兼容
 

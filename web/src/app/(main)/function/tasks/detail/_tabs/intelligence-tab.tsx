@@ -630,8 +630,11 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
 
   const selected = routes.find((route) => route.route_id === selectedRouteID) ?? routes[0] ?? null;
   const nodes = information?.nodes ?? [];
-  const counts = (summary ?? information)?.counts ?? {};
-  const taskTotal = summary?.total ?? information?.total ?? 0;
+  // Top cards always use task-wide totals; the Information card's filter chips
+  // use the response's route-scoped counts so labels match the visible list.
+  const summaryCounts = (summary ?? information)?.counts ?? {};
+  const filterCounts = information?.counts ?? {};
+  const filterTotal = information?.total ?? 0;
   const totalEvidence = evidence?.refs.length ?? 0;
   const missingEvidence = evidence?.refs.filter((ref) => ref.available === false).length ?? 0;
 
@@ -657,13 +660,13 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
         <IntelStatCard
           icon={CheckCircle2Icon}
           label="Claim"
-          value={String(counts.claim ?? 0)}
-          hint={`观察 ${counts.observation ?? 0} · 假设 ${counts.hypothesis ?? 0}`}
+          value={String(summaryCounts.claim ?? 0)}
+          hint={`观察 ${summaryCounts.observation ?? 0} · 假设 ${summaryCounts.hypothesis ?? 0}`}
         />
         <IntelStatCard
           icon={AlertTriangleIcon}
           label="候选 / 确认漏洞"
-          value={`${counts.finding_candidate ?? 0} / ${counts.finding ?? 0}`}
+          value={`${summaryCounts.finding_candidate ?? 0} / ${summaryCounts.finding ?? 0}`}
           hint="Candidate 需人工或 Planner 复核"
         />
         <IntelStatCard
@@ -755,14 +758,14 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
                 <FilterChip
                   active={typeFilter === "all"}
                   onClick={() => setTypeFilter("all")}
-                  label={`全部 ${taskTotal}`}
+                  label={`全部 ${filterTotal}`}
                 />
-                {TYPE_ORDER.filter((type) => (counts[type] ?? 0) > 0).map((type) => (
+                {TYPE_ORDER.filter((type) => (filterCounts[type] ?? 0) > 0).map((type) => (
                   <FilterChip
                     key={type}
                     active={typeFilter === type}
                     onClick={() => setTypeFilter(type)}
-                    label={`${typeMeta(type).label} ${counts[type] ?? 0}`}
+                    label={`${typeMeta(type).label} ${filterCounts[type] ?? 0}`}
                   />
                 ))}
               </div>

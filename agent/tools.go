@@ -1399,9 +1399,10 @@ type intentItem struct {
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
-// 约束：意图只能锚在已确认知识上——每个 parent_id 必须是已存在的 fact/finding
-// 节点（不能挂在别的意图/目标/提示上）。顶层全新方向留空 parent_ids，兜底连 origin fact。
-// 这样"每个意图都连到 fact 节点、且是发现驱动而非凭空规划"从创建路径上被强制。
+// 约束：意图只能锚在知识节点上——observation/claim/decision/legacy、open|supported
+// hypothesis、pending finding_candidate、confirmed finding；checkpoint/origin/
+// rejected/expired 与不可继承的来源节点会被拒绝。顶层全新方向留空 parent_ids，
+// 兜底连 origin fact。
 func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
@@ -1416,7 +1417,7 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		if n.Kind != db.KindFact && n.Kind != db.KindFinding {
 			return 0, fmt.Errorf("parent_id %d 是 %q 节点，不能作为意图锚点：意图只能锚在已确认的【事实(fact)/发现(finding)】上，不能挂在意图/目标/提示上；顶层全新方向请留空 parent_ids", pidv, n.Kind)
 		}
-		if err := t.validateProofAnchor(n); err != nil {
+		if err := t.validateIntentAnchor(n); err != nil {
 			return 0, fmt.Errorf("parent_id %d 不能作为意图锚点：%w", pidv, err)
 		}
 	}

@@ -331,6 +331,66 @@ func (t *ToolSet) validateProofAnchor(n *db.Node) error {
 	return nil
 }
 
+// validateIntentAnchor is the looser lineage boundary used by add_intent:
+// an intent may derive from tentative knowledge (open/supported hypothesis,
+// pending finding_candidate) because the intent is what validates it. Goal
+// proof (validateProofAnchor) stays strict. Checkpoints, the task root, rejected/
+// expired nodes and non-inheritable source nodes are never valid anchors.
+func (t *ToolSet) validateIntentAnchor(n *db.Node) error {
+	if n == nil {
+		return fmt.Errorf("节点不存在")
+	}
+	if n.Kind == db.KindFinding {
+		if n.State != "confirmed" {
+			return fmt.Errorf("漏洞节点 #%d 状态为 %q，只有 confirmed 漏洞能作为意图锚点", n.ID, n.State)
+		}
+		return nil
+	}
+	if n.Kind != db.KindFact {
+		return fmt.Errorf("节点 #%d 是 %q，不能作为意图锚点", n.ID, n.Kind)
+	}
+	if n.State == db.StateOrigin {
+		return fmt.Errorf("节点 #%d 是任务根事实，不能作为意图锚点", n.ID)
+	}
+	if n.State != "confirmed" {
+		return fmt.Errorf("节点 #%d 状态为 %q，已否定节点不能作为意图锚点", n.ID, n.State)
+	}
+	ft := n.FactType()
+	p := db.ParseFactPayload(n.Payload)
+	switch ft {
+	case db.FactTypeObservation, db.FactTypeClaim, db.FactTypeLegacyUnknown, db.FactTypeDecision:
+	case db.FactTypeHypothesis:
+		state := strings.ToLower(strings.TrimSpace(p.State))
+		if state == "" {
+			state = "open"
+		}
+		if state != "open" && state != "supported" {
+			return fmt.Errorf("hypothesis #%d 状态为 %s，只有 open/supported 假设能派生验证意图", n.ID, state)
+		}
+	case db.FactTypeFindingCandidate:
+		state := strings.ToLower(strings.TrimSpace(p.ValidationState))
+		if state == "" {
+			state = "pending"
+		}
+		if state != "pending" {
+			return fmt.Errorf("finding_candidate #%d 的 validation_state 为 %s，只有 pending 候选能派生验证意图", n.ID, state)
+		}
+	case db.FactTypeCheckpoint:
+		return fmt.Errorf("节点 #%d 是 checkpoint，不能作为意图锚点", n.ID)
+	default:
+		return fmt.Errorf("节点 #%d 的 fact_type 是 %s，不能作为意图锚点", n.ID, ft)
+	}
+	if db.IsFactExpired(p, time.Now()) {
+		return fmt.Errorf("节点 #%d 已超过 valid_until 有效期，不能作为意图锚点", n.ID)
+	}
+	if n.Inherited {
+		if ok, why := db.CanInheritFact(n, time.Now()); !ok {
+			return fmt.Errorf("节点 #%d 来自关联任务，但受继承策略限制（%s），不能作为意图锚点", n.ID, why)
+		}
+	}
+	return nil
+}
+
 // validateInformationNodes checks the supplied ids are fact nodes of the allowed
 // information types in this task.
 func (t *ToolSet) validateInformationNodes(ids []int64, allowed []string, field string) error {

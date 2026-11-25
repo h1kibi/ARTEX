@@ -240,6 +240,81 @@ func TestValidateProofAnchor(t *testing.T) {
 	}
 }
 
+func TestValidateIntentAnchorAllowsTentativeKnowledge(t *testing.T) {
+	ts := &ToolSet{}
+	fact := func(id int64, state, payload string) *db.Node {
+		return &db.Node{ID: id, Kind: db.KindFact, State: state, Payload: []byte(payload)}
+	}
+	allowed := []*db.Node{
+		fact(1, "confirmed", `{"fact_type":"observation","summary":"seen"}`),
+		fact(2, "confirmed", `{"fact_type":"claim","summary":"proven"}`),
+		fact(3, "confirmed", `{"fact_type":"decision","summary":"chosen"}`),
+		fact(4, "confirmed", `{"fact_type":"hypothesis","summary":"maybe","state":"open"}`),
+		fact(5, "confirmed", `{"fact_type":"hypothesis","summary":"supported","state":"supported"}`),
+		fact(6, "confirmed", `{"fact_type":"finding_candidate","summary":"pending","validation_state":"pending"}`),
+		{ID: 7, Kind: db.KindFinding, State: "confirmed"},
+	}
+	for _, n := range allowed {
+		if err := ts.validateIntentAnchor(n); err != nil {
+			t.Fatalf("anchor %d rejected: %v", n.ID, err)
+		}
+	}
+	rejected := []*db.Node{
+		fact(10, "confirmed", `{"fact_type":"hypothesis","summary":"rejected","state":"rejected"}`),
+		fact(11, "confirmed", `{"fact_type":"hypothesis","summary":"expired","state":"expired"}`),
+		fact(12, "confirmed", `{"fact_type":"finding_candidate","summary":"no","validation_state":"rejected"}`),
+		fact(13, "confirmed", `{"fact_type":"checkpoint","summary":"bookkeeping"}`),
+		fact(14, db.StateOrigin, `{"summary":"root"}`),
+		fact(15, "dismissed", `{"fact_type":"claim","summary":"denied"}`),
+		fact(16, "confirmed", `{"fact_type":"claim","summary":"stale","valid_until":"2000-01-01T00:00:00Z"}`),
+		{ID: 17, Kind: db.KindFinding, State: "dismissed"},
+	}
+	for _, n := range rejected {
+		if err := ts.validateIntentAnchor(n); err == nil {
+			t.Fatalf("anchor %d (%s) was accepted", n.ID, n.FactType())
+		}
+	}
+	inheritedSecret := &db.Node{ID: 20, Kind: db.KindFact, State: "confirmed", Inherited: true,
+		Payload: []byte(`{"fact_type":"claim","summary":"token","sensitivity":"token"}`)}
+	if err := ts.validateIntentAnchor(inheritedSecret); err == nil {
+		t.Fatal("non-inheritable source anchor accepted")
+	}
+}
+
+func TestAddIntentAcceptsTentativeParentsButNotCheckpoint(t *testing.T) {
+	d := testDB(t)
+	defer d.Close()
+	task, err := d.CreateTask("intent anchors", "fixture", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(task.ID)
+	store := d.Exploration(task.ExplorationID)
+	ts := NewToolSet(store, "planner")
+	parent := func(payload map[string]any) json.RawMessage {
+		id, err := store.AddNode(db.KindFact, payload, 0, "confirmed", "worker", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return json.RawMessage(itoa(id))
+	}
+	hyp := parent(map[string]any{"fact_type": db.FactTypeHypothesis, "summary": "open hypothesis", "state": "open"})
+	if _, err := ts.addOneIntent(intentItem{Summary: "validate hypothesis", ParentIDs: []json.RawMessage{hyp}}); err != nil {
+		t.Fatalf("open hypothesis parent rejected: %v", err)
+	}
+	candidate := parent(map[string]any{"fact_type": db.FactTypeFindingCandidate, "summary": "pending candidate", "validation_state": "pending"})
+	if _, err := ts.addOneIntent(intentItem{Summary: "validate candidate", ParentIDs: []json.RawMessage{candidate}}); err != nil {
+		t.Fatalf("pending candidate parent rejected: %v", err)
+	}
+	checkpoint := parent(db.CheckpointPayload(
+		"bookkeeping", "path_stage", "fixture", "validation", "run-a", "completed",
+		0, 0, nil, nil, nil, nil, nil, nil, db.RouteBudgetUsed{ToolCalls: 1},
+	))
+	if _, err := ts.addOneIntent(intentItem{Summary: "bad parent", ParentIDs: []json.RawMessage{checkpoint}}); err == nil {
+		t.Fatal("checkpoint was accepted as intent parent")
+	}
+}
+
 func TestGraphOverviewExcludesCheckpointsFromFacts(t *testing.T) {
 	d := testDB(t)
 	defer d.Close()
