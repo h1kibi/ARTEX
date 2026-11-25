@@ -103,6 +103,28 @@ func TestInheritedGraphSnapshotFiltersLiveIntentsAndEdges(t *testing.T) {
 	}
 }
 
+func TestInheritedGraphSnapshotWithholdsDigestBody(t *testing.T) {
+	digest := &db.Node{ID: 90, Kind: db.KindDigest, State: "active",
+		Payload: json.RawMessage(`{"body":"source secret body","member_count":2}`)}
+	got, _ := inheritedGraphSnapshot([]*db.Node{digest}, nil, 7)
+	if len(got) != 1 {
+		t.Fatalf("digest snapshot=%+v", got)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(got[0].Payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	if _, leaked := p["body"]; leaked {
+		t.Fatalf("digest body leaked: %s", got[0].Payload)
+	}
+	if p["body_withheld"] == nil {
+		t.Fatalf("digest body withheld marker missing: %s", got[0].Payload)
+	}
+	if !got[0].Inherited || got[0].SourceTaskID != 7 {
+		t.Fatalf("digest provenance: %+v", got[0])
+	}
+}
+
 func TestFindingProvenanceInTask(t *testing.T) {
 	task := &Task{ID: "10", SourceTaskIDs: []int64{7, 8}}
 

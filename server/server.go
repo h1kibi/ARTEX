@@ -2661,6 +2661,21 @@ func inheritedGraphSnapshot(nodes []*db.Node, edges []db.Edge, sourceTaskID int6
 				continue
 			}
 		}
+		if node.Kind == db.KindDigest {
+			// Digest bodies are model-written summaries of their members, which may
+			// include credentials/tokens that individual members filter out. Never
+			// copy the source body across tasks.
+			cp := *node
+			var p map[string]any
+			if json.Unmarshal(cp.Payload, &p) == nil {
+				delete(p, "body")
+				p["body_withheld"] = "关联任务摘要正文不跨任务展开"
+				if raw, err := json.Marshal(p); err == nil {
+					cp.Payload = raw
+				}
+			}
+			node = &cp
+		}
 		node.SourceTaskID = sourceTaskID
 		node.Inherited = true
 		visible[node.ID] = struct{}{}

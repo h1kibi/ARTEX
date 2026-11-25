@@ -46,6 +46,11 @@
 - **情报页异步守卫**：任务切换/筛选快速变化时丢弃过期响应；错误按接口记录，轮询恢复成功后自动清除。
 - **筛选与状态细节**：当前选中的类型筛选始终保留按钮；finding 域补 `dismissed=已排除`，不再回退英文。
 - **路线串行锁与截断**：`ActiveIntentForRoute` 兼容隐式 `route_id`；关联任务节点超过 2000 条时 `truncated` 标志向上传递。
+- **跨任务 digest 正文**：`/api/exploration/graph` 与 `related_tasks.cold_digests` 只返回 digest ID/成员数，正文不跨任务展开；成员仍按 `CanInheritFact` 过滤。
+- **目标证明原子性**：新增 `ExplorationStore.ProveGoal`，同事务写入 `proves` 边并更新 goal 状态；任一步失败整体回滚，不再吞错。
+- **来源任务统计**：`InheritableInformationCounts` 分页精确统计可继承 fact 与 finding；Information 合并来源时 counts/total 不再受 2000 条列表窗口影响。
+- **关联任务概览**：来源 facts 只取真实事实窗口，`yield_count`/facts 统计排除 checkpoint；digest 正文隐藏。
+- **Mock 与加载态**：Mock Information 按 route 重算 counts/total 并模拟 limit/truncated；情报页增加独立 informationLoading；路线筛选 Chip 横向滚动。
 - **情报页一致性**：子意图/漏洞改用 `StatusBadge`；错误条复用 `Alert`；顶部统计固定为全任务口径（信息图路线筛选不再影响统计卡）；统计卡改用与总览页相同的 CardHeader/tabular-nums 排版。
 - **多阶段路线终态被首阶段 done 掩盖**：`/routes` 改由最新非删除意图决定状态（done 不再压过后续 blocked/exhausted/stopped），并按 `running/paused/open` 映射 active/paused/proposed。
 - **人工重跑绕过预算耗尽保护**：单条与批量 rerun 在重开前检查路线累计预算；已耗尽时返回 409，提示改用扩容的 continuation，不再让 Worker 在下一个 Fast Path tick 被立即再次终止。

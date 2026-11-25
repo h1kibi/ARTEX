@@ -539,6 +539,7 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
   const [openNodeID, setOpenNodeID] = React.useState<string | null>(null);
   const [view, setView] = React.useState("routes");
   const [loading, setLoading] = React.useState(true);
+  const [informationLoading, setInformationLoading] = React.useState(true);
   const [error, setError] = React.useState("");
   const [reloadTick, setReloadTick] = React.useState(0);
 
@@ -577,6 +578,7 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
     setTypeFilter("all");
     setError("");
     setLoading(true);
+    setInformationLoading(true);
   }, [taskId]);
 
   const loadRoutes = React.useCallback(async () => {
@@ -594,6 +596,7 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
 
   const loadInformation = React.useCallback(async () => {
     const seq = ++infoSeqRef.current;
+    setInformationLoading(true);
     try {
       const i = await api.taskInformation(taskId, {
         type: typeFilter === "all" ? undefined : typeFilter,
@@ -606,6 +609,10 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
     } catch (err) {
       if (currentTaskRef.current === taskId && seq === infoSeqRef.current) {
         markError("information", err);
+      }
+    } finally {
+      if (currentTaskRef.current === taskId && seq === infoSeqRef.current) {
+        setInformationLoading(false);
       }
     }
   }, [taskId, typeFilter, infoRouteID, markError, clearEndpointError]);
@@ -773,8 +780,8 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
               <CardTitle className="flex items-center gap-2 text-sm">
                 <FileSearchIcon className="size-4" /> Information Graph
               </CardTitle>
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-muted-foreground text-[11px]">路线</span>
+              <div className="flex flex-nowrap items-center gap-1.5 overflow-x-auto pb-1">
+                <span className="text-muted-foreground shrink-0 text-[11px]">路线</span>
                 <FilterChip active={infoRouteID === null} onClick={() => setInfoRouteID(null)} label="全部" />
                 {routes.map((route) => (
                   <FilterChip
@@ -802,7 +809,7 @@ export function IntelligenceTab({ taskId }: { taskId: string }) {
               </div>
             </CardHeader>
             <CardContent className="p-3 pt-0">
-              {loading && !information ? (
+              {informationLoading && !information ? (
                 <div className="flex flex-col gap-2">
                   <Skeleton className="h-16 w-full" />
                   <Skeleton className="h-16 w-full" />
@@ -862,7 +869,7 @@ function FilterChip({ active, onClick, label }: { active: boolean; onClick: () =
       type="button"
       size="sm"
       variant={active ? "secondary" : "outline"}
-      className="h-7 px-2 text-[11px]"
+      className="h-7 shrink-0 px-2 text-[11px]"
       onClick={onClick}
     >
       {label}

@@ -254,6 +254,18 @@ func TestBlackboardToolsReadDirectSources(t *testing.T) {
 	if _, err := sourceStore.AddNode(db.KindFact, map[string]any{"summary": "source host anchor"}, 0, "confirmed", "worker", []int64{assetID}); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := sourceStore.AddNodeLinked(db.KindFact, db.CheckpointPayload(
+		"source bookkeeping", "path_stage", "source goal", "validation", "run-src", "completed",
+		sourceIntent, sourceIntent, nil, nil, nil, []string{"traffic:src"}, []string{"old action"}, []string{"next action"}, db.RouteBudgetUsed{ToolCalls: 3},
+	), 0, "confirmed", "system", nil, sourceIntent, db.RelYields); err != nil {
+		t.Fatal(err)
+	}
+	digestID, err := sourceStore.AddNode(db.KindDigest, map[string]any{
+		"body": "source digest secret body", "member_count": 0,
+	}, 0, "active", "system", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	tools := NewToolSet(currentStore, "worker")
 	tools.SetTaskID(current.ID)
@@ -302,12 +314,43 @@ func TestBlackboardToolsReadDirectSources(t *testing.T) {
 	if findings, ok := related[0]["recent_findings"].([]map[string]any); !ok || len(findings) == 0 || findings[0]["id"] != sourceFinding {
 		t.Fatalf("related finding summary: %#v", related[0]["recent_findings"])
 	}
+	if got := related[0]["facts"]; got != 2 {
+		t.Fatalf("related facts=%v want 2 (checkpoint/origin excluded)", got)
+	}
+	digests, ok := related[0]["cold_digests"].([]map[string]any)
+	if !ok || len(digests) == 0 {
+		t.Fatalf("related cold_digests missing: %#v", related[0]["cold_digests"])
+	}
+	foundDigest := false
+	for _, digest := range digests {
+		if digest["id"] != digestID {
+			continue
+		}
+		foundDigest = true
+		if _, leaked := digest["body"]; leaked {
+			t.Fatalf("source digest body leaked: %#v", digest)
+		}
+		if digest["body_withheld"] == nil {
+			t.Fatalf("source digest body withheld marker missing: %#v", digest)
+		}
+	}
+	if !foundDigest {
+		t.Fatalf("digest %d missing from related overview: %#v", digestID, digests)
+	}
 	results, ok := related[0]["recent_intent_results"].([]map[string]any)
 	if !ok || len(results) == 0 || results[0]["id"] != sourceIntent {
 		t.Fatalf("terminal source intent was starved by newer live work: %#v", related[0]["recent_intent_results"])
 	}
 	if results[0]["result_summary"] != "shared trace marker" {
 		t.Fatalf("terminal source intent result was not distilled: %#v", results[0])
+	}
+	for _, result := range results {
+		if result["id"] != sourceIntent {
+			continue
+		}
+		if got := result["yield_count"]; got != 1 {
+			t.Fatalf("source intent yield_count=%v want 1 (checkpoint excluded)", got)
+		}
 	}
 	coverage, ok := overview["coverage"].(map[string]any)
 	if !ok {

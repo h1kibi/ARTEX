@@ -356,6 +356,25 @@ ORDER BY id DESC LIMIT 1`, s.expID, FactTypeCheckpoint, fmt.Sprint(routeID)))
 	return n, err
 }
 
+// ListFactsExcludingBookkeeping returns newest real facts (no task-root origin,
+// no checkpoints) without loading the whole fact graph. Used by cross-task
+// overviews where only a recent window is rendered.
+func (s *ExplorationStore) ListFactsExcludingBookkeeping(limit int) ([]*Node, error) {
+	if limit <= 0 || limit > 2000 {
+		limit = 20
+	}
+	rows, err := s.db.Query(`SELECT `+nodeCols+` FROM exploration_nodes
+WHERE exploration_id=$1 AND kind='fact'
+  AND state <> $2
+  AND COALESCE(payload->>'fact_type','') <> $3
+ORDER BY id DESC LIMIT $4`, s.expID, StateOrigin, FactTypeCheckpoint, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanNodes(rows)
+}
+
 // ListFactsByType lists facts of one information type newest first.
 func (s *ExplorationStore) ListFactsByType(factType string, limit int) ([]*Node, error) {
 	if limit <= 0 || limit > 2000 {
@@ -626,6 +645,15 @@ func (s *ExplorationStore) InformationQueryWithSources(factType string, routeID 
 	}
 	now := time.Now()
 	for _, src := range sources {
+		srcCounts, srcTotal, err := src.Store.InheritableInformationCounts()
+		if err != nil {
+			return nil, nil, 0, false, err
+		}
+		for typ, n := range srcCounts {
+			counts[typ] += n
+		}
+		total += srcTotal
+
 		srcNodes, srcTruncated, err := src.Store.InformationNodesPage("", 0, 2000)
 		if err != nil {
 			return nil, nil, 0, false, err
@@ -641,8 +669,6 @@ func (s *ExplorationStore) InformationQueryWithSources(factType string, routeID 
 			if n.Kind == KindFact {
 				typ = n.FactType()
 			}
-			counts[typ]++
-			total++
 			if factType != "" && factType != "all" && typ != factType {
 				continue
 			}

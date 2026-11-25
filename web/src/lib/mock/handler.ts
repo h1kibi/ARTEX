@@ -1521,12 +1521,23 @@ function route(m: string, path: string, seg: string[], q: URLSearchParams, b: Re
   if (seg[0] === "tasks" && seg[2] === "routes") return D.taskRoutes;
   if (seg[0] === "tasks" && seg[2] === "evidence") return D.taskEvidence;
   if (seg[0] === "tasks" && seg[2] === "information") {
-    const type = q.get("type") || "";
+    const type = q.get("type") || "all";
     const routeID = Number(q.get("route_id") || 0);
-    const nodes = D.taskInformation.nodes.filter(
-      (node) => (!type || type === "all" || node.fact_type === type) && (!routeID || node.route_id === routeID),
-    );
-    return { ...D.taskInformation, nodes, total: nodes.length };
+    // Match the real handler: counts/total are computed for the route scope,
+    // then the type filter and limit shape only the returned node page.
+    const routeNodes = D.taskInformation.nodes.filter((node) => !routeID || node.route_id === routeID);
+    const counts: Record<string, number> = {};
+    for (const node of routeNodes) counts[node.fact_type] = (counts[node.fact_type] ?? 0) + 1;
+    const typed = routeNodes.filter((node) => !type || type === "all" || node.fact_type === type);
+    const requested = Number(q.get("limit") || 500);
+    const limit = Math.min(2000, Math.max(1, Number.isFinite(requested) ? requested : 500));
+    return {
+      ...D.taskInformation,
+      nodes: typed.slice(0, limit),
+      total: routeNodes.length,
+      counts,
+      truncated: typed.length > limit,
+    };
   }
 
   // ── 任务测试范围（增删查）──

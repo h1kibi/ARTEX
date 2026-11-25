@@ -954,6 +954,7 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 		// §2 cross-task: render the source task's OWN folded view — fold out the
 		// members it has already folded, and surface its cold_digests read-only.
 		hidden := hiddenMembersFor(ts)
+		checkpointIDs, _ := ts.CheckpointFactIDs()
 		budget := overviewTextBudget{remaining: perSourceTextBudget}
 		item := map[string]any{
 			"source_task_id": source.Task.TaskID,
@@ -975,6 +976,9 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 			case db.RelDerivedFrom, db.RelSpawns:
 				parentsOf[edge.To] = append(parentsOf[edge.To], edge.From)
 			case db.RelYields:
+				if checkpointIDs[edge.To] {
+					continue
+				}
 				yieldsOf[edge.From] = append(yieldsOf[edge.From], edge.To)
 				factFrom[edge.To] = edge.From
 			}
@@ -1002,7 +1006,8 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 		}
 		item["hints"] = hintSummary
 
-		facts, _ := ts.ListByKind(db.KindFact, relatedOverviewMaxFactsPerSource)
+		facts, _ := ts.ListFactsExcludingBookkeeping(relatedOverviewMaxFactsPerSource)
+		factTotal := len(facts)
 		findings, _ := ts.ListByKind(db.KindFinding, relatedOverviewMaxFindingsPerTask)
 		intentNodes, _ := ts.ListByKind(db.KindIntent, 300)
 		terminalIntent := make(map[int64]bool, len(intentNodes))
@@ -1012,10 +1017,18 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 		item["facts"] = len(facts)
 		item["findings"] = len(findings)
 		if statsErr == nil {
-			item["facts"] = stats[db.KindFact]
+			realFacts := stats[db.KindFact] - len(checkpointIDs)
+			if realFacts > 0 {
+				realFacts-- // task-root origin fact
+			}
+			if realFacts < 0 {
+				realFacts = 0
+			}
+			factTotal = realFacts
+			item["facts"] = factTotal
 			item["findings"] = stats[db.KindFinding]
 			if stats[db.KindGoal] > len(goals) || stats[db.KindHint] > len(hints) ||
-				stats[db.KindFact] > len(facts) || stats[db.KindFinding] > len(findings) {
+				factTotal > len(facts) || stats[db.KindFinding] > len(findings) {
 				budget.truncated = true
 			}
 		}
@@ -1093,6 +1106,10 @@ func (t *ToolSet) relatedTaskOverviews() []map[string]any {
 			for _, cd := range cds {
 				cd["inherited"] = true
 				cd["source_task_id"] = source.Task.TaskID
+				// A digest body may summarize members that are non-inheritable;
+				// expose only its id/member_count, never the source prose.
+				delete(cd, "body")
+				cd["body_withheld"] = "关联任务摘要正文不跨任务展开"
 			}
 			item["cold_digests"] = cds
 			if len(more) > 0 {
@@ -1742,8 +1759,9 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			if err := t.validateProofAnchor(evidenceNode); err != nil {
 				return actool.Errorf(fmt.Sprintf("evidence_id 不能证明目标：%v", err)), nil
 			}
-			_ = t.ts.Link(ev, db.RelProves, goal)
-			_ = t.ts.SetNodeState(goal, "met")
+			if err := t.ts.ProveGoal(goal, ev); err != nil {
+				return actool.Errorf(fmt.Sprintf("记录目标证明失败：%v", err)), nil
+			}
 			// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
 			// 任务完成（置 GoalMet），无需再依赖模型显式调 goal_met。
 			if goals, err := t.ts.ListByKind(db.KindGoal, 1000); err == nil && len(goals) > 0 {

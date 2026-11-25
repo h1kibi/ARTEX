@@ -105,6 +105,10 @@
 - **情报页**：intent/severity/finding 使用全局 StatusBadge；错误条用 Alert；统计卡固定任务级并复用总览排版；信息图类型计数随路线筛选。
 - **播报板**：checkpoint 使用 summary 字段，不再渲染整段 JSON。
 - **异步与细节**：情报页丢弃过期任务/筛选响应，接口成功后自动清除错误；当前类型筛选不被隐藏；finding 补 dismissed 中文标签；ActiveIntentForRoute 兼容隐式 route_id；来源信息页 truncated 标志向上传递。
+- **digest 正文隔离**：跨任务图谱与关联概览只给 digest ID/成员数，正文不展开，成员继续按 CanInheritFact 过滤。
+- **ProveGoal 原子性**：proves 边与 goal 状态同事务写入，失败回滚。
+- **来源精确计数**：新增 InheritableInformationCounts，逐页过滤 fact、精确合并 finding；关联概览排除 checkpoint 产出。
+- **UI/Mock**：独立 informationLoading；路线 Chip 横向滚动；Mock Information 重算 counts/total/limit/truncated。
 
 ## 2. 迁移和兼容
 

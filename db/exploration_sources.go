@@ -184,6 +184,44 @@ func (s *ExplorationStore) countInheritableFactsFiltered(q string, now time.Time
 	return total, nil
 }
 
+// InheritableInformationCounts returns exact per-type totals for nodes that may
+// be read across the task boundary. Facts are paged and checked with
+// CanInheritFact; findings inherit wholesale. Unlike summing one capped page,
+// this stays correct above 2000 source nodes.
+func (s *ExplorationStore) InheritableInformationCounts() (map[string]int, int, error) {
+	counts := map[string]int{}
+	findingCounts, _, err := s.InformationCounts(0)
+	if err != nil {
+		return nil, 0, err
+	}
+	counts["finding"] = findingCounts["finding"]
+	total := counts["finding"]
+
+	now := time.Now()
+	cursor := int64(0)
+	for {
+		page, err := s.listByKindPageFiltered(KindFact, cursor, 500, "")
+		if err != nil {
+			return nil, 0, err
+		}
+		for _, n := range page {
+			if n.State == StateOrigin || n.FactType() == FactTypeCheckpoint {
+				continue
+			}
+			if ok, _ := CanInheritFact(n, now); !ok {
+				continue
+			}
+			counts[n.FactType()]++
+			total++
+		}
+		if len(page) <= 500 {
+			break
+		}
+		cursor = page[len(page)-1].ID
+	}
+	return counts, total, nil
+}
+
 // GetNodeWithSources reads a node only when it belongs to this exploration or
 // one of its direct sources. Inherited nodes are tagged so tool callers can keep
 // them read-only and show their provenance.

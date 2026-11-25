@@ -286,6 +286,43 @@ func (s *ExplorationStore) SetNodeState(id int64, state string) error {
 	return err
 }
 
+// ProveGoal writes the evidence->goal proves edge and marks the goal met in one
+// transaction. A missing goal or write failure leaves both untouched, so a goal
+// can never appear proven without its evidence edge.
+func (s *ExplorationStore) ProveGoal(goalID, evidenceID int64) error {
+	if goalID <= 0 || evidenceID <= 0 {
+		return fmt.Errorf("goal_id 和 evidence_id 必填")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var state string
+	if err := tx.QueryRow(`SELECT state FROM exploration_nodes
+WHERE id=$1 AND exploration_id=$2 AND kind='goal' FOR UPDATE`, goalID, s.expID).Scan(&state); err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("goal %d 不存在于本任务", goalID)
+		}
+		return err
+	}
+	if _, err := tx.Exec(`
+INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id) VALUES ($1,$2,$3,$4)
+ON CONFLICT (exploration_id, src_id, rel, dst_id) DO NOTHING`, s.expID, evidenceID, RelProves, goalID); err != nil {
+		return err
+	}
+	res, err := tx.Exec(`UPDATE exploration_nodes
+SET state='met', blocked_reason=NULL, terminal_reason=NULL, content_version=content_version+1
+WHERE id=$1 AND exploration_id=$2 AND kind='goal'`, goalID, s.expID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("goal %d 更新失败", goalID)
+	}
+	return tx.Commit()
+}
+
 // UpdateGoalPayload rewrites a goal node's payload text (and optional vulnclass);
 // scoped to kind='goal' so it can never mutate an intent/fact by id. Returns an
 // error if no such goal exists in this exploration.
