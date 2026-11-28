@@ -21,7 +21,11 @@ type RunInfo struct {
 	IntentID      int64  // worker's intent node; 0 for planner/mainagent/chat
 	RunID         string // current worker run id; empty for planner/mainagent/chat
 	RouteID       int64  // route id carried by the intent; 0 when absent
-	SessionID     string // chat conversation id; empty for task runs
+	// Effort is the intent's normalized run tier (probe/standard/deep). Empty for
+	// non-worker runs. The engine reads it per run to size the Watchdog's
+	// autonomous-cycle budget without touching any shared Worker field.
+	Effort    string
+	SessionID string // chat conversation id; empty for task runs
 }
 
 // explorationID reads a store's exploration id, tolerating a nil store (planner and

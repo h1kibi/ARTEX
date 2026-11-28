@@ -204,6 +204,7 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 			if t.as == nil {
 				return actool.Errorf("insert_assets 未启用: AssetStore 未初始化"), nil
 			}
+			in = normalizeToolInputArrays(in, "assets", "asset_ids", "parent_ids")
 			var a struct {
 				Assets []assetInputItem `json:"assets"`
 			}
@@ -227,15 +228,21 @@ func (t *ToolSet) insertAssets() actool.CoreTool {
 			var results []result
 			var errs []errEntry
 
-			// 资产闸门规则一次性载入；读取失败则跳过判定（不阻断插入）。
+			// 资产闸门规则一次性载入。读取失败时整批拒绝：无法确认范围时插进去的
+			// 资产会把禁测目标带进资产图，后续的覆盖度与探测都会沿着它展开。
 			// 拦截规则 = 全局 ∪ 任务级 block；允许规则 = 任务级 allow。
-			blockRules, _ := t.as.ListAssetInterceptRules()
+			blockRules, err := t.as.ListAssetInterceptRules()
+			if err != nil {
+				return actool.Errorf("资产拦截规则读取失败，无法确认目标是否在授权范围内，本批资产未插入：" + err.Error()), nil
+			}
 			var allowRules []db.AssetInterceptRule
 			if t.taskID > 0 {
-				if tb, ta, err := t.as.TaskInterceptRulesSplit(t.taskID); err == nil {
-					blockRules = append(blockRules, tb...)
-					allowRules = ta
+				tb, ta, taskErr := t.as.TaskInterceptRulesSplit(t.taskID)
+				if taskErr != nil {
+					return actool.Errorf("任务级资产拦截规则读取失败，无法确认目标是否在授权范围内，本批资产未插入：" + taskErr.Error()), nil
 				}
+				blockRules = append(blockRules, tb...)
+				allowRules = ta
 			}
 
 			for i, item := range a.Assets {
@@ -646,6 +653,8 @@ func (t *ToolSet) WorkerTools() []actool.CoreTool {
 		// list_findings 保留：报漏洞前先查本任务已确认漏洞，避免重复上报同一漏洞。
 		t.listFindings(),
 		t.addFinding(), t.recordFact(),
+		// http_request：进程内轻量发包，登录会话 Cookie 与 Bash 的 curl 共用任务级文件。
+		t.httpRequest(),
 		// asset management (handlers guard nil store internally)。
 		// add_company_scope 不给 worker：定义企业资产范围属规划/主控/Auto 的职责，worker 只执行探索。
 		t.insertAssets(), t.listAssets(),

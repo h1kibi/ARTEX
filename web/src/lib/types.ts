@@ -352,6 +352,8 @@ export interface RouteIntent {
   asset_ids?: number[];
   worker_seconds: number;
   worker_runs: number;
+  /** 本意图的运行档位；缺省等同 standard。 */
+  effort?: "probe" | "standard" | "deep" | string;
   checkpoint_fact_id?: number;
   terminal_reason?: string;
   delete_reason?: string;
@@ -392,8 +394,23 @@ export interface TaskRoute {
   success_condition?: string;
   expected_evidence?: string[];
   status: "proposed" | "active" | "succeeded" | "blocked" | "exhausted" | "paused" | "stopped" | "superseded" | string;
+  /** 历史统计；运行档位看 effort。 */
   budget?: RouteBudget;
   budget_used: RouteBudgetUsed;
+  /** 本路线实际生效的运行档位（probe/standard/deep）。 */
+  effort?: "probe" | "standard" | "deep" | string;
+  /** 已结束棒数（done/blocked/exhausted/stopped）。 */
+  total_runs: number;
+  /** 从最新一棒倒数的连续无产出棒数（无 finding 且无高价值 ProgressEvent）。 */
+  consecutive_dry_runs: number;
+  /** 人工介入路线（origin=human / 人工消息 / 人工「继续」）：豁免自治挂起与静默强杀。 */
+  human_involved: boolean;
+  /** 距上一次产出漏洞已结束的棒数。 */
+  runs_since_finding?: number;
+  /** 该路线累计的 worker 执行秒数。 */
+  worker_seconds?: number;
+  /** 自治调度状态：正常轮转 / 连续空跑挂起 / 冷却让位。 */
+  autonomy_status?: "active" | "suspended_dry" | "parked_stagnant" | string;
   intent_count: number;
   active_intents: number;
   asset_ids?: number[];
@@ -626,6 +643,8 @@ export interface Finding {
   name?: string; // 漏洞名称;为空时展示回退到 vulnclass
   severity: Severity;
   status: FindingStatus;
+  // triage_state 是自动分诊结论(confirmed/verifying/rejected),与人工处置 status 分开。
+  triage_state?: "confirmed" | "verifying" | "rejected";
   summary: string;
   evidence: string;
   report?: string; // 详细报告(Markdown);仅详情接口返回,列表为空
@@ -1170,6 +1189,10 @@ export interface Settings {
   // 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
   task_concurrency_enabled?: boolean; // 默认 false
   task_concurrency_limit?: number; // 开启后默认 5
+  // 任务级等效成本上限(默认关)。开启后引擎按 llm_usage 账本折算
+  // 未缓存输入 + 0.1×缓存读 + 4×输出，达到上限即停止领取新意图并暂停任务。
+  task_cost_cap_enabled?: boolean; // 默认 false
+  task_cost_cap_tokens?: number; // 等效成本 token 上限
   // LLM 轮询(故障转移)。默认关；开启后「未指定模型」的 agent 在当前配置不可用
   // （余额不足/key 失效/限流/服务异常）时自动切到下一个配置。
   llm_pool_enabled?: boolean; // 默认 false

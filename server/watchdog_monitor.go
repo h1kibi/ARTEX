@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,61 +73,83 @@ type runState struct {
 	RouteObjective   string
 	RouteBudget      db.RouteBudget
 	RouteUsedBase    db.RouteBudgetUsed
-	ProviderError    string
-	SlowPathClass    string
-	SlowPathSummary  string
-	SlowPathEvidence []string
-	SlowPathCycle    int
-	pendingTool      string
-	pendingInput     string
-	lastSignature    string
-	lastSigCount     int
-	dirty            bool
-	finishNotified   bool // the finish hook ran once for this run
+	// EffortMaxAutoCycles is this run's autonomous green-light budget derived from
+	// the intent's effort tier, and HasEffortMaxAutoCycles distinguishes "probe
+	// allows 0 cycles" from "unset → use the global config".
+	EffortMaxAutoCycles    int
+	HasEffortMaxAutoCycles bool
+	Effort                 string
+	HumanInvolved          bool
+	ProviderError          string
+	SlowPathClass          string
+	SlowPathSummary        string
+	SlowPathEvidence       []string
+	SlowPathCycle          int
+	pendingTool            string
+	pendingInput           string
+	lastSignature          string
+	lastSigCount           int
+	lastPollSignature      string
+	lastPollRepeat         int
+	PollingRepeats         int
+	dirty                  bool
+	finishNotified         bool // the finish hook ran once for this run
 }
 
 // RunSnapshot is a copy of one run at a point in time. The Fast Path, API and
 // termination result all read this shape instead of touching the live state.
 type RunSnapshot struct {
-	TaskID           string             `json:"task_id"`
-	IntentID         int64              `json:"intent_id"`
-	RunID            string             `json:"run_id"`
-	WorkerName       string             `json:"worker_name"`
-	Phase            string             `json:"phase"`
-	PhaseStartedAt   time.Time          `json:"phase_started_at"`
-	HeartbeatAt      time.Time          `json:"heartbeat_at"`
-	LastEventAt      time.Time          `json:"last_event_at"`
-	LastOutputAt     time.Time          `json:"last_output_at"`
-	LastHighValueAt  time.Time          `json:"last_high_value_at"`
-	StartedAt        time.Time          `json:"started_at"`
-	CycleStart       time.Time          `json:"cycle_start"`
-	CycleNo          int                `json:"cycle_no"`
-	AutoCyclesUsed   int                `json:"auto_cycles_used"`
-	PressureSent     bool               `json:"pressure_sent"`
-	SlowPathState    string             `json:"slow_path_state"`
-	DecisionState    string             `json:"decision_state"`
-	State            string             `json:"state"`
-	Tool             string             `json:"tool,omitempty"`
-	Facts            int                `json:"facts"`
-	Assets           int                `json:"assets"`
-	Findings         int                `json:"findings"`
-	ToolCalls        int                `json:"tool_calls"`
-	InputTokens      int                `json:"input_tokens"`
-	OutputTokens     int                `json:"output_tokens"`
-	DuplicateActions int                `json:"duplicate_actions"`
-	ProgressEvents   []string           `json:"progress_events,omitempty"`
-	RouteID          int64              `json:"route_id,omitempty"`
-	RouteKind        string             `json:"route_kind,omitempty"`
-	RoutePhase       string             `json:"route_phase,omitempty"`
-	RouteObjective   string             `json:"route_objective,omitempty"`
-	RouteBudget      db.RouteBudget     `json:"route_budget,omitempty"`
-	RouteUsedBase    db.RouteBudgetUsed `json:"route_used_base,omitempty"`
-	ProviderError    string             `json:"provider_error,omitempty"`
-	SlowPathClass    string             `json:"slow_path_class,omitempty"`
-	SlowPathSummary  string             `json:"slow_path_summary,omitempty"`
-	SlowPathEvidence []string           `json:"slow_path_evidence,omitempty"`
-	SlowPathCycle    int                `json:"slow_path_cycle,omitempty"`
-	LeaseUntil       time.Time          `json:"lease_until,omitempty"`
+	TaskID           string    `json:"task_id"`
+	IntentID         int64     `json:"intent_id"`
+	RunID            string    `json:"run_id"`
+	WorkerName       string    `json:"worker_name"`
+	Phase            string    `json:"phase"`
+	PhaseStartedAt   time.Time `json:"phase_started_at"`
+	HeartbeatAt      time.Time `json:"heartbeat_at"`
+	LastEventAt      time.Time `json:"last_event_at"`
+	LastOutputAt     time.Time `json:"last_output_at"`
+	LastHighValueAt  time.Time `json:"last_high_value_at"`
+	StartedAt        time.Time `json:"started_at"`
+	CycleStart       time.Time `json:"cycle_start"`
+	CycleNo          int       `json:"cycle_no"`
+	AutoCyclesUsed   int       `json:"auto_cycles_used"`
+	PressureSent     bool      `json:"pressure_sent"`
+	SlowPathState    string    `json:"slow_path_state"`
+	DecisionState    string    `json:"decision_state"`
+	State            string    `json:"state"`
+	Tool             string    `json:"tool,omitempty"`
+	Facts            int       `json:"facts"`
+	Assets           int       `json:"assets"`
+	Findings         int       `json:"findings"`
+	ToolCalls        int       `json:"tool_calls"`
+	InputTokens      int       `json:"input_tokens"`
+	OutputTokens     int       `json:"output_tokens"`
+	DuplicateActions int       `json:"duplicate_actions"`
+	// PollingRepeats counts consecutive normalized wait/poll actions (sleep N,
+	// repeatedly reading slot_poll/slot_watch logs). >=2 is a zero-progress stall.
+	PollingRepeats int                `json:"polling_repeats,omitempty"`
+	ProgressEvents []string           `json:"progress_events,omitempty"`
+	RouteID        int64              `json:"route_id,omitempty"`
+	RouteKind      string             `json:"route_kind,omitempty"`
+	RoutePhase     string             `json:"route_phase,omitempty"`
+	RouteObjective string             `json:"route_objective,omitempty"`
+	RouteBudget    db.RouteBudget     `json:"route_budget,omitempty"`
+	RouteUsedBase  db.RouteBudgetUsed `json:"route_used_base,omitempty"`
+	// Effort is the intent's run tier; EffortMaxAutoCycles its autonomous-cycle
+	// budget (HasEffortMaxAutoCycles=false → fall back to config).
+	Effort                 string `json:"effort,omitempty"`
+	EffortMaxAutoCycles    int    `json:"effort_max_auto_cycles,omitempty"`
+	HasEffortMaxAutoCycles bool   `json:"has_effort_max_auto_cycles,omitempty"`
+	// HumanInvolved: the intent's route is human-owned (origin="human", a human
+	// message, or a human "continue" decision). Such runs are exempt from
+	// autonomous suspension and from silent cycle termination.
+	HumanInvolved    bool      `json:"human_involved,omitempty"`
+	ProviderError    string    `json:"provider_error,omitempty"`
+	SlowPathClass    string    `json:"slow_path_class,omitempty"`
+	SlowPathSummary  string    `json:"slow_path_summary,omitempty"`
+	SlowPathEvidence []string  `json:"slow_path_evidence,omitempty"`
+	SlowPathCycle    int       `json:"slow_path_cycle,omitempty"`
+	LeaseUntil       time.Time `json:"lease_until,omitempty"`
 }
 
 func (r *runState) snapshot() RunSnapshot {
@@ -141,10 +164,12 @@ func (r *runState) snapshot() RunSnapshot {
 		DecisionState: r.DecisionState, State: r.State, Tool: r.Tool,
 		Facts: r.Facts, Assets: r.Assets, Findings: r.Findings,
 		ToolCalls: r.ToolCalls, InputTokens: r.InputTokens, OutputTokens: r.OutputTokens,
-		DuplicateActions: r.DuplicateActions,
-		ProgressEvents:   append([]string(nil), r.ProgressEvents...),
-		RouteID:          r.RouteID, RouteKind: r.RouteKind, RoutePhase: r.RoutePhase,
+		DuplicateActions: r.DuplicateActions, PollingRepeats: r.PollingRepeats,
+		ProgressEvents: append([]string(nil), r.ProgressEvents...),
+		RouteID:        r.RouteID, RouteKind: r.RouteKind, RoutePhase: r.RoutePhase,
 		RouteObjective: r.RouteObjective, RouteBudget: r.RouteBudget, RouteUsedBase: r.RouteUsedBase,
+		Effort: r.Effort, EffortMaxAutoCycles: r.EffortMaxAutoCycles,
+		HasEffortMaxAutoCycles: r.HasEffortMaxAutoCycles, HumanInvolved: r.HumanInvolved,
 		ProviderError: r.ProviderError, SlowPathClass: r.SlowPathClass,
 		SlowPathSummary: r.SlowPathSummary, SlowPathEvidence: evidence,
 		SlowPathCycle: r.SlowPathCycle, LeaseUntil: r.LeaseUntil,
@@ -207,6 +232,55 @@ func (m *RunMonitor) SetRoute(runID string, route db.IntentRoute) {
 		r.RouteObjective = route.Objective
 		r.RouteBudget = route.Budget
 		r.RouteUsedBase = route.BudgetUsed
+		r.dirty = true
+	}
+	m.mu.Unlock()
+}
+
+// SetHumanInvolved refreshes a LIVE run's human-owned flag. Human ownership can
+// start mid-run — the operator sends a guidance message to the running worker, or
+// answers "continue" on its Watchdog card — and from that moment the run must be
+// exempt from autonomous suspension and silent cycle termination. Reading the flag
+// only at registration would let a run a human just took over be killed silently.
+func (m *RunMonitor) SetHumanInvolved(runID string, humanInvolved bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if r := m.runs[runID]; r != nil && r.HumanInvolved != humanInvolved {
+		r.HumanInvolved = humanInvolved
+		r.dirty = true
+	}
+	m.mu.Unlock()
+}
+
+// HumanInvolvedRun reports the current flag for one live run.
+func (m *RunMonitor) HumanInvolvedRun(runID string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if r := m.runs[runID]; r != nil {
+		return r.HumanInvolved
+	}
+	return false
+}
+
+// SetEffort attaches the intent's run tier and its autonomous-cycle budget to
+// the run. probe passes 0 cycles explicitly: deciding not to grant any cycle is
+// a decision, and collapsing it into "unset" would silently hand the run the
+// global default. Called once at run registration, before any cycle boundary.
+func (m *RunMonitor) SetEffort(runID, effort string, maxAutoCycles int, humanInvolved bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	if r := m.runs[runID]; r != nil {
+		r.Effort = effort
+		r.EffortMaxAutoCycles = maxAutoCycles
+		r.HasEffortMaxAutoCycles = true
+		r.HumanInvolved = humanInvolved
 		r.dirty = true
 	}
 	m.mu.Unlock()
@@ -294,6 +368,25 @@ func (m *RunMonitor) Observe(runID string, a db.Activity) {
 			m.appendProgressLocked(r, "duplicate_action")
 		} else {
 			r.lastSignature, r.lastSigCount = sig, 1
+		}
+		// 归一化的"长时等待/轮询"识别：sleep/Start-Sleep 的具体秒数不同、但都是空等；
+		// 反复读 slot_poll/slot_watch/tail 日志也一样。把它们折算成同一个签名，否则
+		// "sleep 30 / sleep 60 / sleep 90" 永远不算重复，worker 可以整周期空转不被发现。
+		if wait := normalizePollingAction(a.Tool, a.Detail); wait != "" {
+			pollSig := "polling\x00" + wait
+			if pollSig == r.lastPollSignature {
+				r.lastPollRepeat++
+				r.DuplicateActions++
+				m.appendProgressLocked(r, "duplicate_action")
+			} else {
+				r.lastPollSignature, r.lastPollRepeat = pollSig, 1
+			}
+			// 同一空等动作重复出现即"零实质推进"：Fast Path 的 terminate 判据直接读它。
+			r.PollingRepeats = r.lastPollRepeat
+		} else {
+			// Real work between waits breaks the run of polling actions; otherwise a
+			// worker alternating sleep/curl/sleep would never look like a loop.
+			r.lastPollSignature, r.lastPollRepeat, r.PollingRepeats = "", 0, 0
 		}
 		r.dirty = true
 	case "tool_result":
@@ -413,6 +506,54 @@ func (m *RunMonitor) appendProgressLocked(r *runState, event string) {
 		r.ProgressEvents = r.ProgressEvents[len(r.ProgressEvents)-20:]
 	}
 	r.dirty = true
+}
+
+// pollingSignature normalizes a wait/poll action so repeats are visible: the sleep
+// duration is dropped (sleep 30 and sleep 600 are the same non-progress act), and
+// log-tail/read probes are folded onto their target. Returns "" for actions that
+// are real work.
+func normalizePollingAction(tool, detail string) string {
+	if tool != "Bash" && tool != "sleep" && tool != "Monitor" {
+		return ""
+	}
+	// The SDK's dedicated sleep tool carries {"seconds":N}, not a command; it is a
+	// wait by definition regardless of its argument shape.
+	if tool == "sleep" {
+		return "sleep"
+	}
+	trimmed := strings.TrimSpace(detail)
+	// A tool_use activity carries the tool's RAW JSON input ("{""command"":""sleep
+	// 300...""}"), not bare shell text. Matching against the JSON wrapper would make
+	// every HasPrefix check false and hide exactly the sleeps/polls this gate exists for.
+	if strings.HasPrefix(trimmed, "{") {
+		var in struct {
+			Command string `json:"command"`
+		}
+		if json.Unmarshal([]byte(trimmed), &in) == nil && strings.TrimSpace(in.Command) != "" {
+			trimmed = strings.TrimSpace(in.Command)
+		}
+	}
+	cmd := strings.ToLower(trimmed)
+	if cmd == "" {
+		return ""
+	}
+	if strings.HasPrefix(cmd, "start-sleep") || strings.Contains(cmd, "start-sleep ") ||
+		strings.HasPrefix(cmd, "timeout /t") || strings.Contains(cmd, "ping -n") {
+		return "sleep"
+	}
+	if strings.HasPrefix(cmd, "sleep ") || strings.Contains(cmd, "&& sleep ") || strings.Contains(cmd, "; sleep ") {
+		return "sleep"
+	}
+	// waiting on another worker's slot / log instead of doing work
+	for _, needle := range []string{"slot_poll", "slot_watch", "slot-", "worker.wait", "wait_for_slot"} {
+		if strings.Contains(cmd, needle) {
+			return "slot-wait"
+		}
+	}
+	if strings.HasPrefix(cmd, "tail ") && strings.Contains(cmd, "log") {
+		return "log-tail"
+	}
+	return ""
 }
 
 func progressEventFromInput(raw json.RawMessage) string {

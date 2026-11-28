@@ -481,6 +481,15 @@ func (d *DB) SetFindingStatusWithNotify(ctx context.Context, id int64, status st
 // 返回 from=变更前状态、found=漏洞是否存在、changed=状态是否真的变了、
 // notified=事件是否登记成功（登记失败不影响状态更新，见 RecordNotificationEventTx）。
 func SetFindingStatusTx(ctx context.Context, tx *sql.Tx, id int64, status string) (from string, found bool, changed bool, notified bool, err error) {
+	return setFindingStatusTx(ctx, tx, id, status, true)
+}
+
+// setFindingStatusTx is SetFindingStatusTx with an explicit choice about the triage
+// mirror. A human disposition (confirmed / resolved / fixed / false_positive) is
+// itself a triage judgement and must move the graph state; a retest verdict resolves
+// triage on its own, against the evidence version its snapshot captured, so it calls
+// this with syncTriage=false to avoid binding a verdict to evidence that changed.
+func setFindingStatusTx(ctx context.Context, tx *sql.Tx, id int64, status string, syncTriage bool) (from string, found bool, changed bool, notified bool, err error) {
 	var (
 		vulnclass, name, severity, summary string
 		taskID                             sql.NullInt64
@@ -503,6 +512,22 @@ FROM findings WHERE id=$1 FOR UPDATE`, id).
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE findings SET status=$2 WHERE id=$1`, id, status); err != nil {
 		return from, true, false, false, err
+	}
+	if syncTriage {
+		// The human disposition IS a triage decision: confirming, resolving or
+		// marking fixed means the evidence is accepted (so prove_goal may use it),
+		// and a false positive means it is not. A confirmation binds to the version
+		// the operator looked at; a rejection does not need a version.
+		switch status {
+		case FindingConfirmed, FindingResolved, FindingFixed:
+			if err := setFindingTriageTx(ctx, tx, id, "confirmed", true); err != nil {
+				return from, true, false, false, err
+			}
+		case FindingFalsePositive:
+			if err := setFindingTriageTx(ctx, tx, id, "rejected", false); err != nil {
+				return from, true, false, false, err
+			}
+		}
 	}
 	var assets []int64
 	_ = json.Unmarshal(assetIDs, &assets)

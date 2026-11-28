@@ -464,6 +464,7 @@ func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Reques
 // busyKey clears when the run ends (best-effort in-flight marker).
 func (s *Server) runConversation(c *db.Conversation, msg, busyKey string, userMessage ...string) {
 	ctx, cancel := s.conversationRunContext(c.ID, busyKey)
+	ctx = withConversationTaskScope(ctx, c)
 	// Only the human-message handler supplies this field, before adding the
 	// attachment manifest. Scheduler/retest prompts must not be labelled as users.
 	if len(userMessage) == 1 {
@@ -477,16 +478,38 @@ func (s *Server) runConversation(c *db.Conversation, msg, busyKey string, userMe
 // fire-and-forget chat path; the P3 trigger queue calls it directly so it can wait
 // for completion before starting the next queued fire for the same agent.
 func (s *Server) runConversationSync(c *db.Conversation, msg, busyKey string) {
-	ctx, cancel := s.conversationRunContext(c.ID, busyKey)
+	s.runConversationSyncCtx(s.ctx, c, msg, busyKey)
+}
+
+// runConversationSyncCtx is runConversationSync with a caller-supplied parent ctx,
+// used when the run must inherit a trusted identity (a trigger's taskId).
+func (s *Server) runConversationSyncCtx(parent context.Context, c *db.Conversation, msg, busyKey string) {
+	ctx, cancel := s.conversationRunContextFrom(parent, c.ID, busyKey)
+	ctx = withConversationTaskScope(ctx, c)
 	s.runConversationTurn(ctx, cancel, c, msg, busyKey)
+}
+
+// withConversationTaskScope attaches the conversation's PERSISTED task scope to the
+// run context. Every turn goes through it, so a follow-up turn (which builds its
+// context from the server root) keeps the same evidence authorization as the first.
+// A message-supplied task number is never used for this: it is model input.
+func withConversationTaskScope(ctx context.Context, c *db.Conversation) context.Context {
+	if c == nil || c.TaskID == nil || *c.TaskID <= 0 {
+		return ctx
+	}
+	return agent.WithRunInfo(ctx, agent.RunInfo{TaskID: *c.TaskID})
 }
 
 // Register cancellation before returning 202, so an immediate stop/delete cannot
 // miss a background goroutine which has not started yet.
 func (s *Server) conversationRunContext(id int64, busyKey string) (context.Context, context.CancelCauseFunc) {
+	return s.conversationRunContextFrom(s.ctx, id, busyKey)
+}
+
+func (s *Server) conversationRunContextFrom(parent context.Context, id int64, busyKey string) (context.Context, context.CancelCauseFunc) {
 	// Per-run cancellable context so a manual stop (pgStopConversation) can abort
 	// just this session. Registered under chatMu so the stop handler can find it.
-	ctx, cancel := context.WithCancelCause(intercept.WithConvID(s.ctx, id))
+	ctx, cancel := context.WithCancelCause(intercept.WithConvID(parent, id))
 	s.chatMu.Lock()
 	s.chatCancel[busyKey] = cancel
 	s.chatMu.Unlock()
@@ -786,10 +809,28 @@ func mergeAllRuns(items []triggeredRun) triggeredRun {
 		agentKey:  first.agentKey,
 		title:     fmt.Sprintf("合并触发 · 全部 · %d 条", len(items)),
 		message:   b.String(),
-		taskID:    first.taskID,
+		taskID:    mergedTaskScope(items),
 		mergeable: true,
 		// taskDesc/taskGoal left empty: per-task headers already embedded above.
 	}
+}
+
+// mergedTaskScope returns the single task a merged batch may be authorized for, or
+// 0 when the batch cannot name one. Every event must carry the SAME positive task:
+// handing the first event's task identity to a batch that also contains other tasks'
+// events (or task-less fires) would let those events write evidence into a task they
+// do not belong to.
+func mergedTaskScope(items []triggeredRun) int64 {
+	taskID := items[0].taskID
+	if taskID <= 0 {
+		return 0
+	}
+	for _, it := range items[1:] {
+		if it.taskID != taskID {
+			return 0
+		}
+	}
+	return taskID
 }
 
 // runTriggeredRun creates the conversation for one queued fire, records the human
@@ -807,6 +848,20 @@ func (s *Server) runTriggeredRun(item triggeredRun) {
 		log.Printf("[trigger] create conversation for %s failed: %v", item.agentKey, err)
 		return
 	}
+	// Persist the fire's task scope on the CONVERSATION, not just on this run's ctx:
+	// follow-up turns rebuild their context from the server root, and an in-memory
+	// identity would silently stop applying after the first turn. A merged batch that
+	// spans several tasks has no single task to authorize, so it stays unscoped (the
+	// evidence tools then fail closed) — the alternative was inheriting the first
+	// event's task for every other task's findings.
+	scope := s.triggerTaskScope(item)
+	if err := pg.SetConversationTaskScope(c.ID, scope); err != nil {
+		log.Printf("[trigger] set task scope on conv %d failed: %v", c.ID, err)
+		return
+	}
+	if scope != nil {
+		c.TaskID = scope
+	}
 	msg := finalTriggerMessage(item) // prepend the task-context header for single (non-merged) fires
 	if _, err := pg.AppendConvActivity(c.ID, db.Activity{Worker: item.agentKey, Kind: "user", Summary: firstLine(msg, 200), Detail: msg}); err != nil {
 		log.Printf("[trigger] append msg failed: %v", err)
@@ -815,6 +870,8 @@ func (s *Server) runTriggeredRun(item triggeredRun) {
 	s.chatMu.Lock()
 	s.chatBusy[busyKey] = true
 	s.chatMu.Unlock()
+	// The trusted task identity rides on the CONVERSATION (persisted above), so it also
+	// applies to every follow-up turn; runConversationTurn attaches it per run.
 	s.runConversationSync(c, msg, busyKey)
 }
 
@@ -828,4 +885,16 @@ func firstLine(s string, max int) string {
 		s = string([]rune(s)[:max]) + "…"
 	}
 	return s
+}
+
+// triggerTaskScope resolves the task a triggered run is authorized for, or nil when
+// there is none (interval triggers, platform-level fires). Merged batches are grouped
+// STRICTLY by task (see drainTriggerQueue), so every merged fire still names exactly
+// one task and the scope stays well-defined.
+func (s *Server) triggerTaskScope(item triggeredRun) *int64 {
+	if item.taskID <= 0 {
+		return nil
+	}
+	v := item.taskID
+	return &v
 }

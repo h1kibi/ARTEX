@@ -3,17 +3,34 @@
 package tool
 
 import (
-	"os"
-	"os/exec"
+	"context"
 
-	"github.com/creack/pty"
+	gopty "github.com/aymanbagabas/go-pty"
 )
 
-// startPTY launches cmd attached to a new pseudo-terminal of the given size and
-// returns the master file (read output / write input). Unix implementation via
-// creack/pty. ptySupported reports platform support.
-func startPTY(cmd *exec.Cmd, rows, cols int) (*os.File, error) {
-	return pty.StartWithSize(cmd, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
+// startPTY launches the command attached to a new pseudo-terminal of the given
+// size and returns the master side (read output / write input).
+func startPTY(spec ptySpec) (*ptyProc, error) {
+	shell, flags := shellCmd()
+	ctx := spec.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ptmx, err := gopty.New()
+	if err != nil {
+		return nil, err
+	}
+	if spec.Cols > 0 && spec.Rows > 0 {
+		_ = ptmx.Resize(spec.Cols, spec.Rows)
+	}
+	cmd := ptmx.CommandContext(ctx, shell, append(flags, spec.Command)...)
+	cmd.Dir = ptyWorkDir(spec.WorkDir)
+	cmd.Env = withEnv(spec.Env)
+	if err := cmd.Start(); err != nil {
+		_ = ptmx.Close()
+		return nil, err
+	}
+	return &ptyProc{cmd: cmd, ptmx: ptmx}, nil
 }
 
-func ptySupported() bool { return true }
+func ptySupported() bool { return !InteractiveShellDisabled() }

@@ -975,6 +975,10 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;
+-- 会话的任务授权范围。触发器会话代表某个任务运行时，这里记录该任务：证据类工具的
+-- 归属校验必须在续聊轮次里也生效，而内存 RunInfo 只覆盖首轮。NULL = 无任务授权
+-- （平台对话），跨任务合并批次也为 NULL——没有单一任务可授权。
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL;
 CREATE INDEX IF NOT EXISTS idx_conversations_llm_profile ON conversations(llm_profile_id) WHERE llm_profile_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_conversations_pinned ON conversations(pinned_at DESC) WHERE pinned_at IS NOT NULL;
 DROP TRIGGER IF EXISTS trg_conversations_upd ON conversations;
@@ -1154,6 +1158,14 @@ DROP TRIGGER IF EXISTS trg_conversation_retest_delete ON conversations;
 CREATE TRIGGER trg_conversation_retest_delete BEFORE DELETE ON conversations
     FOR EACH ROW EXECUTE FUNCTION stop_deleted_conversation_retest();
 
+-- Auto-Triager 预检结论：confirmed 有可回查证据支撑 / verifying 仅文字证据待复核 /
+-- rejected 确定性误报。空/confirmed 视为可用；只有 confirmed 能证明目标。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS triage_state TEXT NOT NULL DEFAULT 'confirmed';
+-- 自动确认所依据的证据版本。自动分诊/复测给出的 confirmed 只在证据版本未变化时有效：
+-- 之后有人移除证明流量（evidence_version 递增），旧的 confirmed 不能再用于 prove_goal。
+-- 0 = 历史行或人工确认，不做版本绑定。
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS triage_evidence_version BIGINT NOT NULL DEFAULT 0;
+
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS evidence_version BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_evidence_version BIGINT NOT NULL DEFAULT 0;
 
@@ -1210,9 +1222,13 @@ CREATE TABLE IF NOT EXISTS side_question_sessions (
     version BIGINT NOT NULL,
     snapshot JSONB NOT NULL,
     generation BIGINT NOT NULL DEFAULT 0,
-    CHECK ((conversation_id IS NOT NULL AND task_id IS NULL AND exploration_id IS NULL AND intent_id IS NULL)
+    CHECK ((conversation_id IS NOT NULL AND exploration_id IS NULL AND intent_id IS NULL)
         OR (conversation_id IS NULL AND task_id IS NOT NULL AND exploration_id IS NOT NULL))
 );
+-- A conversation turn bound to a task carries both identities: the task scope
+-- authorises evidence, the conversation owns the btw history. Databases created
+-- before this check are migrated in Go (migrateSideSessionConstraint), because a
+-- DO block inside the multi-statement schema Exec did not take effect there.
 CREATE INDEX IF NOT EXISTS idx_side_sessions_conv ON side_question_sessions(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_side_sessions_task ON side_question_sessions(task_id);
 CREATE INDEX IF NOT EXISTS idx_side_sessions_exp ON side_question_sessions(exploration_id);

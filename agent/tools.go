@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -29,7 +28,7 @@ func intentWorkerSeconds(n *db.Node) float64 {
 // yields, worker_seconds, worker_runs} so the planner sees both the direction
 // and its cost, plus LINEAGE — parents (upstream facts/intents/findings) and
 // yields (facts/findings produced) — without pulling full payloads.
-func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[string]any {
+func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64, classify func(int64) string) []map[string]any {
 	out := make([]map[string]any, 0, len(ns))
 	for _, n := range ns {
 		var p map[string]any
@@ -71,13 +70,52 @@ func compactIntents(ns []*db.Node, parentsOf, yieldsOf map[int64][]int64) []map[
 			m["parents"] = ps // 上游：本意图派生自哪些节点（多个事实可共同产生一个意图）
 		}
 		ys := yieldsOf[n.ID]
-		m["yield_count"] = len(ys)
+		m["yield_count"] = len(ys) // 兼容保留：总产出数（前端与旧提示词仍读它）
+		// 产出分质：high_value=确认漏洞 + 高价值 ProgressEvent fact（validated_weakness/
+		// credential_obtained/privilege_change/lateral_progress/objective_milestone/
+		// finding_written）；observation=普通 observation/claim/hypothesis。
+		// 几条"仍在等待"的 observation 不再能让规划者误判这条意图产出健康。
+		hv, ob := splitYields(ys, classify)
+		m["high_value_yields"] = hv
+		m["observation_yields"] = ob
+		m["effort"] = db.NormalizeEffort(route.Effort)
 		if len(ys) > 0 {
 			m["yields"] = ys // 下游：本意图产生了哪些事实/发现
 		}
 		out = append(out, m)
 	}
 	return out
+}
+
+// yieldClassOf classifies one yield node: a confirmed finding is always high
+// value; a fact is high value only when it carries a high-value ProgressEvent
+// (a plain observation is "busy", not "progress").
+func yieldClassOf(n *db.Node) string {
+	if n == nil {
+		return "observation"
+	}
+	if n.Kind == db.KindFinding {
+		return "high"
+	}
+	if db.IsHighValueProgressEvent(db.ParseFactPayload(n.Payload).ProgressEvent) {
+		return "high"
+	}
+	return "observation"
+}
+
+// splitYields partitions yield node ids into high-value vs plain-observation
+// counts, classify given a node-id → class resolver. Facts carrying a high-value
+// progress_event and confirmed findings count as high value; everything else is
+// observation. Checkpoints are already excluded upstream (yieldsOf skips them).
+func splitYields(ids []int64, classify func(int64) string) (high, obs int) {
+	for _, id := range ids {
+		if classify != nil && classify(id) == "high" {
+			high++
+		} else {
+			obs++
+		}
+	}
+	return high, obs
 }
 
 // ToolSet exposes the PG-backed dual graph (asset + exploration) to an LLM agent.
@@ -90,6 +128,7 @@ type ToolSet struct {
 	worker          string
 	taskID          int64 // PG tasks.id; 0 when unknown (tests / orchestrator cross-task reads)
 	artifactRoots   []string
+	httpCfg         HTTPRequestConfig
 	// coverageDisabled mirrors tasks.coverage_enabled=false. Stored inverted so the
 	// zero value (all existing ToolSet constructions) means ENABLED — matching the
 	// DB default (true). When true: graphOverviewData drops the coverage block, the
@@ -117,6 +156,10 @@ type ToolSet struct {
 	// openIntentCap bounds the Planner's open frontier (2 × task worker count).
 	// Zero disables the check for non-planner tool sets and tests.
 	openIntentCap int
+	// yieldClass classifies a yield node id as "high" (finding or high-value
+	// progress_event fact) or "observation". Set by graphOverviewData from this
+	// round's fact/finding windows; nil (uninitialized tool sets) = all observation.
+	yieldClass func(int64) string
 	// peerOps is the engine-side registry for worker-to-worker resource requests.
 	// nil = the peer tools report unavailable (non-worker agents, tests).
 	peerOps PeerOps
@@ -144,6 +187,10 @@ type ToolSet struct {
 	// goals decomposer (round-0 has no running planner to inform) and workers → those
 	// fall back to the bare notify.
 	notifyGoal func(texts []string)
+	// guardAttributions, if set, returns the task guard's failure-attribution
+	// counters (ok/error/blocked/waf/rate_limited). Surfaced in graph_overview as
+	// guard_attributions so the G5 observer finally informs pacing decisions.
+	guardAttributions func() map[string]int
 	// notifyHint, if set, wakes the planner AND records ONE "人新增了 N 条战略提示：…"
 	// trigger for a whole add_hint call (batch-aware — one call, one trigger) so the next
 	// round is told the round was fired by a new hint and spells the hint out, instead of
@@ -161,6 +208,9 @@ type PeerOps interface {
 	ReleasePeerRequest(receiverIntentID int64, requestID string) error
 	RequestPeerArbitration(fromIntentID int64, requestID, reason string) error
 }
+
+// SetGuardAttributions wires the G5 observer's counters into the overview.
+func (t *ToolSet) SetGuardAttributions(fn func() map[string]int) { t.guardAttributions = fn }
 
 // SetPeerOps wires the per-task peer request registry. Workers set it on each
 // run; other agents leave it nil so the tools stay unavailable.
@@ -201,6 +251,11 @@ type WriteCounts struct {
 	Facts    int
 	Assets   int
 	Findings int
+	// HumanNeeded reports that this run hit a point only a human can pass (captcha,
+	// MFA, SSO login, an approval, a jump host) and said so through record_fact's
+	// need_human flag. The engine parks the intent in `paused` instead of closing it
+	// as done, so the slot frees up for other lanes and the human can resume it.
+	HumanNeeded bool
 }
 
 // Total is every node persisted this run, regardless of kind — the
@@ -236,6 +291,25 @@ func (t *ToolSet) SetArtifactRoots(dirs ...string) {
 		}
 	}
 	t.artifactRoots = clean
+}
+
+// SetHTTPConfig supplies the proxy tag, MITM CA, cookie dir and artifact dir used
+// by the in-process http_request tool of this run.
+func (t *ToolSet) SetHTTPConfig(cfg HTTPRequestConfig) { t.httpCfg = cfg }
+
+// httpRequest is the in-process HTTP tool. The configuration is resolved per call
+// so a worker's task/intent-tagged proxy and cookie dir apply without rebuilding
+// the tool list.
+func (t *ToolSet) httpRequest() actool.CoreTool {
+	return NewHTTPRequestToolDynamic(func(ctx context.Context) HTTPRequestConfig {
+		if t.httpCfg != (HTTPRequestConfig{}) {
+			return t.httpCfg
+		}
+		if HTTPConfigFor != nil {
+			return HTTPConfigFor(ctx)
+		}
+		return HTTPRequestConfig{}
+	})
 }
 
 // SetCoverageEnabled records whether this task has the asset-coverage feature on
@@ -304,22 +378,9 @@ func (t *ToolSet) anchorOwner(assetID int64) {
 	}
 }
 
-// pid parses an id that may arrive as a JSON number or string ("" / 0 → 0).
-func pid(raw json.RawMessage) int64 {
-	if len(raw) == 0 {
-		return 0
-	}
-	var n int64
-	if json.Unmarshal(raw, &n) == nil {
-		return n
-	}
-	var s string
-	if json.Unmarshal(raw, &s) == nil {
-		v, _ := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
-		return v
-	}
-	return 0
-}
+// pid parses an id that may arrive as a JSON number or a string, including the
+// display forms "#14825", "intent:14825", "fact:14825", "asset:42" ("" / 0 → 0).
+func pid(raw json.RawMessage) int64 { return looseID(raw) }
 
 // pidList parses a list of ids (number|string), dropping zeros/invalids.
 func pidList(raw []json.RawMessage) []int64 {
@@ -404,762 +465,6 @@ func jsonResult(v any) (actool.Result, error) {
 		return actool.Errorf(err.Error()), nil
 	}
 	return actool.Text(string(b)), nil
-}
-
-// --- read tools (planner + worker) ---
-
-func (t *ToolSet) graphOverview() actool.CoreTool {
-	return t.readExpTool("graph_overview",
-		"(探索链路图)探索态势蒸馏摘要：资产计数、无接口的站点、frontier、发现、hints(人类/主 agent 的战略提示，生成意图时须纳入)。规划时先调它。",
-		obj(map[string]any{}),
-		func(context.Context, json.RawMessage) (actool.Result, error) {
-			return jsonResult(t.graphOverviewData())
-		})
-}
-
-// graphOverviewData computes the distilled situational snapshot shared by the
-// graph_overview tool and the planner's wake-up prompt (which pre-injects it so
-// the model needn't spend a turn calling the tool — every plan round starts with
-// an empty context and always needs this first).
-func (t *ToolSet) graphOverviewData() map[string]any {
-	out := map[string]any{}
-	// goals summary folded in so the planner needn't call list_goals each round.
-	goals, _ := t.ts.ListByKind(db.KindGoal, 100)
-	gsum := make([]map[string]any, 0, len(goals))
-	for _, g := range goals {
-		var p map[string]any
-		_ = json.Unmarshal(g.Payload, &p)
-		gsum = append(gsum, map[string]any{"id": g.ID, "state": g.State, "text": p["text"]})
-	}
-	out["goals"] = gsum
-	// hints: 人类/主 agent 通过 add_hint 挂上图的战略提示；folded in so the
-	// planner reads them every round when generating intents (否则只写不读).
-	hints, _ := t.ts.ListByKind(db.KindHint, 50)
-	hsum := make([]map[string]any, 0, len(hints))
-	for _, h := range hints {
-		var p map[string]any
-		_ = json.Unmarshal(h.Payload, &p)
-		hint := map[string]any{"id": h.ID, "state": h.State, "text": p["text"]}
-		if findingTrafficBindingEnabled() && p["traffic_refs"] != nil {
-			hint["traffic_refs"] = p["traffic_refs"]
-		}
-		hsum = append(hsum, hint)
-	}
-	out["hints"] = hsum
-	// lineage from the exploration edges: an intent's parents (what it
-	// derived_from — possibly several facts combined) and its yields (the
-	// facts/findings it produced). factFrom maps a fact → the intent that
-	// produced it. This is the relationship layer the flat lists lacked.
-	// Checkpoints are yielded facts too, but they are route bookkeeping. Load the
-	// full id set so yield_count and the wake-up triggers only count real
-	// exploration output (not just the recent 1000-fact window).
-	factNodes, _ := t.ts.ListByKind(db.KindFact, 1000) // newest first
-	checkpointIDs, _ := t.ts.CheckpointFactIDs()
-	edges, _ := t.ts.Edges(5000)
-	parentsOf := map[int64][]int64{}
-	yieldsOf := map[int64][]int64{}
-	factFrom := map[int64]int64{}
-	for _, e := range edges {
-		switch e.Rel {
-		case db.RelDerivedFrom, db.RelSpawns: // upstream: derived_from (fact/finding/intent→intent) or spawns (origin fact→goal, legacy begin→intent)
-			parentsOf[e.To] = append(parentsOf[e.To], e.From)
-		case db.RelYields: // intent --yields--> fact/finding
-			if checkpointIDs[e.To] {
-				continue
-			}
-			yieldsOf[e.From] = append(yieldsOf[e.From], e.To)
-			factFrom[e.To] = e.From
-		}
-	}
-	// cold-digest §6: members folded into an active digest are shown via cold_digests
-	// (below), not the flat recent_* lists. `covered` maps member id → its digest id.
-	// §6 render-time revival check: a covered member that has become hot again (a new
-	// intent derived from it) must reappear this round — so `hidden` folds a member out
-	// only when it is covered AND still cold.
-	covered, _ := t.ts.CoveredMembers()
-	// Render-time hot set (ancestor of a live intent / fact under a live intent).
-	// §6 revival check: a covered member that revived (now hot) must NOT stay folded
-	// — hidden() only folds a member out when it is covered AND still cold. Computed
-	// every round (cheap for real graph sizes); nil map degrades safely.
-	var hotAtRender map[int64]bool
-	if cg, _, err := loadColdGraph(t.ts); err == nil {
-		hotAtRender = cg.hotSet()
-	}
-	hidden := func(id int64) bool { _, c := covered[id]; return c && !hotAtRender[id] }
-	const openIntentsCap = 30
-	fr, _ := t.ts.Frontier(openIntentsCap) // priority DESC, id ASC —— 优先级最高的前 N 条；真实总数见 frontier_open
-	out["open_intents"] = compactIntents(fr, parentsOf, yieldsOf)
-	all, _ := t.ts.ListByKind(db.KindIntent, 300)
-	var running, recentDone []*db.Node
-	for _, n := range all {
-		switch n.State {
-		case "running":
-			running = append(running, n)
-		case "done", "blocked", "exhausted", "stopped":
-			if hidden(n.ID) {
-				continue // in a cold_digest and still cold — shown via cold_digests (§6.2)
-			}
-			recentDone = append(recentDone, n) // 最新在前（all 按 id 降序）；折叠的已剔除，输出时截最新 N
-		}
-	}
-	out["running_intents"] = compactIntents(running, parentsOf, yieldsOf)
-	// done_intents_total：已结束意图（done/blocked/exhausted/stopped）总数，与
-	// recent_done_intents 平行命名——后者只是它的最新窗口截断视图。stopped 包含
-	// Planner 取消和人工终止，后续轮次必须能看到并据此去重。
-	if dt, err := t.ts.CountFinishedIntents(); err == nil {
-		out["done_intents_total"] = dt
-	}
-	// frontier_open：开放意图真实总数（open_intents 只是其中优先级最高的前 N 条截断视图）。
-	frontierOpen := len(fr)
-	if fo, err := t.ts.CountOpenIntents(); err == nil {
-		frontierOpen = fo
-	}
-	out["frontier_open"] = frontierOpen
-	if t.openIntentCap > 0 {
-		remaining := t.openIntentCap - frontierOpen
-		if remaining < 0 {
-			remaining = 0
-		}
-		out["open_intent_cap"] = t.openIntentCap
-		out["open_intent_remaining"] = remaining
-		out["cap_reached"] = frontierOpen >= t.openIntentCap
-	}
-	// findings (confirmed vulns) and facts (worker exploration results) are
-	// now distinct node kinds. recent_facts surfaces fact summaries (esp.
-	// negative results) so the planner sees them in one call; full content
-	// via node_detail(id).
-	vulnNodes, _ := t.ts.ListByKind(db.KindFinding, 1000)
-	// Checkpoints are route bookkeeping and origin facts are the task root, not
-	// exploration facts: keep both out of the planner's fact count and window
-	// (the Route block shows checkpoints; origin is implicit).
-	infoFacts := make([]*db.Node, 0, len(factNodes))
-	for _, n := range factNodes {
-		if n.FactType() == db.FactTypeCheckpoint || n.State == db.StateOrigin {
-			continue
-		}
-		infoFacts = append(infoFacts, n)
-	}
-	out["findings_total"] = len(vulnNodes) // 确认漏洞总数（目标判定看它）；明细见 finding_list（最新一窗）
-	out["facts"] = len(infoFacts)          // 探索事实/结论数（含否定结论，不含 checkpoint）
-	// findings 是任务里最高价值的产物 → 概览带最新一窗（≤10 条，vulnNodes 已按 id 降序即最新在前），
-	// 让 planner 每轮判目标时一眼看到最近确认的漏洞；全量/更早的用 list_findings 取。
-	// 每条只留 {id, summary, from_intent?}：from_intent 是产生本漏洞的意图。
-	// evidence/assets/vulnclass/severity/state 等仍可用 list_findings / node_detail(id) 取。
-	const findingListCap = 10
-	findingList := make([]map[string]any, 0, findingListCap)
-	for _, n := range vulnNodes {
-		if len(findingList) >= findingListCap {
-			break
-		}
-		var fp map[string]any
-		_ = json.Unmarshal(n.Payload, &fp)
-		m := map[string]any{"id": n.ID, "summary": fp["summary"]}
-		if from := factFrom[n.ID]; from > 0 {
-			m["from_intent"] = from // 本漏洞由哪个意图产生
-		}
-		findingList = append(findingList, m)
-	}
-	out["finding_list"] = findingList
-	// recent_facts：非折叠事实里最新的一窗（≤N，infoFacts 按 id 降序即最新在前）。已折进
-	// digest 且仍冷的（hidden）走 cold_digests，不在此重复。每条 {id, summary, from_intent?,
-	// confidence?}；evidence 等详情用 node_detail(id)。更早的用 list_facts 翻。
-	const recentFactsCap = 20
-	recentFacts := make([]map[string]any, 0, recentFactsCap)
-	for _, n := range infoFacts {
-		if len(recentFacts) >= recentFactsCap {
-			break
-		}
-		if hidden(n.ID) {
-			continue // 已折进 digest 且仍冷 —— 见 cold_digests
-		}
-		m := compactNode(n)
-		if from := factFrom[n.ID]; from > 0 {
-			m["from_intent"] = from // 本事实由哪个意图产生
-		}
-		// confidence 带进概览：让规划者一眼看出哪条结论只是 inferred（尤其否定结论
-		// 别当铁案）；evidence 较长，留给 node_detail(id)。
-		var fp map[string]any
-		if json.Unmarshal(n.Payload, &fp) == nil {
-			if c, ok := fp["confidence"].(string); ok && c != "" {
-				m["confidence"] = c
-			}
-		}
-		recentFacts = append(recentFacts, m)
-	}
-	out["recent_facts"] = recentFacts
-
-	// Route Graph 摘要：当前路线的阶段、目标、预算、最近 checkpoint。这里只放
-	// 引用和摘要，完整证据用 node_detail / expand_digest 取。
-	type routeAgg struct {
-		id         int64
-		phase      string
-		objective  string
-		kind       string
-		budget     db.RouteBudget
-		used       db.RouteBudgetUsed
-		intents    int
-		active     int
-		assets     []int64
-		checkpoint *db.Node
-	}
-	routeMap := map[int64]*routeAgg{}
-	for _, n := range all {
-		r := db.ParseIntentRoute(n)
-		if r.RouteID <= 0 {
-			continue
-		}
-		agg := routeMap[r.RouteID]
-		if agg == nil {
-			agg = &routeAgg{id: r.RouteID, kind: r.RouteKind, budget: r.Budget}
-			routeMap[r.RouteID] = agg
-		}
-		agg.intents++
-		if n.State == "open" || n.State == "running" || n.State == "paused" {
-			agg.active++
-		}
-		if agg.phase == "" {
-			agg.phase = r.PathPhase
-		}
-		if agg.objective == "" {
-			agg.objective = r.Objective
-		}
-		if agg.budget.Empty() && !r.Budget.Empty() {
-			agg.budget = r.Budget
-		}
-		if agg.used == (db.RouteBudgetUsed{}) && r.BudgetUsed != (db.RouteBudgetUsed{}) {
-			agg.used = r.BudgetUsed
-		}
-		var ip struct {
-			AssetIDs []int64 `json:"asset_ids"`
-		}
-		if json.Unmarshal(n.Payload, &ip) == nil {
-			agg.assets = appendUniqueInt64(agg.assets, ip.AssetIDs...)
-		}
-	}
-	const checkpointListCap = 10
-	checkpoints := make([]map[string]any, 0, checkpointListCap)
-	candidates := make([]map[string]any, 0, 10)
-	infoCounts := map[string]int{}
-	for _, n := range factNodes {
-		ft := n.FactType()
-		if ft != db.FactTypeCheckpoint && n.State != db.StateOrigin {
-			infoCounts[ft]++
-		}
-		switch ft {
-		case db.FactTypeCheckpoint:
-			p := db.ParseFactPayload(n.Payload)
-			if agg := routeMap[p.RouteID]; agg != nil && agg.checkpoint == nil {
-				agg.checkpoint = n
-				if p.BudgetUsed != (db.RouteBudgetUsed{}) {
-					agg.used = p.BudgetUsed
-				}
-			}
-			if len(checkpoints) < checkpointListCap {
-				checkpoints = append(checkpoints, compactCheckpoint(n, p))
-			}
-		case db.FactTypeFindingCandidate:
-			if len(candidates) < 10 {
-				p := db.ParseFactPayload(n.Payload)
-				candidates = append(candidates, compactCandidate(n, p))
-			}
-		}
-	}
-	routes := make([]map[string]any, 0, len(routeMap))
-	for _, agg := range routeMap {
-		m := map[string]any{
-			"route_id": agg.id, "route_kind": agg.kind, "phase": agg.phase,
-			"objective": agg.objective, "intents": agg.intents, "active_intents": agg.active,
-			"asset_ids": agg.assets,
-		}
-		if !agg.budget.Empty() {
-			m["budget"] = agg.budget
-		}
-		if agg.used != (db.RouteBudgetUsed{}) {
-			m["budget_used"] = agg.used
-		}
-		if agg.checkpoint != nil {
-			p := db.ParseFactPayload(agg.checkpoint.Payload)
-			m["checkpoint"] = compactCheckpoint(agg.checkpoint, p)
-		}
-		routes = append(routes, m)
-	}
-	sort.Slice(routes, func(i, j int) bool {
-		ai, _ := routes[i]["active_intents"].(int)
-		aj, _ := routes[j]["active_intents"].(int)
-		if ai != aj {
-			return ai > aj
-		}
-		return routes[i]["route_id"].(int64) > routes[j]["route_id"].(int64)
-	})
-	if len(routes) > 20 {
-		routes = routes[:20]
-	}
-	out["routes"] = routes
-	out["checkpoints"] = checkpoints
-	out["finding_candidates"] = candidates
-	out["information_counts"] = infoCounts
-
-	// recent_done_intents：非折叠的已结束意图里最新的一窗（≤N，recentDone 已按 id 降序）。
-	// 更早的看 done_intents_total 计数 + node_detail(id)。
-	const recentDoneCap = 12
-	if len(recentDone) > recentDoneCap {
-		recentDone = recentDone[:recentDoneCap]
-	}
-	out["recent_done_intents"] = compactIntents(recentDone, parentsOf, yieldsOf)
-	// cold-digest §6.1: 折叠冷区的 digest body，按最新成员时间降序取前 N；被截的更旧 digest
-	// 只给裸 id（仍可 expand_digest 展开），避免冷区唯一出口被无限拉长。
-	const coldDigestsCap = 15
-	if cds, more := coldDigestsRecent(t.ts, coldDigestsCap); len(cds) > 0 {
-		out["cold_digests"] = cds // [{id, body, member_count}] —— 直接读 body (§6.1)
-		if len(more) > 0 {
-			out["cold_digests_more"] = more // 被截断的更旧 digest 的 id；用 expand_digest(id) 展开
-		}
-	}
-	// the original task (root) so the planner always has it, not just the
-	// decomposed goals.
-	if description, goal, err := t.ts.Root(); err == nil {
-		out["task"] = map[string]any{"description": description, "goal": goal}
-	}
-	// Direct source tasks are a live, read-only blackboard view. Keep their
-	// summaries in a separate field so their intents never enter this task's
-	// frontier or get mistaken for locally claimable work.
-	out["related_tasks"] = t.relatedTaskOverviews()
-	// coverage：粗略的资产测试覆盖度参考——范围(task_scope)内的资产里，被 fact 碰过的
-	// 占比 + by_type(按类型的 总数/已测)。要看未测的具体资产由 agent 按需调 list_untested_assets 自行判断。仅任务上下文有。
-	// 资产覆盖度功能关闭时(coverageDisabled)：只保留 host_count(目标主机数的感知信息)，
-	// 丢弃 denominator/tested/pct/by_type/note 等覆盖度度量，避免污染上下文、也不诱导
-	// 已隐藏的 add_task_scope/list_untested_assets。
-	if t.as != nil && t.ts != nil && t.taskID > 0 {
-		{
-			m := map[string]any{}
-			if !t.coverageDisabled {
-				if cov, err := t.as.TaskCoverageWithSources(t.taskID); err == nil {
-					m["denominator"] = cov.Denominator
-					m["tested"] = cov.Tested
-					m["by_type"] = cov.ByType
-					m["note"] = "coverage资产测试覆盖度（包括接口等各种相关资产），粗略估计、仅供参考：包含当前任务与直接关联任务的 scope、事实锚点；关联 scope 只读。容器型资产/大量枚举会让它偏低，勿据此认为已测完；可用 add_task_scope 增补本任务范围、list_untested_assets 看未测资产【通常不调用list_untested_assets，按照任务推进即可】；"
-					if cov.Denominator == 0 {
-						m["pct"] = nil
-						m["status"] = "范围未锚定"
-					} else {
-						m["pct"] = cov.Pct
-					}
-				}
-				if scope := compactTaskScope(t.as, t.taskID); len(scope) > 0 {
-					m["scope"] = scope
-					m["scope_count"] = len(scope)
-				}
-			}
-			if hosts, err := t.as.HostsByTaskWithSources(t.taskID); err == nil {
-				// 只给主机总数，不再把 host 列表平铺进 graph_overview（大范围任务里那是每轮
-				// 都重复携带的大量字符串，对规划决策价值有限）；具体主机按需 list_assets 查。
-				m["host_count"] = len(hosts)
-			}
-			if len(m) > 0 {
-				out["coverage"] = m
-			}
-		}
-	}
-	return out
-}
-
-// compactTaskScope renders the task's own scope rows for the coverage block. A
-// company reference is expanded into its company_scope rules and keywords so the
-// planner sees the authorization boundary without a second tool call; the same
-// keyword is also retained in the rule list, matching the company scope view.
-func compactTaskScope(as *db.AssetStore, taskID int64) []map[string]any {
-	if as == nil || taskID <= 0 {
-		return nil
-	}
-	rows, err := as.ListTaskScope(taskID)
-	if err != nil || len(rows) == 0 {
-		return nil
-	}
-	out := make([]map[string]any, 0, len(rows))
-	for _, row := range rows {
-		entry := map[string]any{"kind": row.Kind, "source": row.Source}
-		if row.CompanyID != nil {
-			entry["company_id"] = *row.CompanyID
-		}
-		if row.CompanyName != "" {
-			entry["company_name"] = row.CompanyName
-		}
-		switch {
-		case row.Domain != "":
-			entry["value"] = row.Domain
-		case row.Net != "":
-			entry["value"] = row.Net
-		case row.Value != "":
-			entry["value"] = row.Value
-		}
-		if row.Reason != "" {
-			entry["reason"] = row.Reason
-		}
-		if row.CompanyID != nil && as.Companies() != nil {
-			if rules, err := as.Companies().GetScope(*row.CompanyID); err == nil && len(rules) > 0 {
-				companyScope := make([]map[string]any, 0, len(rules))
-				var keywords []string
-				for _, rule := range rules {
-					// Show the human-entered ICP/keyword text; domains and networks
-					// use their normalized form. A single IP is stored as /32 or
-					// /128 CIDR, but the scope view should read as the address.
-					value := rule.Raw
-					switch rule.Kind {
-					case "domain":
-						value = rule.Domain
-					case "ip":
-						value = strings.TrimSuffix(strings.TrimSuffix(rule.Net, "/128"), "/32")
-					case "cidr":
-						value = rule.Net
-					}
-					if value == "" {
-						value = rule.Value
-					}
-					if value == "" {
-						value = rule.Raw
-					}
-					companyScope = append(companyScope, map[string]any{"kind": rule.Kind, "value": value})
-					if rule.Kind == "keyword" {
-						keywords = append(keywords, value)
-					}
-				}
-				entry["company_scope"] = companyScope
-				entry["company_keywords"] = keywords
-			}
-		}
-		out = append(out, entry)
-	}
-	return out
-}
-
-func inheritedMap(m map[string]any, sourceTaskID int64) map[string]any {
-	m["source_task_id"] = sourceTaskID
-	m["inherited"] = true
-	return m
-}
-
-const (
-	relatedOverviewTotalTextRunes      = 48_000
-	relatedOverviewMaxTextPerSource    = 8_000
-	relatedOverviewMaxGoalsPerSource   = 8
-	relatedOverviewMaxHintsPerSource   = 6
-	relatedOverviewMaxFactsPerSource   = 12
-	relatedOverviewMaxFindingsPerTask  = 6
-	relatedOverviewMaxIntentsPerTask   = 8
-	relatedOverviewMaxScopePerSource   = 12
-	relatedOverviewMaxDigestsPerSource = 6
-)
-
-// overviewTextBudget bounds inherited prompt text while preserving a fair slice
-// for every direct source. Full evidence remains available through the on-demand
-// read tools, so truncation here does not discard persisted blackboard data.
-type overviewTextBudget struct {
-	remaining int
-	truncated bool
-}
-
-func relatedOverviewBudgetForSources(sourceCount int) int {
-	if sourceCount <= 0 {
-		return 0
-	}
-	if sourceCount > db.MaxTaskSourceCount {
-		sourceCount = db.MaxTaskSourceCount
-	}
-	perSource := relatedOverviewTotalTextRunes / sourceCount
-	if perSource > relatedOverviewMaxTextPerSource {
-		perSource = relatedOverviewMaxTextPerSource
-	}
-	return perSource
-}
-
-func (b *overviewTextBudget) take(value any, fieldLimit int) string {
-	var text string
-	switch value := value.(type) {
-	case string:
-		text = strings.TrimSpace(value)
-	case nil:
-		return ""
-	default:
-		text = strings.TrimSpace(fmt.Sprint(value))
-	}
-	if text == "" {
-		return ""
-	}
-	if b.remaining <= 0 || fieldLimit <= 0 {
-		b.truncated = true
-		return ""
-	}
-	runes := []rune(text)
-	limit := fieldLimit
-	if limit > b.remaining {
-		limit = b.remaining
-	}
-	if len(runes) > limit {
-		b.truncated = true
-		if limit == 1 {
-			text = "…"
-		} else {
-			text = string(runes[:limit-1]) + "…"
-		}
-		runes = []rune(text)
-	}
-	b.remaining -= len(runes)
-	return text
-}
-
-func recentTerminalIntents(store *db.ExplorationStore, limit int) []*db.Node {
-	if limit <= 0 {
-		return []*db.Node{}
-	}
-	const batch = 300
-	cursor := int64(0)
-	out := make([]*db.Node, 0, limit)
-	for len(out) < limit {
-		page, more, err := store.ListByKindPage(db.KindIntent, cursor, batch)
-		if err != nil || len(page) == 0 {
-			break
-		}
-		for _, intent := range page {
-			switch intent.State {
-			case "done", "blocked", "exhausted", "stopped":
-				out = append(out, intent)
-			}
-			if len(out) >= limit {
-				break
-			}
-		}
-		if !more {
-			break
-		}
-		cursor = page[len(page)-1].ID
-	}
-	return out
-}
-
-// relatedTaskOverviews distills persistent blackboard state from direct source
-// tasks. It intentionally reads each source's local store methods, never its own
-// related sources, so inheritance is one level only.
-func (t *ToolSet) relatedTaskOverviews() []map[string]any {
-	sources, err := t.ts.DirectSourceStores()
-	if err != nil {
-		return []map[string]any{}
-	}
-	if len(sources) > db.MaxTaskSourceCount {
-		sources = sources[:db.MaxTaskSourceCount]
-	}
-	perSourceTextBudget := relatedOverviewBudgetForSources(len(sources))
-	out := make([]map[string]any, 0, len(sources))
-	for _, source := range sources {
-		ts := source.Store
-		// §2 cross-task: render the source task's OWN folded view — fold out the
-		// members it has already folded, and surface its cold_digests read-only.
-		hidden := hiddenMembersFor(ts)
-		checkpointIDs, _ := ts.CheckpointFactIDs()
-		budget := overviewTextBudget{remaining: perSourceTextBudget}
-		item := map[string]any{
-			"source_task_id": source.Task.TaskID,
-			"inherited":      true,
-			"task": map[string]any{
-				"description": budget.take(source.Task.Description, 800),
-				"goal":        budget.take(source.Task.Goal, 800),
-				"status":      source.Task.Status,
-			},
-		}
-		stats, statsErr := ts.Stats()
-
-		edges, _ := ts.Edges(5000)
-		parentsOf := map[int64][]int64{}
-		yieldsOf := map[int64][]int64{}
-		factFrom := map[int64]int64{}
-		for _, edge := range edges {
-			switch edge.Rel {
-			case db.RelDerivedFrom, db.RelSpawns:
-				parentsOf[edge.To] = append(parentsOf[edge.To], edge.From)
-			case db.RelYields:
-				if checkpointIDs[edge.To] {
-					continue
-				}
-				yieldsOf[edge.From] = append(yieldsOf[edge.From], edge.To)
-				factFrom[edge.To] = edge.From
-			}
-		}
-
-		goals, _ := ts.ListByKind(db.KindGoal, relatedOverviewMaxGoalsPerSource)
-		goalSummary := make([]map[string]any, 0, len(goals))
-		for _, goal := range goals {
-			var payload map[string]any
-			_ = json.Unmarshal(goal.Payload, &payload)
-			goalSummary = append(goalSummary, inheritedMap(map[string]any{
-				"id": goal.ID, "state": goal.State, "text": budget.take(payload["text"], 400),
-			}, source.Task.TaskID))
-		}
-		item["goals"] = goalSummary
-
-		hints, _ := ts.ListByKind(db.KindHint, relatedOverviewMaxHintsPerSource)
-		hintSummary := make([]map[string]any, 0, len(hints))
-		for _, hint := range hints {
-			var payload map[string]any
-			_ = json.Unmarshal(hint.Payload, &payload)
-			hintSummary = append(hintSummary, inheritedMap(map[string]any{
-				"id": hint.ID, "state": hint.State, "text": budget.take(payload["text"], 400),
-			}, source.Task.TaskID))
-		}
-		item["hints"] = hintSummary
-
-		facts, _ := ts.ListFactsExcludingBookkeeping(relatedOverviewMaxFactsPerSource)
-		factTotal := len(facts)
-		findings, _ := ts.ListByKind(db.KindFinding, relatedOverviewMaxFindingsPerTask)
-		intentNodes, _ := ts.ListByKind(db.KindIntent, 300)
-		terminalIntent := make(map[int64]bool, len(intentNodes))
-		for _, intent := range intentNodes {
-			terminalIntent[intent.ID] = db.IsTerminalIntentState(intent.State)
-		}
-		item["facts"] = len(facts)
-		item["findings"] = len(findings)
-		if statsErr == nil {
-			realFacts := stats[db.KindFact] - len(checkpointIDs)
-			if realFacts > 0 {
-				realFacts-- // task-root origin fact
-			}
-			if realFacts < 0 {
-				realFacts = 0
-			}
-			factTotal = realFacts
-			item["facts"] = factTotal
-			item["findings"] = stats[db.KindFinding]
-			if stats[db.KindGoal] > len(goals) || stats[db.KindHint] > len(hints) ||
-				factTotal > len(facts) || stats[db.KindFinding] > len(findings) {
-				budget.truncated = true
-			}
-		}
-		recentFindings := make([]map[string]any, 0, len(findings))
-		for _, finding := range findings {
-			entry := inheritedMap(compactFinding(finding), source.Task.TaskID)
-			entry["summary"] = budget.take(entry["summary"], 400)
-			recentFindings = append(recentFindings, entry)
-		}
-		item["recent_findings"] = recentFindings
-		recentFacts := make([]map[string]any, 0, len(facts))
-		now := time.Now()
-		for _, fact := range facts {
-			if ok, _ := db.CanInheritFact(fact, now); !ok {
-				continue
-			}
-			if hidden(fact.ID) {
-				continue // folded into this source's cold_digests — shown there (§2/§6.2)
-			}
-			m := inheritedMap(compactNode(fact), source.Task.TaskID)
-			m["summary"] = budget.take(m["summary"], 400)
-			if from := factFrom[fact.ID]; from > 0 && terminalIntent[from] {
-				m["from_intent"] = from
-			}
-			var payload map[string]any
-			if json.Unmarshal(fact.Payload, &payload) == nil {
-				if confidence, ok := payload["confidence"].(string); ok && confidence != "" {
-					m["confidence"] = confidence
-				}
-			}
-			recentFacts = append(recentFacts, m)
-		}
-		item["recent_facts"] = recentFacts
-
-		recentDoneRaw := recentTerminalIntents(ts, relatedOverviewMaxIntentsPerTask)
-		recentDone := recentDoneRaw[:0] // in-place filter: drop this source's folded intents (§2)
-		for _, intent := range recentDoneRaw {
-			if hidden(intent.ID) {
-				continue
-			}
-			recentDone = append(recentDone, intent)
-		}
-		for _, intent := range recentDone {
-			intent.Inherited = true
-			intent.SourceTaskID = source.Task.TaskID
-		}
-		intentResults := compactIntents(recentDone, parentsOf, yieldsOf)
-		for i, intent := range recentDone {
-			intentResults[i]["summary"] = budget.take(intentResults[i]["summary"], 400)
-			acts, _, err := ts.ActivityPageForTerminalIntent(intent.ID, 0, 20)
-			if err != nil {
-				continue
-			}
-			var resultSummary, textFallback string
-			for _, activity := range acts {
-				switch activity.Kind {
-				case "result":
-					resultSummary = activity.Summary
-				case "text":
-					textFallback = activity.Summary
-				}
-			}
-			if resultSummary == "" {
-				resultSummary = textFallback
-			}
-			if resultSummary != "" {
-				intentResults[i]["result_summary"] = budget.take(resultSummary, 800)
-			}
-		}
-		item["recent_intent_results"] = intentResults
-		// §2 cross-task: the source task's folded cold region, read-only, newest-member
-		// first & capped like the current task's. Members (and overflow digests) are
-		// resolvable via expand_digest(id)/node_detail(id), which search source tasks.
-		if cds, more := coldDigestsRecent(ts, relatedOverviewMaxDigestsPerSource); len(cds) > 0 {
-			for _, cd := range cds {
-				cd["inherited"] = true
-				cd["source_task_id"] = source.Task.TaskID
-				// A digest body may summarize members that are non-inheritable;
-				// expose only its id/member_count, never the source prose.
-				delete(cd, "body")
-				cd["body_withheld"] = "关联任务摘要正文不跨任务展开"
-			}
-			item["cold_digests"] = cds
-			if len(more) > 0 {
-				item["cold_digests_more"] = more // 被截断的更旧 digest 的 id；expand_digest(id) 展开
-			}
-		}
-		if statsErr == nil {
-			item["node_stats"] = stats
-		}
-
-		if t.as != nil {
-			if scopeRows, err := t.as.ListTaskScope(source.Task.TaskID); err == nil && len(scopeRows) > 0 {
-				scopeCount := len(scopeRows)
-				if len(scopeRows) > relatedOverviewMaxScopePerSource {
-					scopeRows = scopeRows[:relatedOverviewMaxScopePerSource]
-					budget.truncated = true
-				}
-				scope := make([]map[string]any, 0, len(scopeRows))
-				for _, row := range scopeRows {
-					entry := map[string]any{"kind": row.Kind, "source": budget.take(row.Source, 300)}
-					switch {
-					case row.Domain != "":
-						entry["value"] = budget.take(row.Domain, 400)
-					case row.Net != "":
-						entry["value"] = budget.take(row.Net, 400)
-					case row.Value != "":
-						entry["value"] = budget.take(row.Value, 400)
-					case row.CompanyID != nil:
-						entry["company_id"] = *row.CompanyID
-					}
-					scope = append(scope, entry)
-				}
-				item["asset_scope"] = scope
-				item["asset_scope_count"] = scopeCount
-			}
-			if coverage, err := t.as.TaskCoverage(source.Task.TaskID, source.Task.ExplorationID); err == nil {
-				item["asset_coverage"] = map[string]any{
-					"denominator": coverage.Denominator,
-					"tested":      coverage.Tested,
-					"pct":         coverage.Pct,
-					"by_type":     coverage.ByType,
-				}
-			}
-		}
-		if budget.truncated {
-			item["summary_truncated"] = true
-		}
-		out = append(out, item)
-	}
-	return out
 }
 
 // compactNode distills any exploration node to id + summary + state, dropping the
@@ -1406,13 +711,18 @@ type intentItem struct {
 	AssetIDs         []json.RawMessage `json:"asset_ids"`
 	ParentIDs        []json.RawMessage `json:"parent_ids"`
 	Priority         int               `json:"priority"`
-	ContinuationOf   int64             `json:"continuation_of"`
+	ContinuationOf   json.RawMessage   `json:"continuation_of"`
 	RouteKind        string            `json:"route_kind"`
 	Objective        string            `json:"objective"`
 	Phase            string            `json:"phase"`
 	ExpectedEvidence []string          `json:"expected_evidence"`
 	SuccessCondition string            `json:"success_condition"`
-	Budget           routeBudgetItem   `json:"budget"`
+	// Effort is the discrete run tier (probe/standard/deep). It replaces the
+	// model-authored numeric budget: the engine maps it to turn/cycle limits.
+	Effort string `json:"effort"`
+	// Budget stays parseable so historical JSON (and older prompts/tests) still
+	// load; it is no longer enforced and is not taught to the model.
+	Budget routeBudgetItem `json:"budget"`
 }
 
 // addOneIntent 创建一条意图节点并连上游血缘，返回 id。
@@ -1424,8 +734,25 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if strings.TrimSpace(it.Summary) == "" {
 		return 0, fmt.Errorf("summary 不能为空")
 	}
+	// Continuation ids arrive as numbers or display strings ("#14825"); parse them
+	// once at the tool boundary so the object case never rejects the whole intent.
+	continuationID := pid(it.ContinuationOf)
 	// 先校验锚点（建节点前，避免坏锚点留下孤儿意图）。
 	parents := pidList(it.ParentIDs)
+	if continuationID > 0 {
+		// A continuation inherits the route's latest checkpoint. Models routinely
+		// echo that checkpoint into parent_ids; it is bookkeeping, not knowledge, so
+		// drop it here instead of failing the whole intent.
+		kept := parents[:0]
+		for _, pidv := range parents {
+			n, err := t.ts.GetNodeWithSources(pidv)
+			if err == nil && n != nil && !n.Inherited && n.Kind == db.KindFact && n.FactType() == db.FactTypeCheckpoint {
+				continue
+			}
+			kept = append(kept, pidv)
+		}
+		parents = kept
+	}
 	for _, pidv := range parents {
 		n, err := t.ts.GetNodeWithSources(pidv)
 		if err != nil || n == nil {
@@ -1439,16 +766,16 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 		}
 	}
 	var continuation *db.Node
-	if it.ContinuationOf > 0 {
-		n, err := t.ts.GetNodeWithSources(it.ContinuationOf)
+	if continuationID > 0 {
+		n, err := t.ts.GetNodeWithSources(continuationID)
 		if err != nil || n == nil || n.Kind != db.KindIntent {
-			return 0, fmt.Errorf("continuation_of %d 不是本任务可用的意图 id", it.ContinuationOf)
+			return 0, fmt.Errorf("continuation_of %d 不是本任务可用的意图 id", continuationID)
 		}
 		if n.Inherited {
-			return 0, fmt.Errorf("continuation_of %d 是关联任务的历史意图，只读，不能接续", it.ContinuationOf)
+			return 0, fmt.Errorf("continuation_of %d 是关联任务的历史意图，只读，不能接续", continuationID)
 		}
 		if n.State == db.StateIntentDeleted {
-			return 0, fmt.Errorf("continuation_of %d 已被删除，不能接续", it.ContinuationOf)
+			return 0, fmt.Errorf("continuation_of %d 已被删除，不能接续", continuationID)
 		}
 		if !db.IsTerminalIntentState(n.State) {
 			return 0, fmt.Errorf("原意图 #%d 当前状态为 %s，仍在执行队列中，不能创建接续；运行中的意图请用 steer_work，外部失败结束后请用 retry_work", n.ID, n.State)
@@ -1496,21 +823,24 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	objective := strings.TrimSpace(it.Objective)
 	successCondition := strings.TrimSpace(it.SuccessCondition)
 	expectedEvidence := trimmedStrings(it.ExpectedEvidence)
+	// effort is the only run-size knob the model sees; a legacy `budget` object may
+	// still arrive (old prompts/tests) and is stored for history but never enforced.
+	// Empty on a continuation inherits the route's tier, so a deep chain is not
+	// silently demoted to standard on the next run.
+	effort := db.NormalizeEffort(it.Effort)
+	if strings.TrimSpace(it.Effort) == "" && continuation != nil {
+		if inherited := db.ParseIntentRoute(continuation).Effort; inherited != "" {
+			effort = db.NormalizeEffort(inherited)
+		}
+	}
+	// The legacy numeric budget is never enforced, so it must never reject a call
+	// either: a model still echoing the old schema (or a stale prompt) gets its
+	// numbers persisted for history and nothing more. Non-positive values are
+	// dropped (0 = unlimited) instead of failing the intent.
 	budget := db.RouteBudget{
-		MaxToolCalls:   it.Budget.MaxToolCalls,
-		MaxInputTokens: it.Budget.MaxInputTokens,
-		MaxWallSeconds: it.Budget.MaxWallSeconds,
-	}
-	if budget.MaxToolCalls < 0 || budget.MaxInputTokens < 0 || budget.MaxWallSeconds < 0 {
-		return 0, fmt.Errorf("route budget 不能为负数")
-	}
-	if budget.MaxToolCalls > 10000 || budget.MaxInputTokens > 10_000_000 || budget.MaxWallSeconds > 30*24*3600 {
-		return 0, fmt.Errorf("route budget 超出合理范围")
-	}
-	if continuation == nil && budget.Empty() {
-		// A new route gets a finite default so a run cannot rely solely on the
-		// (default-off) Watchdog cycle for cost control. Explicit values win.
-		budget = db.DefaultRouteBudget()
+		MaxToolCalls:   max(it.Budget.MaxToolCalls, 0),
+		MaxInputTokens: max(it.Budget.MaxInputTokens, 0),
+		MaxWallSeconds: max(it.Budget.MaxWallSeconds, 0),
 	}
 	// A continuation inherits the route identity and the remaining cumulative
 	// budget. The model cannot choose a different route id here; the source intent
@@ -1551,7 +881,15 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 				routeStartedAt = cp.RouteStartedAt
 			}
 		}
-		if msg := exhaustedBudgetMessage(routeID, budget, budgetUsed); msg != "" {
+		// A continuation inherits the route; the autonomy guard needs the union of
+		// the intent's own assets and the route's assets to recognise evidence from
+		// the same target.
+		routeAssets := appendUniqueInt64(intentAssetIDs(continuation), anchors...)
+		done, msg, err := t.suspendedRouteMessage(routeID, it.Effort, routeAssets, parents)
+		if err != nil {
+			return 0, err
+		}
+		if done {
 			return 0, fmt.Errorf("%s", msg)
 		}
 	}
@@ -1579,7 +917,10 @@ func (t *ToolSet) addOneIntent(it intentItem) (int64, error) {
 	if successCondition != "" {
 		payload["success_condition"] = successCondition
 	}
+	payload["effort"] = effort
 	if !budget.Empty() {
+		// Legacy bookkeeping only: persisted so historical arithmetic stays
+		// readable and Checkpoint statistics keep accumulating. Nothing enforces it.
 		payload["budget"] = budget
 	}
 	if checkpointID > 0 {
@@ -1651,23 +992,23 @@ func (t *ToolSet) addIntent() actool.CoreTool {
 	return t.writeExpTool("add_intent", "生成【探索方向】写入 frontier，并连入探索链路。意图是开放的探索方向，不是固定类型——用 summary 一句话自由描述要探索/验证/利用什么。\n"+
 		"★优先批量：一轮筛出的多个新方向放进 intents 数组一次提交（比逐条调用省往返）。返回 ids 数组，与 intents 等长同序（失败项 id=0，详情见 errors）。单条则省略 intents 直接给顶层 summary。",
 		obj(map[string]any{
-			"intents":           map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority/continuation_of/objective/phase/expected_evidence/success_condition/budget）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
+			"intents":           map[string]any{"type": "array", "description": "【优先用这个】要新增的探索方向数组，按顺序处理。每个元素字段同下方顶层字段（summary/asset_ids/parent_ids/priority/continuation_of/objective/phase/expected_evidence/success_condition/effort）。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
 			"summary":           str("[单条] 一句话描述这个探索方向：做什么+为什么。已写清方向即可，不依赖资产 id。"),
 			"asset_ids":         map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "本方向要测试/攻击的【目标资产 id】（**尽量传**，0/1/多个；是 list_assets 返回的资产 id，不是探索节点 id）：这条探索方向针对哪些资产（站点/接口/参数/主机等）。只要方向围绕某些具体资产就务必传上——它是「这条探索打哪些目标」的结构化标记，用于覆盖去重、把意图连入资产链路。仅当纯全局侦察、确实没有具体目标资产时才留空。"},
 			"parent_ids":        map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "上游锚点 id（可选，0/1/多个）：本方向由哪些【已确认的事实(fact)/发现(finding)】综合得出。**只能填已存在的 fact/finding 节点 id,不能填意图/目标/提示**——意图必须锚在已确认知识上,发现驱动而非凭空规划。多个事实共同产生一个新意图就传多个;顶层全新侦察方向请留空（会自动挂到任务起点 origin fact）。"},
 			"priority":          intp("优先级 0-10，默认5"),
-			"continuation_of":   intp("接续的原意图 id（可选）：仅当原意图已经结束（done/blocked/exhausted/stopped）且你要换一种打法时填写。原意图仍 open/running/paused 会被拒绝；外部失败恢复请优先使用 retry_work。接续会自动继承原路线的 route_id、预算余额和最近 checkpoint；若原路线累计预算已耗尽，必须显式传入更大的 budget 才能继续。"),
+			"continuation_of":   intp("接续的原意图 id（可选）：仅当原意图已经结束（done/blocked/exhausted/stopped）且你要换一种打法时填写。原意图仍 open/running/paused 会被拒绝；外部失败恢复请优先使用 retry_work。接续会自动继承原路线的 route_id、最近 checkpoint 与 effort；若该路线已连续两次跑干，接续需在 parent_ids 引用来自其他路线的新证据（新凭据/资产/跨路线事实），否则会被两振挂起规则拒绝。"),
 			"objective":         str("本阶段要达成的路线目标（可选；新路线建议填写）。接续时留空则继承原意图。"),
 			"phase":             map[string]any{"type": "string", "enum": db.RoutePhases, "description": "路线阶段（可选）：recon/validation/exploitation/privilege/lateral/objective/verification/evidence/cleanup。接续时留空则继承。"},
 			"expected_evidence": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "预期证据（可选）：什么响应/差异才能证明本阶段成功或排除假设。"},
 			"success_condition": str("本阶段成功条件（可选）：确认什么或排除什么。"),
-			"budget": map[string]any{"type": "object", "description": "路线累计预算（可选；新路线省略时默认 max_tool_calls=240、max_input_tokens=1200000；接续默认继承剩余额度）。当某维度已耗尽再接续时，必须显式传高于已用量的上限，否则会被拒绝。", "properties": map[string]any{
-				"max_tool_calls":   intp("整条路线允许的工具调用总数"),
-				"max_input_tokens": intp("整条路线允许的输入 token 总数"),
-				"max_wall_seconds": intp("整条路线允许的墙钟秒数"),
-			}},
+			"effort": map[string]any{
+				"type": "string", "enum": db.Efforts,
+				"description": "本意图的运行档位（可选，默认 standard）：probe=广度测绘/端口指纹/静态盘点/单接口快探（35 轮，首个周期结束即交接）；standard=常规单靶点漏洞挖掘与闭环利用、已有凭据横向验证（80 轮，有实质进展可自主续 1 周期）；deep=多步复杂利用链、反序列化/逆向/多层内网转发（130 轮，有阶段突破可自主续 2 周期）。不用填任何数字预算——档位由引擎确定性换算。",
+			},
 		}),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+			in = normalizeToolInputArrays(in, "intents", "asset_ids", "parent_ids", "expected_evidence")
 			var a struct {
 				Intents    []intentItem `json:"intents"`
 				intentItem              // 单条模式：顶层 summary/asset_ids/parent_ids/priority
@@ -1738,6 +1079,7 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			"reason":      str("为什么这个证据满足该目标"),
 		}, "goal_id", "evidence_id"),
 		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+			in = normalizeToolInputArrays(in, "goal_id", "evidence_id")
 			var a struct {
 				GoalID     json.RawMessage `json:"goal_id"`
 				EvidenceID json.RawMessage `json:"evidence_id"`
@@ -1759,7 +1101,10 @@ func (t *ToolSet) proveGoal() actool.CoreTool {
 			if err := t.validateProofAnchor(evidenceNode); err != nil {
 				return actool.Errorf(fmt.Sprintf("evidence_id 不能证明目标：%v", err)), nil
 			}
-			if err := t.ts.ProveGoal(goal, ev); err != nil {
+			// ProveGoalChecked re-runs the evidence rules inside the write transaction:
+			// the checks above are a separate read, and evidence can be invalidated
+			// (proof traffic removed, a finding demoted) in between.
+			if err := t.ts.ProveGoalCheckedWithInheritance(goal, ev, RevalidateProofEvidenceInTx); err != nil {
 				return actool.Errorf(fmt.Sprintf("记录目标证明失败：%v", err)), nil
 			}
 			// 每标记一个目标 met，就检查本任务是否【所有目标】都已 met；若是，自动判定
@@ -1801,11 +1146,12 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		"vulnclass": str("漏洞类别"), "name": str("漏洞名称"), "severity": str("critical|high|medium|low"), "summary": str("发现摘要"),
 		"intent_id": idp("当前任务的意图 id"), "asset_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "受影响资产 id"},
 		"evidence":         str("证据/PoC 文本（必填：命令输出、日志或可复现步骤；不能只写结论）"),
-		"evidence_refs":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：可回查证据引用 traffic:<id> / artifact:<path> / activity:<id> / node:<id>；没有流量时用命令输出文本并在 evidence 说明"},
+		"evidence_refs":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可选：可回查证据引用 traffic:<id> / artifact:<path> / activity:<id> / node:<id> / oast:<id>（oast_poll 返回的带外回调，盲 SSRF/XXE/RCE 用它作证）；没有流量时用命令输出文本并在 evidence 说明"},
 		"evidence_hint_id": idp("可选：本任务中对应此漏洞的提示节点 ID，自动携带其结构化 traffic_refs；不能引用继承提示或其他漏洞的提示"),
 		"traffic_refs": map[string]any{"type": "array", "description": "可选；HTTP/HTTPS 漏洞先检索并逐条核实请求/响应确实支持漏洞结论，再按复现顺序填写真实 ID。TCP 等非 HTTP 漏洞、未采集或找不到确切记录时省略或传 []，不阻止上报；可在 evidence 说明原因并提供其他可验证证据。不要猜测 ID、按域名/时间推定关联或仅为补包重复探测。用途 baseline 正常对照 / proof 漏洞证明 / verification 补充验证 / supporting 辅助证据。",
 			"items": obj(map[string]any{"traffic_id": str("traffic_search 返回的真实流量 ID"), "role": map[string]any{"type": "string", "enum": []string{"baseline", "proof", "verification", "supporting"}}, "note": str("该流量如何支持漏洞结论")}, "traffic_id")},
 	}, "vulnclass", "severity", "summary", "evidence"), func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+		in = normalizeToolInputArrays(in, "asset_ids", "evidence_refs", "traffic_refs")
 		var a struct {
 			VulnClass, Name, Severity, Summary, Evidence string
 			IntentID                                     json.RawMessage   `json:"intent_id"`
@@ -1828,7 +1174,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if !findingTrafficBindingEnabled() {
 			a.TrafficRefs, a.EvidenceHintID = nil, nil
 		}
-		evidenceRefs, err := db.NormalizeEvidenceRefs(a.EvidenceRefs)
+		evidenceRefs, err := db.NormalizeEvidenceRefs(t.normalizeEvidenceRefPaths(a.EvidenceRefs))
 		if err != nil {
 			return actool.Errorf(err.Error()), nil
 		}
@@ -1851,6 +1197,13 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		if strings.TrimSpace(a.Evidence) == "" && len(refs) == 0 && len(evidenceRefs) == 0 {
 			return actool.Errorf("report_finding 必须提供非空 evidence（命令输出/日志/复现步骤）、有效 traffic_refs（或含流量的 evidence_hint_id）或 evidence_refs；没有证据的推测用 record_fact 记 hypothesis 或 finding_candidate"), nil
 		}
+		// Auto-Triager gate (docs §4.4): a deterministic pre-check so a "login page
+		// answered 200" or a bare version banner never reaches the graph as a
+		// confirmed vuln, and so a text-only claim cannot prove a goal on its own.
+		verdict := triageFinding(a.VulnClass, a.Summary, a.Evidence, "", evidenceRefs, len(refs))
+		if verdict.Reject {
+			return actool.Errorf("report_finding 被自动分诊拒绝：" + verdict.Reason), nil
+		}
 		intentID := pid(a.IntentID)
 		routeID := int64(0)
 		if intentID <= 0 && t.ownerNode > 0 {
@@ -1866,7 +1219,7 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			}
 		}
 		runInfo := RunInfoFrom(ctx)
-		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: intentID, VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), EvidenceRefs: evidenceRefs, RouteID: routeID, RunID: runInfo.RunID}
+		input := db.RecordFindingInput{TaskID: t.taskID, ExplorationID: t.ts.ID(), IntentID: intentID, VulnClass: a.VulnClass, Name: a.Name, Severity: a.Severity, Summary: a.Summary, Evidence: a.Evidence, Worker: t.worker, AssetIDs: pidList(a.AssetIDs), EvidenceRefs: evidenceRefs, RouteID: routeID, RunID: runInfo.RunID, TriageState: verdict.State}
 		var recorded *db.RecordedFinding
 		if t.findingRecorder != nil {
 			recorded, err = t.findingRecorder.Record(ctx, input, refs)
@@ -1877,6 +1230,11 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 		}
 		if err != nil {
 			return actool.Errorf(err.Error()), nil
+		}
+		if verdict.State == TriageVerifying && FindingEvidenceHook != nil {
+			// 后台核验：把"仅文字证据"的发现交给宿主异步复核绑定流量/带外回调，
+			// 复核通过才提升为 confirmed。不阻塞本次工具调用，也不让模型自证。
+			go FindingEvidenceHook(t.taskID, t.ts.ID(), recorded.FindingID, evidenceRefs)
 		}
 		if t.notifyFinding != nil {
 			iid := input.IntentID
@@ -1897,7 +1255,9 @@ func (t *ToolSet) addFinding() actool.CoreTool {
 			*db.RecordedFinding
 			EvidenceStatus string `json:"evidence_status"`
 			EvidenceNote   string `json:"evidence_note,omitempty"`
-		}{RecordedFinding: recorded, EvidenceStatus: "bound"}
+			TriageState    string `json:"triage_state"`
+			TriageNote     string `json:"triage_note,omitempty"`
+		}{RecordedFinding: recorded, EvidenceStatus: "bound", TriageState: verdict.State, TriageNote: verdict.Reason}
 		if len(recorded.Traffic.Bindings) == 0 {
 			result.EvidenceStatus = "not_bound"
 			result.EvidenceNote = "漏洞已保存，未绑定流量。TCP/无包情形可正常继续；若已有核实的 HTTP 流量，请用可用的 bind_finding_traffic 或漏洞页面补绑，再完成证据交接。不要重复创建漏洞。"
@@ -1940,8 +1300,12 @@ type factItem struct {
 	Alternatives      []string          `json:"alternatives_rejected"`
 	NextActions       []string          `json:"next_actions"`
 	ProgressEvent     string            `json:"progress_event"`
-	NextIntentID      json.RawMessage   `json:"next_intent_id"`
-	CheckpointFactID  json.RawMessage   `json:"checkpoint_fact_id"`
+	// NeedHuman marks a fact as the run's hand-off to a human: the worker is blocked
+	// on something only a person can supply. The engine reads it after the run and
+	// parks the intent in `paused` rather than settling it as done.
+	NeedHuman        bool            `json:"need_human"`
+	NextIntentID     json.RawMessage `json:"next_intent_id"`
+	CheckpointFactID json.RawMessage `json:"checkpoint_fact_id"`
 }
 
 // recordOneFact validates the information type and writes one fact node with its
@@ -1958,11 +1322,16 @@ func (t *ToolSet) recordOneFact(ctx context.Context, it factItem, defaultIntent 
 		return 0, err
 	}
 	t.writes.Facts++
+	// A need_human fact is the run's hand-off: the engine parks the intent in paused
+	// after this report so the execution slot frees up for other lanes.
+	if it.NeedHuman {
+		t.writes.HumanNeeded = true
+	}
 	return id, nil
 }
 
 func (t *ToolSet) recordFact() actool.CoreTool {
-	return t.writeExpTool("record_fact", "把探索【事实/结论】写入探索图，连到产生它的意图（intent_id）。必须先选 fact_type：observation（环境观察）/ claim（带证据的归纳）/ hypothesis（待验证假设）/ decision（有支撑的选择）/ finding_candidate（待确认漏洞）。\n"+
+	return t.writeExpTool("record_fact", "把探索【事实/结论】写入探索图，连到产生它的意图（intent_id）。fact_type 可省略，默认 observation（环境观察）；也可选 claim（带证据的归纳）/ hypothesis（待验证假设）/ finding_candidate（待确认漏洞）。\n"+
 		"⚠️一次探索的多个观察要【汇总成一条事实】，不要拆成多条；summary=总结性一句话，detail=相关细节（可含多个具体项）。例：指纹意图→一条 observation {summary:'识别了 X 站点的技术栈与响应特征', detail:'nginx 1.25 / Vue3 / 200 / title=..'}，而不是状态码、指纹、标题各记一条。一条意图通常只产出一条事实，拆太碎会让图谱无限膨胀。\n"+
 		"★facts 数组用于一次写多条【彼此不同】的结论（每条可省略 intent_id，默认用顶层 intent_id）。返回 ids 数组，与 facts 等长同序。\n"+
 		"⚠️只写你在工具输出里【真实看到】的结论，不要脑补。observation/claim/hypothesis 必须带可回查来源：省略 source_activity_ids/evidence_refs 时，系统会自动挂本次意图最近一条 tool_result；要精确引用某一步就传 source_activity_ids（step_id）。evidence_refs 里流量用 traffic:<id>，文件用 artifact:<path>。\n"+
@@ -1972,12 +1341,12 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 		"  · **否定类结论**只陈述实际看到什么、手段是否穷尽；方向是否放弃由规划者综合全局定。",
 		obj(map[string]any{
 			"facts":               map[string]any{"type": "array", "description": "【有多条不同结论时用】事实数组，元素字段同下方顶层字段；省略 intent_id 则用顶层 intent_id。返回 ids 与本数组等长、同序。", "items": map[string]any{"type": "object"}},
-			"fact_type":           map[string]any{"type": "string", "enum": db.FactTypes, "description": "必填：observation | claim | hypothesis | decision | finding_candidate"},
+			"fact_type":           map[string]any{"type": "string", "enum": []string{db.FactTypeObservation, db.FactTypeClaim, db.FactTypeHypothesis, db.FactTypeFindingCandidate}, "description": "可选，省略时按 observation 写入：observation | claim | hypothesis | finding_candidate"},
 			"summary":             str("对本次探索结论的【总结性一句话】（是对 detail 的概括）"),
 			"intent_id":           idp("产生本事实的意图 id（你领到的意图；批量时作为各条默认）"),
 			"detail":              str("本事实的相关细节：把这次探索的多个观察事实都写进这里"),
 			"evidence":            str("【一行】关键证据：命令 + 最能证明结论的一两行输出。务必简洁，不要粘大段输出（细节放 detail）。"),
-			"evidence_refs":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可回查证据引用：traffic:<id> / artifact:<path> / activity:<id> / node:<id> / finding:<id>"},
+			"evidence_refs":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "可回查证据引用：traffic:<id> / artifact:<path> / activity:<id> / node:<id> / finding:<id> / oast:<id>（oast_poll 的回连记录）"},
 			"source_activity_ids": map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "支撑本结论的执行步骤 id（get_worker_trace 的 step_id）；省略时自动挂最近一条 tool_result"},
 			"observation_ids":     map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "claim 引用的 observation 节点 id"},
 			"claim_ids":           map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "hypothesis/finding_candidate 引用的 claim 节点 id"},
@@ -1995,12 +1364,18 @@ func (t *ToolSet) recordFact() actool.CoreTool {
 			"inheritance_policy": map[string]any{"type": "string", "enum": []string{"auto", "inheritable", "local_only"}, "description": "跨任务继承策略（可选）：auto（默认按敏感性与类型判断）/ inheritable / local_only"},
 			"next_actions":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "下一步动作（会写入 checkpoint）"},
 			"progress_event":     map[string]any{"type": "string", "description": "可选进展事件：new_asset/new_claim/validated_weakness/privilege_change/lateral_progress/objective_milestone/finding_written 等"},
+			"need_human": map[string]any{"type": "boolean",
+				"description": "遇到只有人才能过的卡点（图形验证码/短信扫码 MFA/SSO 登录态/高风险接口发包审批/特殊内网跳板）时设 true，并在 detail 写清卡在哪个 URL/步骤、需要人提供什么。本次运行结束后意图会进入 paused（让出执行槽），人填入凭据或给出一句指令后原会话直接接力继续。"},
 			"next_intent_id":     idp("decision 选择的下一条意图 id"),
 			"checkpoint_fact_id": idp("decision 引用的 checkpoint fact id"),
 			"confidence":         str("observed（输出里直接看到）| inferred（据现象推断）。claim 必填。"),
 			"asset_ids":          map[string]any{"type": "array", "items": map[string]any{"type": "integer"}, "description": "相关资产 id（可选，0/1/多个）：该事实涉及哪些资产"},
-		}),
+		}, "summary"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
+			in = normalizeToolInputArrays(in,
+				"facts", "asset_ids", "evidence_refs", "source_activity_ids",
+				"observation_ids", "claim_ids", "hypothesis_ids",
+				"validation_actions", "next_actions")
 			var a struct {
 				Facts    []factItem `json:"facts"`
 				factItem            // 单条模式 + 批量默认 intent_id
@@ -2760,6 +2135,88 @@ func (t *ToolSet) searchAllWorkerTraces() actool.CoreTool {
 			}
 			return jsonResult(map[string]any{"query": a.Q, "hits": hits})
 		})
+}
+
+// digestAssetLabels maps each digest id → short labels of the assets its members
+// are anchored to. A digest covers members through RelCovers edges, so the assets
+// come from those members' anchors (db.NodeAssets). Labels are the same compact
+// identifier the asset tools print, capped so an overview never balloons.
+func (t *ToolSet) digestAssetLabels(store *db.ExplorationStore, digestIDs []int64) map[int64][]string {
+	out := map[int64][]string{}
+	if store == nil || len(digestIDs) == 0 {
+		return out
+	}
+	memberIDs := map[int64]int64{} // member → digest
+	for _, did := range digestIDs {
+		members, err := store.DigestMembers(did)
+		if err != nil {
+			continue
+		}
+		for _, m := range members {
+			memberIDs[m] = did
+		}
+	}
+	if len(memberIDs) == 0 {
+		return out
+	}
+	ids := make([]int64, 0, len(memberIDs))
+	for id := range memberIDs {
+		ids = append(ids, id)
+	}
+	anchors, err := store.NodeAssets(ids)
+	if err != nil {
+		return out
+	}
+	// Resolve labels in one lookup when the asset store is wired; otherwise the id
+	// alone still tells the planner which host region the digest covers.
+	var byID map[int64]*db.Asset
+	if t.as != nil {
+		var all []int64
+		for _, assetIDs := range anchors {
+			all = append(all, assetIDs...)
+		}
+		if assets, err := t.as.GetByIDs(all); err == nil {
+			byID = make(map[int64]*db.Asset, len(assets))
+			for _, a := range assets {
+				byID[a.ID] = a
+			}
+		}
+	}
+	const perDigestCap = 6
+	for member, assetIDs := range anchors {
+		did := memberIDs[member]
+		for _, aid := range assetIDs {
+			labels := out[did]
+			if len(labels) >= perDigestCap {
+				break
+			}
+			label := fmt.Sprintf("#%d", aid)
+			if a := byID[aid]; a != nil {
+				if l := assetShortLabel(a); l != "" {
+					label = l
+				}
+			}
+			out[did] = append(labels, label)
+		}
+	}
+	return out
+}
+
+// assetShortLabel picks the most identifying field of an asset for a compact
+// overview line: URL → domain → ip → app/service name. Empty when none is set.
+func assetShortLabel(a *db.Asset) string {
+	if a == nil {
+		return ""
+	}
+	for _, v := range []string{a.URL, a.Domain, a.IP, a.AppName, a.ServiceName, a.RootDomain} {
+		if s := strings.TrimSpace(v); s != "" {
+			if len(s) > 120 {
+				s = s[:120]
+			}
+			return s
+		}
+	}
+	return ""
 }
 
 // listWorkerTraces gives a worker (which has no graph_overview and can't see the

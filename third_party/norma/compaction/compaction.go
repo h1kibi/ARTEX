@@ -42,6 +42,19 @@ type Config struct {
 	// KeepRecent is the number of recent messages AutoCompact always preserves as
 	// the un-summarized tail (default 8). MicroCompact uses its own microKeepRecent.
 	KeepRecent int
+	// MicroKeepRecent is how many of the MOST RECENT compactable tool results
+	// MicroCompact leaves untouched (default microKeepRecent = 5 when <= 0). A
+	// larger keep window (the worker uses 8) keeps the live working set — recent
+	// traffic/probe output — in the model's view while older bulk output is cleared.
+	MicroKeepRecent int
+	// MinClearChars keeps SHORT tool results verbatim even when they are old.
+	// A short error ("permission denied", "Connection refused") is cheap to keep
+	// and losing it makes the model repeat a failing step. 0 = clear regardless of
+	// size (previous behavior).
+	MinClearChars int
+	// ExtraCompactableTools adds tool names whose results MicroCompact may clear,
+	// merged with the built-in set (e.g. TaskOutput, traffic_*, node_detail).
+	ExtraCompactableTools []string
 }
 
 func (c *Config) defaults() {
@@ -53,6 +66,12 @@ func (c *Config) defaults() {
 	}
 	if c.KeepRecent == 0 {
 		c.KeepRecent = 8
+	}
+	if c.MicroKeepRecent <= 0 {
+		c.MicroKeepRecent = microKeepRecent
+	}
+	if c.MinClearChars < 0 {
+		c.MinClearChars = 0
 	}
 }
 
@@ -69,6 +88,12 @@ const (
 	microKeepRecent       = 5                                   // == claude-code KEEP_RECENT (compactable results kept)
 	toolResultGrowthGuess = 15000                               // == claude-code TOOL_RESULT_GROWTH_ESTIMATE
 	maxAutoCompactFails   = 3                                   // == claude-code MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES
+
+	// spill marker written by tool.Capture; the cleared replacement keeps the
+	// path so the model can re-read the full output instead of losing it.
+	spillMarker = "<persisted-output>[Output too large: full"
+	spillPathA  = "Full output saved to  "
+	spillPathB  = " </persisted-output>"
 )
 
 // Compactor applies the strategy. Construct with New.
@@ -243,36 +268,99 @@ func lastNNonMarkerStart(msgs []llm.Message, keep int) int {
 
 // --- MicroCompact: keep the most recent N compactable results, clear the rest ---
 
-// microCompact clears the bodies of all COMPACTABLE tool results except the most
-// recent microKeepRecent, returning the (possibly new) message slice and whether
-// anything changed. It is non-destructive: a cleared result can be re-read.
-func (c *Compactor) microCompact(msgs []llm.Message) ([]llm.Message, bool) {
-	// Collect compactable tool_use ids in encounter order.
-	var ids []string
-	for _, m := range msgs {
-		for _, b := range m.Content {
-			if b.Type == llm.BlockToolUse && compactableTools[b.Name] {
-				ids = append(ids, b.ID)
+// compactable reports whether MicroCompact may clear a result of this tool:
+// the built-in set merged with Config.ExtraCompactableTools.
+func (c *Compactor) compactable(name string) bool {
+	if compactableTools[name] {
+		return true
+	}
+	for _, extra := range c.cfg.ExtraCompactableTools {
+		if extra == name {
+			return true
+		}
+	}
+	return false
+}
+
+// clearReplacement is the body written in place of a cleared result. A spill
+// pointer inside the original is carried over VERBATIM: the whole point of
+// clearing is dropping bytes from the context, not losing the ability to re-read
+// them, and the pointer is the only way back to the file on disk.
+func clearReplacement(text string) string {
+	if i := strings.Index(text, spillMarker); i >= 0 {
+		if j := strings.Index(text[i:], spillPathA); j >= 0 {
+			rest := text[i+j+len(spillPathA):]
+			if k := strings.Index(rest, spillPathB); k >= 0 {
+				return microClearedMessage + "\n（完整输出仍在 " + strings.TrimSpace(rest[:k]) + "，需要时用 Read/grep 重读该文件）"
 			}
 		}
 	}
-	if len(ids) <= microKeepRecent {
+	return microClearedMessage
+}
+
+// microCompact clears the bodies of all COMPACTABLE tool results except the most
+// recent MicroKeepRecent, returning the (possibly new) message slice and whether
+// anything changed. It is non-destructive: a cleared result can be re-read, and a
+// spill pointer (cmd-output path) inside a cleared result is preserved.
+//
+// Two floors keep cheap-but-load-bearing text in view:
+//   - results in the most recent MicroKeepRecent results are never touched;
+//   - results shorter than MinClearChars (short errors, one-line facts) are kept
+//     verbatim even when old — clearing them saves nothing and costs a repeat.
+func (c *Compactor) microCompact(msgs []llm.Message) ([]llm.Message, bool) {
+	keep := c.cfg.MicroKeepRecent
+	if keep < 1 {
+		keep = microKeepRecent
+	}
+	// Collect compactable tool results in encounter order, with their body size so
+	// the MinClearChars floor can skip the short ones without a second walk.
+	type resultRef struct {
+		id   string
+		text string
+	}
+	var results []resultRef
+	names := map[string]string{}
+	for _, m := range msgs {
+		for _, b := range m.Content {
+			if b.Type == llm.BlockToolUse {
+				names[b.ID] = b.Name
+			}
+		}
+	}
+	for _, m := range msgs {
+		for _, b := range m.Content {
+			if b.Type == llm.BlockToolResult && c.compactable(names[b.ToolUseID]) {
+				results = append(results, resultRef{id: b.ToolUseID, text: blockText(b)})
+			}
+		}
+	}
+	if len(results) <= keep {
 		return msgs, false // nothing old enough to clear
 	}
-	clearSet := make(map[string]bool, len(ids)-microKeepRecent)
-	for _, id := range ids[:len(ids)-microKeepRecent] {
-		clearSet[id] = true
+	clearSet := make(map[string]string, len(results)-keep)
+	for _, r := range results[:len(results)-keep] {
+		if isClearedText(r.text) {
+			continue // already cleared in an earlier pass
+		}
+		if c.cfg.MinClearChars > 0 && len(r.text) < c.cfg.MinClearChars {
+			continue // short result — cheaper to keep than to lose the lesson
+		}
+		clearSet[r.id] = clearReplacement(r.text)
+	}
+	if len(clearSet) == 0 {
+		return msgs, false
 	}
 	changed := false
 	out := append([]llm.Message(nil), msgs...)
 	for i := range out {
 		var nc []llm.ContentBlock
 		for j, b := range out[i].Content {
-			if b.Type == llm.BlockToolResult && clearSet[b.ToolUseID] && !isCleared(b.Content) {
+			replacement, ok := clearSet[b.ToolUseID]
+			if b.Type == llm.BlockToolResult && ok {
 				if nc == nil {
 					nc = append([]llm.ContentBlock(nil), out[i].Content...)
 				}
-				nc[j].Content = []llm.ContentBlock{llm.TextBlock(microClearedMessage)}
+				nc[j].Content = []llm.ContentBlock{llm.TextBlock(replacement)}
 				changed = true
 			}
 		}
@@ -286,9 +374,16 @@ func (c *Compactor) microCompact(msgs []llm.Message) ([]llm.Message, bool) {
 	return out, true
 }
 
-func isCleared(blocks []llm.ContentBlock) bool {
-	return len(blocks) == 1 && blocks[0].Type == llm.BlockText && blocks[0].Text == microClearedMessage
+// blockText flattens one tool_result body.
+func blockText(b llm.ContentBlock) string {
+	var s strings.Builder
+	for _, cb := range b.Content {
+		s.WriteString(cb.Text)
+	}
+	return s.String()
 }
+
+func isClearedText(text string) bool { return strings.HasPrefix(text, microClearedMessage) }
 
 // --- AutoCompact: non-destructive boundary + summary ---
 

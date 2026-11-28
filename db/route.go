@@ -257,35 +257,6 @@ WHERE id=$2 AND exploration_id=$3 AND kind='intent'`, string(extraRaw), intentID
 	return checkpointID, nil
 }
 
-// Default cumulative route budget for a NEW route when the planner omits one.
-// It bounds runaway cost even when Watchdog is off; a continuation inherits or
-// raises the route budget instead of receiving a fresh default.
-const (
-	DefaultRouteMaxToolCalls   = 240
-	DefaultRouteMaxInputTokens = 1_200_000
-)
-
-func DefaultRouteBudget() RouteBudget {
-	return RouteBudget{
-		MaxToolCalls:   DefaultRouteMaxToolCalls,
-		MaxInputTokens: DefaultRouteMaxInputTokens,
-	}
-}
-
-// RouteBudgetDimensionMeta maps an exhausted dimension to the user-facing label
-// and the JSON budget field. Kept in one place so agent errors and API rerun
-// guards cannot drift apart.
-func RouteBudgetDimensionMeta(dimension string) (label, field string) {
-	switch dimension {
-	case "input_tokens":
-		return "输入 token", "max_input_tokens"
-	case "wall_seconds":
-		return "墙钟(秒)", "max_wall_seconds"
-	default:
-		return "工具调用", "max_tool_calls"
-	}
-}
-
 // RouteBudgetExhausted reports the first exhausted dimension of a cumulative
 // route budget. Wall-clock usage is compared in milliseconds; the returned
 // values are raw counts for that dimension. A zero limit means unlimited.
@@ -801,6 +772,76 @@ WHERE node_id = ANY($1) ORDER BY node_id, asset_id`, ids)
 		out[nodeID] = append(out[nodeID], assetID)
 	}
 	return out, rows.Err()
+}
+
+// ToolOutputSnapshot is the reviewable part of one successful tool_result row.
+type ToolOutputSnapshot struct {
+	ActivityID int64
+	Tool       string
+	Summary    string
+	Detail     string
+}
+
+// ToolOutputsForFindingCorroboration returns recent successful tool output that can
+// be used to verify a finding without re-running the command. The intent's own
+// activity and any explicitly referenced activity ids are searched; a finding whose
+// node was produced by a different intent still resolves through activityIDs.
+func (s *ExplorationStore) ToolOutputsForFindingCorroboration(intentID int64, activityIDs []int64, limit int) ([]ToolOutputSnapshot, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 40
+	}
+	if intentID <= 0 && len(activityIDs) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`SELECT id, COALESCE(tool,''), COALESCE(summary,''), COALESCE(detail,'')
+FROM activity
+WHERE exploration_id=$1 AND kind='tool_result' AND is_error=false
+  AND tool IN ('Bash','http_request','WebFetch','Read','shell_send','shell_read')
+  AND (node_id=$2 OR id=ANY($3::bigint[]))
+ORDER BY id DESC
+LIMIT $4`, s.expID, intentID, activityIDs, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ToolOutputSnapshot
+	for rows.Next() {
+		var snap ToolOutputSnapshot
+		if err := rows.Scan(&snap.ActivityID, &snap.Tool, &snap.Summary, &snap.Detail); err != nil {
+			return nil, err
+		}
+		out = append(out, snap)
+	}
+	return out, rows.Err()
+}
+
+// IntentForFindingNode resolves the intent that produced a finding node. The node
+// payload is authoritative; the yields edge is the fallback for findings recorded
+// before the payload carried intent_id.
+func (s *ExplorationStore) IntentForFindingNode(findingNodeID int64) (int64, error) {
+	if findingNodeID <= 0 {
+		return 0, nil
+	}
+	n, err := s.GetNode(findingNodeID)
+	if err != nil {
+		return 0, err
+	}
+	if n != nil && len(n.Payload) > 0 {
+		var p struct {
+			IntentID int64 `json:"intent_id"`
+		}
+		if json.Unmarshal(n.Payload, &p) == nil && p.IntentID > 0 {
+			return p.IntentID, nil
+		}
+	}
+	var src int64
+	err = s.db.QueryRow(`SELECT src_id FROM exploration_edges
+WHERE exploration_id=$1 AND dst_id=$2 AND rel='yields'
+ORDER BY created_at DESC LIMIT 1`, s.expID, findingNodeID).Scan(&src)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return src, err
 }
 
 // RouteIDsForAsset returns the distinct route ids of intents anchored to one

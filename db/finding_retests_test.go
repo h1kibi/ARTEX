@@ -240,3 +240,75 @@ func TestRetestFixedTriageOnlyAfterSuccessfulCompletion(t *testing.T) {
 		})
 	}
 }
+
+// A retest confirms only the evidence version its run started from. If the evidence
+// changed mid-run (a binding added or removed bumps evidence_version), the verdict
+// judged evidence nobody can read anymore and must not bind the confirmation to the
+// new version.
+func TestFinishFindingRetestConfirmsOnlySnapshotVersion(t *testing.T) {
+	d, fid := retestDB(t)
+	ctx := t.Context()
+	triageVersion := func() (state string, version int64) {
+		t.Helper()
+		if err := d.QueryRow(`SELECT triage_state, triage_evidence_version FROM findings WHERE id=$1`, fid).Scan(&state, &version); err != nil {
+			t.Fatal(err)
+		}
+		return state, version
+	}
+
+	// Control: evidence untouched during the run → confirmation binds the version judged.
+	if _, err := d.Exec(`UPDATE findings SET triage_state='verifying', triage_evidence_version=0 WHERE id=$1`, fid); err != nil {
+		t.Fatal(err)
+	}
+	run, conv, _, err := d.CreateFindingRetest(ctx, fid, "unchanged evidence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.StartFindingRetest(ctx, run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.RecordFindingRetestResult(ctx, conv.ID, "reproduced", "still exploitable", "curl -> uid=0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.FinishFindingRetest(run.ID, "completed", ""); err != nil {
+		t.Fatal(err)
+	}
+	f, err := d.GetFinding(fid)
+	if err != nil || f == nil || f.TriageState != "confirmed" {
+		t.Fatalf("unchanged evidence was not confirmed: %+v err=%v", f, err)
+	}
+	if state, version := triageVersion(); state != "confirmed" || version != f.EvidenceVersion {
+		t.Fatalf("confirmation bound to wrong version: state=%s version=%d want %d", state, version, f.EvidenceVersion)
+	}
+
+	// Evidence moves while the next run is in flight.
+	if _, err := d.Exec(`UPDATE findings SET triage_state='verifying', triage_evidence_version=0 WHERE id=$1`, fid); err != nil {
+		t.Fatal(err)
+	}
+	run2, conv2, _, err := d.CreateFindingRetest(ctx, fid, "evidence changes mid-run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.StartFindingRetest(ctx, run2.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.RecordFindingRetestResult(ctx, conv2.ID, "reproduced", "still exploitable", "curl -> uid=0"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(`UPDATE findings SET evidence_version=evidence_version+1 WHERE id=$1`, fid); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.FinishFindingRetest(run2.ID, "completed", ""); err != nil {
+		t.Fatal(err)
+	}
+	f, err = d.GetFinding(fid)
+	if err != nil || f == nil {
+		t.Fatal(err)
+	}
+	if f.TriageState != "verifying" {
+		t.Fatalf("stale-snapshot verdict confirmed unseen evidence (state=%q version=%d)", f.TriageState, f.EvidenceVersion)
+	}
+	if state, version := triageVersion(); state != "verifying" || version != 0 {
+		t.Fatalf("stale-snapshot verdict wrote triage version: state=%s version=%d", state, version)
+	}
+}

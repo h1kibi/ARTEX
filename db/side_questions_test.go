@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -314,6 +315,96 @@ func TestSideClearLateWritersAndDeletedParent(t *testing.T) {
 	}
 	if got, err = d.SideSnapshot(ctx, s.Parent.Key()); err != nil || got != nil {
 		t.Fatalf("delete cascade: %+v %v", got, err)
+	}
+}
+
+// A conversation turn bound to a task carries both identities: the conversation
+// owns the /btw history while the task scope authorises evidence. The original
+// CHECK required task_id to be NULL on conversation rows, so every checkpoint such
+// a turn produced was rejected — and the flush loop retried it forever, burying the
+// log. The migration must accept the pair while still refusing a conversation row
+// that claims an exploration.
+func TestSideSnapshotAcceptsTaskScopedConversation(t *testing.T) {
+	d, err := Open(testDSN(t))
+	if err != nil {
+		t.Skipf("postgres unavailable (%v)", err)
+	}
+	defer d.Close()
+	ctx := t.Context()
+
+	var def string
+	if err := d.QueryRow(`SELECT pg_get_constraintdef(c.oid)
+FROM pg_constraint c
+WHERE c.conrelid = to_regclass('side_question_sessions')
+  AND c.conname = 'side_question_sessions_check'`).Scan(&def); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(def, "task_id IS NULL") {
+		t.Fatalf("schema migration did not run: %s", def)
+	}
+
+	c, err := d.CreateConversation("mainagent", "task-scoped btw", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.DeleteConversation(c.ID) })
+	task, err := d.CreateTask("task-scoped btw", "goal", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = d.DeleteTask(task.ID) })
+
+	mk := func(p sidequestion.Parent) sidequestion.Snapshot {
+		return sidequestion.Snapshot{Parent: p, RunID: 1, Version: 1, CapturedAt: time.Now().UTC(),
+			Model:   sidequestion.Model{Model: "fixture"},
+			Request: llm.CompletionRequest{Messages: []llm.Message{llm.UserText("scoped")}}}
+	}
+	scoped := mk(sidequestion.Parent{ConversationID: c.ID, TaskID: task.ID})
+	if err := d.SaveSideSnapshot(ctx, scoped); err != nil {
+		t.Fatalf("task-scoped conversation snapshot rejected: %v", err)
+	}
+	if got, err := d.SideSnapshot(ctx, scoped.Parent.Key()); err != nil || got == nil {
+		t.Fatalf("snapshot not persisted: %+v %v", got, err)
+	}
+
+	// A conversation row must not claim an exploration: that identity belongs to
+	// the task-scoped key space and would collide with a worker session.
+	bad := mk(sidequestion.Parent{ConversationID: c.ID, TaskID: task.ID, ExplorationID: task.ExplorationID})
+	if err := d.SaveSideSnapshot(ctx, bad); err == nil {
+		t.Fatal("conversation snapshot with an exploration id was accepted")
+	}
+
+	// The migration itself: put the legacy constraint back and prove Open's
+	// migration step widens it, since an existing deployment starts in that state.
+	conn, err := d.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// The row written above only fits the widened constraint; remove it before
+	// restoring the legacy one, which would otherwise reject the ALTER.
+	if _, err := conn.ExecContext(ctx, `DELETE FROM side_question_sessions WHERE session_key=$1`, scoped.Parent.Key()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, `ALTER TABLE side_question_sessions DROP CONSTRAINT side_question_sessions_check`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, `ALTER TABLE side_question_sessions ADD CONSTRAINT side_question_sessions_check
+CHECK ((conversation_id IS NOT NULL AND task_id IS NULL AND exploration_id IS NULL AND intent_id IS NULL)
+    OR (conversation_id IS NULL AND task_id IS NOT NULL AND exploration_id IS NOT NULL))`); err != nil {
+		t.Fatal(err)
+	}
+	if err := migrateSideSessionConstraint(ctx, conn); err != nil {
+		t.Fatalf("migration: %v", err)
+	}
+	if err := d.QueryRow(`SELECT pg_get_constraintdef(c.oid)
+FROM pg_constraint c
+WHERE c.conrelid = to_regclass('side_question_sessions')
+  AND c.conname = 'side_question_sessions_check'`).Scan(&def); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(def, "task_id IS NULL") {
+		t.Fatalf("migration left the legacy constraint in place: %s", def)
 	}
 }
 

@@ -4,13 +4,13 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	gopty "github.com/aymanbagabas/go-pty"
 	"github.com/hinshun/vt10x"
 )
 
@@ -53,8 +53,11 @@ type ptySession struct {
 	mode    string // interactive | hands-free | dispatch
 	prompt  *regexp.Regexp
 
-	cmd  *exec.Cmd
-	ptmx *os.File
+	cmd *gopty.Cmd
+	// ptmx is the terminal master. Every platform now hands back a real
+	// pseudo-terminal: a pts pair on Unix, a Windows ConPTY (with or without WSL
+	// inside it) elsewhere.
+	ptmx gopty.Pty
 
 	mu       sync.Mutex
 	buf      []byte // raw scrollback (ring, capped)
@@ -65,7 +68,7 @@ type ptySession struct {
 	lastOut  time.Time
 	exitedAt time.Time
 
-	readCur  int64 // tool-side read cursor (shell_read without since_cursor continues here)
+	readCur  int64         // tool-side read cursor (shell_read without since_cursor continues here)
 	notifyCh chan struct{} // pinged on new output
 	done     chan struct{} // closed when the process exits
 }
@@ -271,11 +274,13 @@ func (s *ptySession) kill() {
 	s.state = "closed"
 	ptmx, cmd := s.ptmx, s.cmd
 	s.mu.Unlock()
+	if ptmx != nil && cmd != nil && cmd.Process != nil {
+		treeKill(cmd.Process)
+	}
+	// Close the terminal after the child is gone: on Windows the ConPTY pipes
+	// keep readLoop blocked until they are closed.
 	if ptmx != nil {
 		_ = ptmx.Close()
-	}
-	if cmd != nil && cmd.Process != nil {
-		treeKill(cmd.Process)
 	}
 }
 
@@ -302,7 +307,7 @@ func (m *Manager) session(id string) (*ptySession, bool) {
 // openSession starts an interactive program in a fresh PTY and begins its read loop.
 func (m *Manager) openSession(command, workDir string, env []string, rows, cols int, mode string, prompt *regexp.Regexp) (*ptySession, error) {
 	if !ptySupported() {
-		return nil, fmt.Errorf("交互式 shell(PTY) 在当前平台不支持")
+		return nil, fmt.Errorf("交互式 shell 已被 AGENT_CORE_DISABLE_INTERACTIVE_SHELL 停用")
 	}
 	m.reapSessions()
 	if rows <= 0 {
@@ -311,14 +316,11 @@ func (m *Manager) openSession(command, workDir string, env []string, rows, cols 
 	if cols <= 0 {
 		cols = sessDefCols
 	}
-	shell, flags := shellCmd()
-	cmd := exec.CommandContext(m.rootCtx, shell, append(flags, command)...)
-	cmd.Dir = workDir
-	cmd.Env = withEnv(env)
-	ptmx, err := startPTY(cmd, rows, cols)
+	proc, err := startPTY(ptySpec{Ctx: m.rootCtx, Command: command, WorkDir: workDir, Env: env, Rows: rows, Cols: cols})
 	if err != nil {
 		return nil, err
 	}
+	cmd := proc.cmd
 	m.sessMu.Lock()
 	m.sessSeq++
 	id := fmt.Sprintf("sh_%d", m.sessSeq)
@@ -326,7 +328,7 @@ func (m *Manager) openSession(command, workDir string, env []string, rows, cols 
 
 	s := &ptySession{
 		id: id, command: command, rows: rows, cols: cols, mode: mode, prompt: prompt,
-		cmd: cmd, ptmx: ptmx, state: "running", lastOut: time.Now(),
+		cmd: cmd, ptmx: proc.ptmx, state: "running", lastOut: time.Now(),
 		notifyCh: make(chan struct{}, 1), done: make(chan struct{}),
 	}
 	m.sessMu.Lock()
@@ -348,12 +350,14 @@ func (m *Manager) readLoop(s *ptySession) {
 			break
 		}
 	}
-	_ = s.cmd.Wait()
+	if s.cmd != nil {
+		_ = s.cmd.Wait()
+	}
 	s.mu.Lock()
 	if s.state != "closed" {
 		s.state = "exited"
 	}
-	if s.cmd.ProcessState != nil {
+	if s.cmd != nil && s.cmd.ProcessState != nil {
 		ec := s.cmd.ProcessState.ExitCode()
 		s.exitCode = &ec
 	}

@@ -29,12 +29,20 @@ type sideRun struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 }
+
+// sideSnapshotMaxAttempts bounds how often one snapshot is retried. Twenty
+// attempts at the 250ms flush cadence is five seconds of transient tolerance;
+// anything longer is a rejected row or a dead dependency, which repetition cannot
+// repair.
+const sideSnapshotMaxAttempts = 20
+
 type sideQuestionState struct {
 	mu           sync.Mutex
 	commands     sync.Mutex // short admission / clear operations only, never inference
 	pending      map[string]sidequestion.Snapshot
 	latest       map[string]sidequestion.Snapshot
 	seen         map[string][2]int64
+	fails        map[string]int
 	runs         map[string]sideRun
 	done         chan struct{}
 	outputTokens int
@@ -51,7 +59,7 @@ func bindSideProvider(p llm.Provider, cfg agent.Config, id int64, name string) l
 }
 
 func (s *Server) initSideQuestions() {
-	s.side = &sideQuestionState{pending: map[string]sidequestion.Snapshot{}, latest: map[string]sidequestion.Snapshot{}, seen: map[string][2]int64{}, runs: map[string]sideRun{}, done: make(chan struct{})}
+	s.side = &sideQuestionState{pending: map[string]sidequestion.Snapshot{}, latest: map[string]sidequestion.Snapshot{}, seen: map[string][2]int64{}, fails: map[string]int{}, runs: map[string]sideRun{}, done: make(chan struct{})}
 	if n, err := strconv.Atoi(os.Getenv("ARTEX_BTW_MAX_OUTPUT_TOKENS")); err == nil && n >= 256 && n <= 32768 {
 		s.side.outputTokens = n
 	}
@@ -106,14 +114,32 @@ func (s *Server) flushSideSnapshots() {
 		cancel()
 		s.side.mu.Lock()
 		if err == nil || errors.Is(err, db.ErrSideParentGone) {
+			delete(s.side.fails, key)
 			if cur, ok := s.side.latest[key]; ok && cur.RunID == snap.RunID && cur.Version == snap.Version {
 				delete(s.side.latest, key)
 			}
-		} else if newer, ok := s.side.pending[key]; !ok || newer.RunID < snap.RunID || newer.RunID == snap.RunID && newer.Version < snap.Version {
+			s.side.mu.Unlock()
+			continue
+		}
+		s.side.fails[key]++
+		attempts := s.side.fails[key]
+		// A rejected row shape or a permission error will not fix itself, and this
+		// loop ticks four times a second: retrying forever buried the log and kept a
+		// useless transaction in flight. Give up after a bounded number of attempts,
+		// keeping the cause on record instead of repeating it.
+		if attempts > sideSnapshotMaxAttempts {
+			delete(s.side.pending, key)
+			delete(s.side.latest, key)
+			delete(s.side.fails, key)
+			s.side.mu.Unlock()
+			log.Printf("[btw] 旁路快照连续 %d 次持久化失败，放弃该会话的最新快照: %v", attempts, err)
+			continue
+		}
+		if newer, ok := s.side.pending[key]; !ok || newer.RunID < snap.RunID || newer.RunID == snap.RunID && newer.Version < snap.Version {
 			s.side.pending[key] = snap
 		}
 		s.side.mu.Unlock()
-		if err != nil && !errors.Is(err, db.ErrSideParentGone) {
+		if attempts == 1 {
 			log.Printf("[btw] checkpoint persistence: %v", err)
 		}
 	}

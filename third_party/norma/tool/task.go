@@ -74,7 +74,11 @@ type Task struct {
 	notified     bool // completion already enqueued into pending
 	oversize     bool // terminated by the size watchdog
 	cmd          *exec.Cmd
-	done         chan struct{} // closed by watch when the process exits
+	// outFilter is the WSL stderr decoder in front of the output file, nil for
+	// a local-shell run. watch flushes it once the process exits so a trailing
+	// partial line is not lost.
+	outFilter *wslNoiseFilter
+	done      chan struct{} // closed by watch when the process exits
 }
 
 func (t *Task) info() TaskInfo {
@@ -327,12 +331,20 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 	if kind == "" {
 		kind = KindBash
 	}
-	shell, flags := shellCmd()
-	cmd := exec.CommandContext(m.rootCtx, shell, append(flags, spec.Command)...)
-	cmd.Dir = spec.WorkingDir
-	cmd.Env = withEnv(spec.Env)
-	cmd.Stdout = f
-	cmd.Stderr = f
+	// The same backend selection Bash uses: a WSL-backed run must stay in WSL
+	// when it moves to the background, or it would silently fall back to
+	// PowerShell syntax the command was never written for.
+	cmd, viaWSL := shellProcess(m.rootCtx, spec.Command, spec.WorkingDir, spec.Env)
+	var outFilter *wslNoiseFilter
+	if viaWSL {
+		// The output file is read back by TaskOutput/Read, so wsl.exe's own
+		// UTF-16 diagnostics must be filtered before they reach it.
+		outFilter = newWSLNoiseFilter(f)
+		cmd.Stdout, cmd.Stderr = outFilter, outFilter
+	} else {
+		cmd.Stdout = f
+		cmd.Stderr = f
+	}
 	setDetached(cmd)
 
 	if err := cmd.Start(); err != nil {
@@ -350,6 +362,7 @@ func (m *Manager) Spawn(spec SpawnSpec) (*Task, error) {
 		StartTime:   time.Now(),
 		OutputPath:  outPath,
 		cmd:         cmd,
+		outFilter:   outFilter,
 		done:        make(chan struct{}),
 	}
 	m.mu.Lock()
@@ -367,6 +380,9 @@ func (m *Manager) watch(t *Task, f *os.File) {
 
 	err := t.cmd.Wait()
 	close(stop)
+	if t.outFilter != nil {
+		_ = t.outFilter.Close()
+	}
 	_ = f.Close()
 
 	m.mu.Lock()
@@ -703,14 +719,47 @@ func tailFile(path string, maxBytes int) (string, error) {
 	return fmt.Sprintf("[%d KB of earlier output omitted — read the output file directly for full output]\n", off/1024) + tail, nil
 }
 
+// windowsPowerShellPrelude prepares a local Windows shell for unattended use:
+// UTF-8 without a BOM for every stream, no progress bars on stderr, and the
+// curl/wget aliases removed so those names reach the native executables. The
+// other built-in aliases (sleep, cat, ...) stay for existing scripts.
+const windowsPowerShellPrelude = "[Console]::InputEncoding = [Console]::OutputEncoding = $OutputEncoding = [System.Text.UTF8Encoding]::new($false); $ProgressPreference = 'SilentlyContinue'; Remove-Item Alias:curl,Alias:wget -Force -ErrorAction SilentlyContinue;\n"
+
+var (
+	windowsPowerShellOnce sync.Once
+	windowsPowerShellPath string
+)
+
+// windowsPowerShellExe prefers PowerShell 7 (pwsh.exe) and falls back to the
+// Windows PowerShell 5.1 executable.
+func windowsPowerShellExe() string {
+	windowsPowerShellOnce.Do(func() {
+		if p, err := exec.LookPath("pwsh.exe"); err == nil {
+			windowsPowerShellPath = p
+			return
+		}
+		windowsPowerShellPath = "powershell"
+	})
+	return windowsPowerShellPath
+}
+
+// wrapLocalShellCommand prefixes command with the PowerShell initialization when
+// the host shell is Windows PowerShell. Non-Windows hosts execute it unchanged.
+func wrapLocalShellCommand(command string) string {
+	if runtime.GOOS == "windows" {
+		return windowsPowerShellPrelude + command
+	}
+	return command
+}
+
 // shellCmd returns the platform shell and the argument flags that precede the
-// command string. On Windows it uses PowerShell with -NoProfile -NonInteractive
-// (the command is passed to -Command) so a user profile can't inject banners or
-// prompts and an interactive prompt can't hang an unattended run. Elsewhere it
-// uses `bash -c`.
+// command string. On Windows it uses PowerShell with -NoLogo -NoProfile
+// -NonInteractive (the command is passed to -Command) so a user profile can't
+// inject banners or prompts and an interactive prompt can't hang an unattended
+// run. Elsewhere it uses `bash -c`.
 func shellCmd() (string, []string) {
 	if runtime.GOOS == "windows" {
-		return "powershell", []string{"-NoProfile", "-NonInteractive", "-Command"}
+		return windowsPowerShellExe(), []string{"-NoLogo", "-NoProfile", "-NonInteractive", "-Command"}
 	}
 	return "bash", []string{"-c"}
 }

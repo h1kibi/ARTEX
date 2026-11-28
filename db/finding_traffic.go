@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 
 var (
 	ErrEvidenceConflict = errors.New("流量证据已变更，请刷新后重试")
+
 	ErrFindingNotFound  = errors.New("漏洞不存在")
 	ErrEvidenceNotFound = errors.New("流量证据不存在")
 )
@@ -236,8 +238,24 @@ VALUES($1,$2,$3,$4,$5) ON CONFLICT(finding_id,snapshot_id) DO NOTHING`, findingI
 }
 
 func bumpEvidenceVersionTx(tx *sql.Tx, findingID int64) error {
-	_, err := tx.Exec(`UPDATE findings SET evidence_version=evidence_version+1 WHERE id=$1`, findingID)
-	return err
+	var version int64
+	var nodeID sql.NullInt64
+	if err := tx.QueryRow(`UPDATE findings SET evidence_version=evidence_version+1
+WHERE id=$1 RETURNING evidence_version, node_id`, findingID).Scan(&version, &nodeID); err != nil {
+		return err
+	}
+	// Mirror the version onto the graph node in the same transaction. The goal-proof
+	// gate reads the NODE, and it compares the version a confirmation was bound to
+	// against the current one — so a version that only exists in the findings table
+	// would make every confirmed finding look stale the moment evidence changed.
+	if nodeID.Valid {
+		if _, err := tx.Exec(`UPDATE exploration_nodes
+SET payload = jsonb_set(payload, '{evidence_version}', to_jsonb($1::bigint), true)
+WHERE id=$2`, version, nodeID.Int64); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func FindingTrafficTx(tx *sql.Tx, findingID int64) (*FindingTraffic, error) {
@@ -332,6 +350,11 @@ type RecordFindingInput struct {
 	EvidenceRefs                                         []string
 	RouteID                                              int64
 	RunID                                                string
+	// TriageState is the Auto-Triager verdict for this report: "confirmed" when
+	// re-checkable evidence backs it, "verifying" when only text evidence exists.
+	// Empty means "not triaged" and reads as confirmed (legacy callers/tests), so
+	// goal proof keeps working for every pre-existing row.
+	TriageState string
 }
 
 type RecordedFinding struct {
@@ -377,6 +400,9 @@ func RecordFindingTx(ctx context.Context, tx *sql.Tx, in RecordFindingInput, pre
 	if in.RunID != "" {
 		payloadMap["run_id"] = in.RunID
 	}
+	if in.TriageState != "" {
+		payloadMap["triage_state"] = in.TriageState
+	}
 	payload, _ := json.Marshal(payloadMap)
 	out := &RecordedFinding{}
 	if err := tx.QueryRow(`INSERT INTO exploration_nodes(exploration_id,kind,payload,priority,state,origin)
@@ -398,8 +424,12 @@ VALUES($1,'finding',$2,9,'confirmed',$3) RETURNING id`, in.ExplorationID, string
 		assets = []int64{}
 	}
 	raw, _ := json.Marshal(assets)
-	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids)
-VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw)).Scan(&out.FindingID); err != nil {
+	triage := in.TriageState
+	if triage == "" {
+		triage = "confirmed"
+	}
+	if err := tx.QueryRow(`INSERT INTO findings(task_id,node_id,vulnclass,name,severity,summary,evidence,worker,asset_ids,triage_state)
+VALUES(NULLIF($1,0),$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, in.TaskID, out.NodeID, in.VulnClass, in.Name, in.Severity, in.Summary, in.Evidence, in.Worker, string(raw), triage).Scan(&out.FindingID); err != nil {
 		return nil, err
 	}
 	// 在**同一事务**里登记一条推送事件：提交即保证「漏洞落库」与「推送任务存在」
@@ -506,19 +536,160 @@ func (s *ExplorationStore) PopulateFindingTrafficIDs(nodes []*Node) error {
 	return rows.Err()
 }
 
-func (d *DB) SetFindingReportVersionByNodeID(ctx context.Context, nodeID int64, report string, version *int64) (n int64, err error) {
-	err = d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
-		var id int64
-		if err := tx.QueryRow(`SELECT id FROM findings WHERE node_id=$1`, nodeID).Scan(&id); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil
+// FindingIDForAnyID resolves a finding row from EITHER id a caller may hold:
+// findings.node_id (the exploration node report_finding's first line prints) or
+// findings.id (the standalone record id the report_finding JSON returns). The two
+// are different numbers for the same vuln, and models routinely pass one where the
+// tool wanted the other.
+//
+// The two id spaces are independent BIGSERIAL sequences, so a single number can
+// name one row's record id AND another row's node id — collisions are the norm in
+// a long-lived database, not a corner case. Resolution therefore looks at both
+// candidates and prefers the row whose findings.id matches (report_finding's
+// structured output is the authoritative identifier); node_id is the fallback for
+// the legacy first-line convention. taskID, when > 0, narrows the candidates to
+// that task first, which is the only tie-break that is actually meaningful: a node
+// id is task-scoped while a record id is global. Returns 0 (no error) when nothing
+// matches.
+func (d *DB) FindingIDForAnyID(id int64) (int64, error) {
+	return d.FindingIDForAnyIDInTask(id, 0)
+}
+
+// FindingIDByNodeIDInTask resolves a graph node id to the finding that owns it,
+// scoped to the caller's task. This is the unambiguous counterpart of
+// FindingIDForAnyIDInTask: a caller that KNOWS it holds a node id (the reporter gets
+// one from its trigger context) must not be routed through the "either sequence"
+// resolver, where a coincidental findings.id silently wins.
+func (d *DB) FindingIDByNodeIDInTask(nodeID, _ int64) (int64, error) {
+	if nodeID <= 0 {
+		return 0, nil
+	}
+	var fid int64
+	err := d.QueryRow(`SELECT id FROM findings WHERE node_id=$1`, nodeID).Scan(&fid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	// Ownership is NOT decided here: cross-task reads and inherited findings are
+	// legitimate (a handoff hint carries another task's finding), so the caller's
+	// provenance check decides. This resolver only fixes the NUMBERING.
+	return fid, nil
+}
+
+// FindingIDByRecordID resolves a findings.id, scoped to the caller's task. It never
+// falls back to the node-id space: a caller that was given a record id means that
+// record.
+func (d *DB) FindingIDByRecordID(recordID, _ int64) (int64, error) {
+	if recordID <= 0 {
+		return 0, nil
+	}
+	var fid int64
+	err := d.QueryRow(`SELECT id FROM findings WHERE id=$1`, recordID).Scan(&fid)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	// See FindingIDByNodeIDInTask: numbering here, ownership in the caller.
+	return fid, nil
+}
+
+// FindingIDForAnyIDInTask is FindingIDForAnyID with a task preference. See above.
+func (d *DB) FindingIDForAnyIDInTask(id, taskID int64) (int64, error) {
+	if id <= 0 {
+		return 0, nil
+	}
+	rows, err := d.Query(`SELECT id, COALESCE(task_id,0) FROM findings WHERE id=$1 OR node_id=$1`, id)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var recordID, nodeID, recordInTask, nodeInTask int64
+	for rows.Next() {
+		var fid, tid int64
+		if err := rows.Scan(&fid, &tid); err != nil {
+			return 0, err
+		}
+		if fid == id {
+			recordID = fid
+			if tid == taskID {
+				recordInTask = fid
 			}
+		} else {
+			nodeID = fid
+			if tid == taskID {
+				nodeInTask = fid
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	// A number that names TWO different findings is not decidable without the task:
+	// findings.id and exploration_nodes.id are independent sequences, so id=17 can be
+	// one task's finding record and another task's finding node. Left unresolved this
+	// silently targets the WRONG finding, so the ambiguity is logged at least once per
+	// call — real agent runs always carry a task and never reach this branch.
+	if taskID <= 0 && recordID > 0 && nodeID > 0 && recordID != nodeID {
+		log.Printf("[finding] 编号 %d 同时是漏洞记录 #%d 与节点 #%d 的编号；无任务上下文，按记录编号解析。请在任务内调用以避免歧义", id, recordID, nodeID)
+	}
+	// Preference order, most specific first:
+	//   1. a same-task row (cross-task evidence must not shadow the caller's own);
+	//   2. without a task, the record id (report_finding's structured output is the
+	//      modern contract) then the node id (the legacy first-line convention).
+	for _, candidate := range []int64{recordInTask, nodeInTask, recordID, nodeID} {
+		if candidate > 0 {
+			return candidate, nil
+		}
+	}
+	return 0, nil
+}
+
+// SetFindingReportVersionByNodeID is the strict node-keyed write: the argument IS
+// an exploration node id (the historical contract of every in-task caller and of
+// SetFindingReportByNodeID). It must NOT fall back to findings.id — the two id
+// spaces are independent sequences, so a node id can equal an unrelated finding's
+// record id and a fallback would silently write the report onto the wrong vuln.
+func (d *DB) SetFindingReportVersionByNodeID(ctx context.Context, nodeID int64, report string, version *int64) (n int64, err error) {
+	var findingID int64
+	if err := d.QueryRow(`SELECT id FROM findings WHERE node_id=$1`, nodeID).Scan(&findingID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return d.setFindingReportVersionByID(ctx, findingID, report, version)
+}
+
+// SetFindingReportVersionByAnyID writes a report for callers that only know "some
+// finding id" and cannot say which of the two it is (finding_id vs finding_node_id
+// — see FindingIDForAnyIDInTask). The returned id is the canonical findings.id
+// actually written (0 = not found).
+func (d *DB) SetFindingReportVersionByAnyID(ctx context.Context, id, taskID int64, report string, version *int64) (findingID, n int64, err error) {
+	findingID, err = d.FindingIDForAnyIDInTask(id, taskID)
+	if err != nil || findingID == 0 {
+		return 0, 0, err
+	}
+	n, err = d.setFindingReportVersionByID(ctx, findingID, report, version)
+	return findingID, n, err
+}
+
+// SetFindingReportVersionByID writes a finding's report, gated on the evidence
+// version the caller read. findingID must already be a canonical findings.id (the
+// explicit-id tool path resolves it by the numbering the caller used).
+func (d *DB) SetFindingReportVersionByID(ctx context.Context, findingID int64, report string, version *int64) (n int64, err error) {
+	return d.setFindingReportVersionByID(ctx, findingID, report, version)
+}
+
+func (d *DB) setFindingReportVersionByID(ctx context.Context, findingID int64, report string, version *int64) (n int64, err error) {
+	err = d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+		if err := LockFindingEvidenceTx(tx, findingID, version); err != nil {
 			return err
 		}
-		if err := LockFindingEvidenceTx(tx, id, version); err != nil {
-			return err
-		}
-		res, err := tx.Exec(`UPDATE findings SET report=$2,report_evidence_version=COALESCE($3::bigint,CASE WHEN evidence_version=0 THEN 0 ELSE -1 END) WHERE id=$1`, id, report, version)
+		res, err := tx.Exec(`UPDATE findings SET report=$2,report_evidence_version=COALESCE($3::bigint,CASE WHEN evidence_version=0 THEN 0 ELSE -1 END) WHERE id=$1`, findingID, report, version)
 		if err != nil {
 			return err
 		}

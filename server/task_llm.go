@@ -579,6 +579,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	workerRunSecs := watchdogWorkerRunSeconds(s.agentRunSeconds("worker"), s.watchdogConfig())
 	wk.SetRunTimeout(time.Duration(workerRunSecs) * time.Second)
 	wk.SetProxy(s.m.ProxyAddr(), s.m.ProxyCACert())
+	wk.SetRecording(s.m.TrafficEnabled()) // traffic_* 工具是否存在取决于录制，而不是 MITM 在不在链路里
 	wk.SetWebSearch(s.webSearchFor("worker"))
 	wk.SetConstraintInject(s.constraintInjectWorker) // 操作约束注入 worker(可配置,默认开)
 	pl := agent.NewPlanner(plannerRuntime, "task-router", s.m.dir, tx, plannerRuntime.CompactionWindow(), s.agentMaxTurns("planner"))
@@ -606,6 +607,10 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	// (agentsForTask),Compactor 必须接在这里。走任务路由的 planner provider(§4:与 agent
 	// 同模型,随任务 LLM 链解析),压缩用 Complete 一次性生成 body。
 	pl.SetCompactor(agent.NewCompactor(plannerRuntime, "task-router"))
+	// Guard: planner/mainagent 也持有 Bash/WebFetch，不挂 hook 就是全套拦截规则的旁路。
+	// task guard 由 Manager 在 taskFromPG 时用同一个 Interceptor 构造，WAF/429 计数
+	// 按任务归属，graph_overview 读的就是这一个。
+	pl.SetGuard(t.Guard)
 	main := agent.NewMainAgent(mainRuntime, "task-router", s.m.dir, tx, mainRuntime.CompactionWindow(), s.agentMaxTurns("mainagent"))
 	main.SetFindingRecorder(s.evidenceStore())
 	main.SetCompactionWindowResolver(mainRuntime.CompactionWindow)
@@ -617,6 +622,7 @@ func (s *Server) agentsForTask(t *Task) *taskAgentBundle {
 	main.SetSteerWork(func(intentID int64, msg string) error {
 		return s.engine.SteerWorkFrom(intentID, "mainagent", msg)
 	}) // steer_work：人对运行中 work 实时纠偏，来源标记为主 Agent
+	main.SetGuard(t.Guard)
 	bundle := &taskAgentBundle{
 		runtime: goalRuntime, plannerRuntime: plannerRuntime, workerRuntime: workerRuntime,
 		mainRuntime: mainRuntime, pl: pl, wk: wk, main: main,

@@ -2,7 +2,9 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -34,16 +36,19 @@ type watchdogRunDTO struct {
 	ProviderError   string `json:"provider_error,omitempty"`
 	SlowPathClass   string `json:"slow_path_class,omitempty"`
 	SlowPathSummary string `json:"slow_path_summary,omitempty"`
-	// Autonomy budget for this run, from the current Watchdog configuration.
-	MaxAutoCycles       int `json:"max_auto_cycles"`
-	AutoCyclesUsed      int `json:"auto_cycles_used"`
-	AutoCyclesRemaining int `json:"auto_cycles_remaining"`
+	// Autonomy budget for this run: the intent's effort tier when set, otherwise
+	// the current Watchdog configuration.
+	MaxAutoCycles       int    `json:"max_auto_cycles"`
+	AutoCyclesUsed      int    `json:"auto_cycles_used"`
+	AutoCyclesRemaining int    `json:"auto_cycles_remaining"`
+	Effort              string `json:"effort,omitempty"`
+	HumanInvolved       bool   `json:"human_involved,omitempty"`
 }
 
 // applyAutoBudget fills the informational autonomy fields from the run's real
 // count of green-light advances. User-approved cycles are not included.
 func (d *watchdogRunDTO) applyAutoBudget(maxAuto, used int) {
-	if maxAuto < 1 {
+	if maxAuto < 0 {
 		maxAuto = defaultWatchdogMaxAuto
 	}
 	if maxAuto > 4 {
@@ -174,7 +179,15 @@ func (s *Server) watchdogRuns(w http.ResponseWriter, r *http.Request) {
 	if s.watchdog != nil && s.watchdog.monitor != nil {
 		for _, snap := range s.watchdog.monitor.ListRunning(taskID) {
 			dto := watchdogRunDTOFromSnapshot(snap)
-			dto.applyAutoBudget(maxAuto, snap.AutoCyclesUsed)
+			// effort 档位是本次 run 的真实自治预算（probe=0 是有效值），全局配置只是
+			// 未标档位时的兜底——UI 必须显示实际生效的值，否则 probe 棒会显示成还有额度。
+			runMaxAuto := maxAuto
+			if snap.HasEffortMaxAutoCycles {
+				runMaxAuto = snap.EffortMaxAutoCycles
+			}
+			dto.applyAutoBudget(runMaxAuto, snap.AutoCyclesUsed)
+			dto.Effort = snap.Effort
+			dto.HumanInvolved = snap.HumanInvolved
 			runs = append(runs, dto)
 		}
 	} else if s.m != nil && s.m.pg != nil {
@@ -302,6 +315,19 @@ func (s *Server) watchdogDecide(w http.ResponseWriter, r *http.Request) {
 		_, actionErr = s.watchdogTerminateCycle(t, *snap, "用户明确拒绝继续", "stopped")
 	}
 	if actionErr != nil {
+		// The run settled between the card being answered and the action commit, so
+		// the choice was never applied. Retract the answer as expired: keeping it
+		// answered would show a stop the intent never took (and a resume the card
+		// says should be impossible).
+		if errors.Is(actionErr, errWorkControlConflict) || errors.Is(actionErr, errWatchdogRunMismatch) {
+			detail := "运行已进入终态提交，本次选择不再生效"
+			if _, xerr := s.m.pg.ExpireAnsweredWatchdogAsk(r.Context(), card.ID, req.Answer, detail); xerr != nil {
+				log.Printf("[watchdog] 回收已作答决策卡 #%d 失败: %v", card.ID, xerr)
+			}
+			if s.watchdog != nil && s.watchdog.monitor != nil {
+				s.watchdog.monitor.SetDecisionState(card.RunID, db.WatchdogDecisionNone)
+			}
+		}
 		writeErr(w, 409, actionErr.Error())
 		return
 	}

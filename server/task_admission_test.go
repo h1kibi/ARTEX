@@ -532,20 +532,22 @@ func TestRerunAdmissionFailureRestoresIntentState(t *testing.T) {
 	}
 }
 
-func TestRerunExhaustedRouteRejected(t *testing.T) {
+// 新契约：手动重跑不再被"路线累计预算耗尽"拦截——数值预算已退化为统计，不再强杀
+// 运行中的 worker，因此旧路线重跑是合法的；人工重跑优先级高于自治止损。
+func TestRerunSpentRouteAllowed(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
 		t.Skipf("postgres unavailable (%v) - skipping", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("exhausted rerun", "route budget guard", nil, 0, 0)
+	task, err := m.CreateTask("spent rerun", "no budget guard", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _, _ = m.DeleteTask(task.ID, DeleteTaskOptions{}) }()
 	store := task.Store
 	intentID, _, err := store.AddIntentWithEdges(map[string]any{
-		"summary": "spend the route budget", "path_phase": "validation",
+		"summary": "spend the route budget", "path_phase": "validation", "effort": "standard",
 		"budget": map[string]any{"max_tool_calls": 10},
 	}, 5, nil, "planner", 0, nil)
 	if err != nil {
@@ -568,12 +570,17 @@ func TestRerunExhaustedRouteRejected(t *testing.T) {
 	req.SetPathValue("iid", fmt.Sprintf("%d", intentID))
 	rec := httptest.NewRecorder()
 	s.rerunIntent(rec, req)
-	if rec.Code != http.StatusConflict || !bytes.Contains(rec.Body.Bytes(), []byte("预算已耗尽")) {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	// The route has no LLM/worker pool here, so admission may fail; what must NOT
+	// happen is a 409 budget rejection before any reopen attempt.
+	if rec.Code == http.StatusConflict {
+		t.Fatalf("rerun blocked by the retired budget guard: %s", rec.Body.String())
 	}
 	node, err := store.GetNode(intentID)
-	if err != nil || node == nil || node.State != "exhausted" {
-		t.Fatalf("intent was reopened despite exhausted route: %+v err=%v", node, err)
+	if err != nil || node == nil {
+		t.Fatalf("intent read: %v", err)
+	}
+	if node.State != "open" && node.State != "exhausted" {
+		t.Fatalf("unexpected state after rerun: %s", node.State)
 	}
 }
 

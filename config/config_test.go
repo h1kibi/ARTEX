@@ -40,3 +40,31 @@ func TestPostgresDSNPrecedence(t *testing.T) {
 		t.Fatalf("file dsn verbatim, got %q err %v", got, err)
 	}
 }
+
+// The OAST listener resolves env over file, and ARTEX_OAST_DISABLED wins over both.
+func TestOASTListenPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(cfg, []byte(`{"oast":{"addr":"10.1.1.1:9000","public_url":"http://cb.internal:9000"}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ARTEX_CONFIG", cfg)
+	t.Setenv("ARTEX_OAST_ADDR", "")
+	t.Setenv("ARTEX_OAST_PUBLIC_URL", "")
+	t.Setenv("ARTEX_OAST_DISABLED", "")
+
+	addr, public, enabled := OASTListen()
+	if addr != "10.1.1.1:9000" || public != "http://cb.internal:9000" || !enabled {
+		t.Fatalf("file config: addr=%q public=%q enabled=%v", addr, public, enabled)
+	}
+	t.Setenv("ARTEX_OAST_ADDR", "0.0.0.0:8081")
+	t.Setenv("ARTEX_OAST_PUBLIC_URL", "http://10.9.9.9:8081")
+	addr, public, _ = OASTListen()
+	if addr != "0.0.0.0:8081" || public != "http://10.9.9.9:8081" {
+		t.Fatalf("env should win: addr=%q public=%q", addr, public)
+	}
+	t.Setenv("ARTEX_OAST_DISABLED", "1")
+	if _, _, enabled = OASTListen(); enabled {
+		t.Fatal("ARTEX_OAST_DISABLED=1 did not disable the listener")
+	}
+}

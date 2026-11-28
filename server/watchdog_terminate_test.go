@@ -233,3 +233,32 @@ func TestWatchdogSettlementCASConflictDoesNotEmitTerminationEvent(t *testing.T) 
 		}
 	}
 }
+
+// Once runIntent has claimed the terminal commit, a late termination must be
+// refused instead of claiming the run and waiting for a settlement result the
+// commit's normal branch will never write.
+func TestTerminateRefusedAfterSettlementClaim(t *testing.T) {
+	_, task, intent := testWatchdogTask(t)
+	e := NewEngine(nil)
+	_, cancel := context.WithCancelCause(context.Background())
+	e.registerWorkRun(intent.ID, "run-claim", cancel)
+	defer func() {
+		_, complete := e.detachWork(intent.ID)
+		complete(nil)
+	}()
+
+	if _, _, _, ok := e.claimWorkSettlement(intent.ID, "run-claim"); ok {
+		t.Fatal("claim reported a pending termination before one was requested")
+	}
+	_, err := e.TerminateWork(context.Background(), intent.ID, "run-claim", "用户明确拒绝继续", "stopped")
+	if !errors.Is(err, errWorkControlConflict) {
+		t.Fatalf("termination after the commit claim error=%v, want errWorkControlConflict", err)
+	}
+	node, err := task.Store.GetNode(intent.ID)
+	if err != nil || node == nil {
+		t.Fatalf("intent: %+v err=%v", node, err)
+	}
+	if node.State == "stopped" {
+		t.Fatal("a refused termination still stopped the intent")
+	}
+}

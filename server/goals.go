@@ -116,6 +116,14 @@ func (s *Server) admitTaskWhen(t *Task, mode string, requirePaused bool) (queued
 	}
 	s.concMu.Lock()
 	defer s.concMu.Unlock()
+	// pauseMu makes the whole admission transition — engine barrier, persistent
+	// paused flag, and the Engine resume that clears the in-memory pause — one
+	// critical section with the cost-cap pauser. Without it a sweep could pause
+	// after ApplyTaskAdmission and be erased by startAdmittedTask's Resume, leaving
+	// the database paused while the engine keeps running. Lock order is
+	// concMu -> pauseMu -> taskStateMu; the cost-cap path takes only the latter two.
+	s.m.pauseMu.Lock()
+	defer s.m.pauseMu.Unlock()
 	// Delete installs its barrier under concMu as well. Re-resolve after acquiring
 	// the lock so a request that captured a task pointer before successful deletion
 	// cannot revive that stale handle after StopTask clears its Engine maps.
@@ -225,6 +233,10 @@ func (s *Server) hasReadyQueuedTask(excludeID string) bool {
 }
 
 func (s *Server) startAdmittedTask(t *Task, mode string) {
+	// The task is admitted (possibly after the operator raised the ceiling), so the
+	// next cost check must read the live ledger and limit instead of the cached
+	// over-cap value that caused the pause.
+	s.engine.costCap.Delete(t.ID)
 	if mode == "bootstrap" {
 		if !s.engine.beginTaskOperation(t.ID) {
 			return
@@ -266,13 +278,16 @@ func (s *Server) reconcileConcurrency() {
 				continue
 			}
 			mode := s.resumeAdmissionMode(task)
+			s.m.pauseMu.Lock()
 			s.engine.Pause(task.ID, agent.Causef("llm_unavailable_queued", "LLM 不可用，任务进入等待队列",
 				"任务当前无法解析可运行的 Planner/Worker LLM，已释放并发槽；配置恢复后按队列顺序继续"))
 			if err := s.m.EnqueueTask(task.ID, mode); err != nil {
 				s.engine.Resume(task)
+				s.m.pauseMu.Unlock()
 				log.Printf("[concurrency] task %s 因 LLM 不可用入队失败: %v", task.ID, err)
 				continue
 			}
+			s.m.pauseMu.Unlock()
 			s.engine.emitActivity(task, db.Activity{Worker: "system", Kind: "text",
 				Summary: "已排队：当前没有可运行的 LLM 配置，配置恢复后自动开始"})
 		}
@@ -336,11 +351,16 @@ func (s *Server) reconcileConcurrency() {
 		if !s.engine.beginTaskOperation(task.ID) {
 			continue
 		}
+		// Promotion is the same transition as a manual resume: keep the persistent
+		// admission and the Engine resume atomic against a concurrent cost-cap pause.
+		s.m.pauseMu.Lock()
 		if err := s.m.ApplyTaskAdmission(task.ID, lifecycle.Status, lifecycle.Status, false, mode, false); err != nil {
+			s.m.pauseMu.Unlock()
 			s.engine.decInflight(task.ID)
 			continue
 		}
 		s.startAdmittedTask(task, mode)
+		s.m.pauseMu.Unlock()
 		s.engine.decInflight(task.ID)
 		slots--
 	}

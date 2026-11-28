@@ -148,6 +148,10 @@ type FactPayload struct {
 	ValidUntil        string   `json:"valid_until,omitempty"`
 	Sensitivity       string   `json:"sensitivity,omitempty"`
 	InheritancePolicy string   `json:"inheritance_policy,omitempty"`
+	// NeedHuman marks this fact as the run's hand-off to a human: the worker is
+	// blocked on something only a person can supply. Persisted so the hand-off
+	// survives a restart and is visible to the planner and the UI.
+	NeedHuman bool `json:"need_human,omitempty"`
 
 	// Route / checkpoint fields.
 	RouteID           int64           `json:"route_id,omitempty"`
@@ -213,6 +217,9 @@ type IntentRoute struct {
 	Budget           RouteBudget
 	BudgetUsed       RouteBudgetUsed
 	RouteStartedAt   string
+	// Effort is the intent's discrete run tier (probe/standard/deep). Empty on
+	// historical intents → NormalizeEffort maps them to standard.
+	Effort string
 }
 
 func ParseIntentRoute(n *Node) IntentRoute {
@@ -244,6 +251,7 @@ func ParseIntentRoute(n *Node) IntentRoute {
 	r.RouteStartedAt = infoString(raw["route_started_at"])
 	r.Budget = infoRouteBudget(raw["budget"])
 	r.BudgetUsed = infoRouteBudgetUsed(raw["route_budget_used"])
+	r.Effort = infoString(raw["effort"])
 	return r
 }
 
@@ -340,7 +348,7 @@ func ParseEvidenceRef(ref string) (EvidenceRef, error) {
 	ref = strings.TrimSpace(ref)
 	kind, id, ok := strings.Cut(ref, ":")
 	if !ok || strings.TrimSpace(kind) == "" || strings.TrimSpace(id) == "" {
-		return EvidenceRef{}, fmt.Errorf("证据引用 %q 必须写成 traffic:<id>、artifact:<path>、activity:<id>、node:<id> 或 finding:<id>", ref)
+		return EvidenceRef{}, fmt.Errorf("证据引用 %q 必须写成 traffic:<id>、artifact:<path>、activity:<id>、node:<id>、finding:<id> 或 oast:<id>", ref)
 	}
 	kind, id = strings.ToLower(strings.TrimSpace(kind)), strings.TrimSpace(id)
 	if strings.IndexFunc(id, func(r rune) bool { return r == '\n' || r == '\r' || r == '\x00' }) >= 0 {
@@ -355,13 +363,13 @@ func ParseEvidenceRef(ref string) (EvidenceRef, error) {
 			return EvidenceRef{}, err
 		}
 		return EvidenceRef{Kind: kind, ID: clean}, nil
-	case "activity", "node", "finding":
+	case "activity", "node", "finding", "oast":
 		if _, err := strconv.ParseInt(id, 10, 64); err != nil || id == "" {
 			return EvidenceRef{}, fmt.Errorf("证据引用 %q 的 %s 部分必须是数字 id", ref, kind)
 		}
 		return EvidenceRef{Kind: kind, ID: id}, nil
 	default:
-		return EvidenceRef{}, fmt.Errorf("不支持的证据引用类型 %q；可用 traffic、artifact、activity、node、finding", kind)
+		return EvidenceRef{}, fmt.Errorf("不支持的证据引用类型 %q；可用 traffic、artifact、activity、node、finding、oast", kind)
 	}
 }
 

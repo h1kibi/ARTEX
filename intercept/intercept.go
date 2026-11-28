@@ -141,9 +141,10 @@ func (i *Interceptor) SetReviewer(r Reviewer) {
 // defaultEnabledTools is the hard-coded set of tools that enter the intercept
 // rule system when no intercept_enabled_tools setting has been saved.
 var defaultEnabledTools = []string{
-	"Bash", "WebFetch", "web_search",
+	"Bash", "WebFetch", "http_request", "web_search",
 	"shell_open", "shell_send",
 	"Write", "Edit", "MultiEdit",
+	"ExecuteExtraTool",
 }
 
 // New creates an Interceptor backed by d. The rule cache is lazy-loaded on

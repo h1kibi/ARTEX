@@ -39,15 +39,21 @@ type job struct {
 }
 
 // Engine owns the resolver, the proxy-routed HTTP client, and the worker pool.
+// Construction is inert: the resolver and the workers start on the first real
+// job, so a deployment that never passively enriches runs no enrichment
+// goroutines at all.
 type Engine struct {
-	as     *db.AssetStore
-	resolv *dnsx.DNSX
+	as      *db.AssetStore
+	workers int
+
+	resolv *dnsx.DNSX // written once by start, before the workers read it
 	client *http.Client
 
-	jobs   chan job
-	cool   sync.Map // dedup/cooldown: "kind:id" -> time.Time (last run)
-	once   sync.Once
-	closed chan struct{}
+	jobs    chan job
+	cool    sync.Map // dedup/cooldown: "kind:id" -> time.Time (last run)
+	started sync.Once
+	once    sync.Once
+	closed  chan struct{}
 }
 
 const (
@@ -64,27 +70,40 @@ func New(as *db.AssetStore, proxy func() string, workers int) *Engine {
 	if workers <= 0 {
 		workers = 4
 	}
-	resolv, err := dnsx.New(dnsx.Options{
-		BaseResolvers: dnsx.DefaultResolvers,
-		MaxRetries:    3,
-		QuestionTypes: []uint16{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME},
-		Timeout:       4 * time.Second,
+	return &Engine{
+		as:      as,
+		workers: workers,
+		client:  buildClient(proxy),
+		jobs:    make(chan job, queueSize),
+		closed:  make(chan struct{}),
+	}
+}
+
+// start initializes the resolver and launches the worker pool on the first job.
+// A Close that wins the race leaves the engine stopped, so enqueue must not hand
+// it work either.
+func (e *Engine) start() {
+	e.started.Do(func() {
+		select {
+		case <-e.closed:
+			return
+		default:
+		}
+		resolv, err := dnsx.New(dnsx.Options{
+			BaseResolvers: dnsx.DefaultResolvers,
+			MaxRetries:    3,
+			QuestionTypes: []uint16{dns.TypeA, dns.TypeAAAA, dns.TypeCNAME},
+			Timeout:       4 * time.Second,
+		})
+		if err != nil {
+			log.Printf("[enrich] dnsx 初始化失败，DNS 解析停用：%v", err)
+			resolv = nil
+		}
+		e.resolv = resolv
+		for range e.workers {
+			go e.worker()
+		}
 	})
-	if err != nil {
-		log.Printf("[enrich] dnsx 初始化失败，DNS 解析停用：%v", err)
-		resolv = nil
-	}
-	e := &Engine{
-		as:     as,
-		resolv: resolv,
-		client: buildClient(proxy),
-		jobs:   make(chan job, queueSize),
-		closed: make(chan struct{}),
-	}
-	for i := 0; i < workers; i++ {
-		go e.worker()
-	}
-	return e
 }
 
 // buildClient returns an HTTP client that dials via the recording proxy (resolved
@@ -125,6 +144,12 @@ func (e *Engine) enqueue(j job) {
 	if e == nil || id0(j.id) || j.arg == "" {
 		return
 	}
+	select {
+	case <-e.closed:
+		return
+	default:
+	}
+	e.start()
 	select {
 	case e.jobs <- j:
 	default: // queue full → drop (best-effort enrichment)

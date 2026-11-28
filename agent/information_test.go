@@ -63,25 +63,41 @@ func TestRecordFactValidatesInformationTypes(t *testing.T) {
 	ts.SetArtifactRoots()
 	tool := ts.recordFact()
 
-	if res := callWrite(t, tool, `{"summary":"no type"}`); !res.IsError || !strings.Contains(res.Flatten(), "fact_type") {
-		t.Fatalf("missing fact_type accepted: %s", res.Flatten())
-	}
-	if res := callWrite(t, tool, `{"fact_type":"observation","summary":"no source"}`); !res.IsError || !strings.Contains(res.Flatten(), "source_activity_ids") {
+	// fact_type is optional: omitting it records an observation. A claim with no
+	// source at all (no tool result, no evidence) is still refused.
+	if res := callWrite(t, tool, `{"summary":"no source"}`); !res.IsError || !strings.Contains(res.Flatten(), "source_activity_ids") {
 		t.Fatalf("observation without source accepted: %s", res.Flatten())
 	}
-	res := callWrite(t, tool, `{"fact_type":"observation","summary":"HTTP 500 leaks DB error","evidence_refs":["artifact:out.txt"]}`)
+	res := callWrite(t, tool, `{"summary":"HTTP 500 leaks DB error","evidence_refs":["artifact:out.txt"]}`)
 	if res.IsError {
-		t.Fatalf("observation rejected: %s", res.Flatten())
+		t.Fatalf("default observation rejected: %s", res.Flatten())
 	}
 	obsID := parseRecordedID(t, res.Flatten())
+	if n, err := store.GetNode(obsID); err != nil || n == nil || n.FactType() != db.FactTypeObservation {
+		t.Fatalf("omitted fact_type stored as %+v err=%v", n, err)
+	}
 
-	if res = callWrite(t, tool, `{"fact_type":"claim","summary":"search is injectable","observation_ids":[`+itoa(obsID)+`],"confidence":"observed"}`); res.IsError {
+	// claim without confidence defaults to inferred.
+	if res = callWrite(t, tool, `{"fact_type":"claim","summary":"search is injectable","observation_ids":[`+itoa(obsID)+`]}`); res.IsError {
 		t.Fatalf("claim rejected: %s", res.Flatten())
 	}
 	claimID := parseRecordedID(t, res.Flatten())
+	claimNode, err := store.GetNode(claimID)
+	if err != nil || claimNode == nil {
+		t.Fatalf("claim %d: %+v err=%v", claimID, claimNode, err)
+	}
+	if got := db.ParseFactPayload(claimNode.Payload).Confidence; got != "inferred" {
+		t.Fatalf("claim confidence=%q want inferred", got)
+	}
 
-	if res = callWrite(t, tool, `{"fact_type":"hypothesis","summary":"can read users","claim_ids":[`+itoa(claimID)+`]}`); !res.IsError || !strings.Contains(res.Flatten(), "validation_actions") {
-		t.Fatalf("hypothesis without actions accepted: %s", res.Flatten())
+	// A hypothesis without validation actions but with claim provenance is stored
+	// as an observation instead of being rejected.
+	if res = callWrite(t, tool, `{"fact_type":"hypothesis","summary":"can read users","claim_ids":[`+itoa(claimID)+`]}`); res.IsError {
+		t.Fatalf("hypothesis downgrade rejected: %s", res.Flatten())
+	}
+	downgradedID := parseRecordedID(t, res.Flatten())
+	if n, err := store.GetNode(downgradedID); err != nil || n == nil || n.FactType() != db.FactTypeObservation {
+		t.Fatalf("hypothesis not downgraded to observation: %+v err=%v", n, err)
 	}
 	if res = callWrite(t, tool, `{"fact_type":"hypothesis","summary":"can read users","claim_ids":[`+itoa(claimID)+`],"validation_actions":["UNION SELECT user()"]}`); res.IsError {
 		t.Fatalf("hypothesis rejected: %s", res.Flatten())
@@ -93,6 +109,39 @@ func TestRecordFactValidatesInformationTypes(t *testing.T) {
 		t.Fatalf("pending candidate rejected: %s", res.Flatten())
 	}
 
+	// need_human is the run's hand-off to a human: it must land on the fact payload
+	// (so it survives a restart and is visible to the planner) and raise the run's
+	// HumanNeeded flag (so the engine parks the intent in paused instead of done).
+	if ts.Writes().HumanNeeded {
+		t.Fatal("HumanNeeded set before any need_human fact")
+	}
+	if res = callWrite(t, tool, `{"fact_type":"observation","summary":"blocked on SMS MFA","detail":"/login needs the SMS code","evidence_refs":["artifact:out.txt"],"need_human":true}`); res.IsError {
+		t.Fatalf("need_human fact rejected: %s", res.Flatten())
+	}
+	if !ts.Writes().HumanNeeded {
+		t.Fatal("need_human fact did not raise the run's HumanNeeded flag")
+	}
+	humanFactID := parseRecordedID(t, res.Flatten())
+	humanFact, err := store.GetNode(humanFactID)
+	if err != nil || humanFact == nil {
+		t.Fatalf("need_human fact %d: %+v err=%v", humanFactID, humanFact, err)
+	}
+	var humanPayload db.FactPayload
+	if err := json.Unmarshal(humanFact.Payload, &humanPayload); err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	if !humanPayload.NeedHuman {
+		t.Fatalf("need_human not persisted on the payload: %s", humanFact.Payload)
+	}
+	// A fact without the flag must not raise it again (the flag is per report).
+	ts2 := NewToolSet(store, "worker")
+	ts2.SetOwnerNode(intentID)
+	ts2.SetArtifactRoots(artifactDir)
+	_ = callWrite(t, ts2.recordFact(), `{"fact_type":"observation","summary":"plain observation","evidence_refs":["artifact:out.txt"]}`)
+	if ts2.Writes().HumanNeeded {
+		t.Fatal("plain fact raised HumanNeeded")
+	}
+
 	facts, err := store.ListByKind(db.KindFact, 20)
 	if err != nil {
 		t.Fatal(err)
@@ -101,13 +150,15 @@ func TestRecordFactValidatesInformationTypes(t *testing.T) {
 	for _, n := range facts {
 		types[n.FactType()]++
 	}
-	if types[db.FactTypeObservation] != 1 || types[db.FactTypeClaim] != 1 ||
+	// Four observations: the default one, the downgraded hypothesis, the need_human
+	// hand-off and the plain one.
+	if types[db.FactTypeObservation] != 4 || types[db.FactTypeClaim] != 1 ||
 		types[db.FactTypeHypothesis] != 1 || types[db.FactTypeFindingCandidate] != 1 {
 		t.Fatalf("stored information types=%v", types)
 	}
 }
 
-func TestAddIntentDefaultsRouteBudget(t *testing.T) {
+func TestAddIntentEffortDefaultsAndHistory(t *testing.T) {
 	d := testDB(t)
 	defer d.Close()
 	task, err := d.CreateTask("route defaults", "fixture", nil, 0, 0)
@@ -118,7 +169,8 @@ func TestAddIntentDefaultsRouteBudget(t *testing.T) {
 	store := d.Exploration(task.ExplorationID)
 	ts := NewToolSet(store, "planner")
 
-	first, err := ts.addOneIntent(intentItem{Summary: "default-budget route"})
+	// effort 缺席 → standard；模型不再需要填任何数字预算。
+	first, err := ts.addOneIntent(intentItem{Summary: "default-effort route"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,32 +178,44 @@ func TestAddIntentDefaultsRouteBudget(t *testing.T) {
 	if err != nil || node == nil {
 		t.Fatalf("node=%+v err=%v", node, err)
 	}
-	if b := db.ParseIntentRoute(node).Budget; b.MaxToolCalls != db.DefaultRouteMaxToolCalls || b.MaxInputTokens != db.DefaultRouteMaxInputTokens {
-		t.Fatalf("default budget=%+v", b)
+	if eff := db.ParseIntentRoute(node).Effort; db.NormalizeEffort(eff) != db.EffortStandard {
+		t.Fatalf("default effort=%q want standard", eff)
+	}
+	if lim := db.EffortRuntimeLimits(db.NormalizeEffort("")); lim.MaxTurns != 80 || lim.MaxAutoCycles != 1 {
+		t.Fatalf("standard limits=%+v", lim)
 	}
 	if err := store.SetIntentState(first, "done"); err != nil {
 		t.Fatal(err)
 	}
-	cont, err := ts.addOneIntent(intentItem{Summary: "inherit defaults", ContinuationOf: first})
+	cont, err := ts.addOneIntent(intentItem{Summary: "inherit effort", ContinuationOf: rawID(first)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if node, err = store.GetNode(cont); err != nil || node == nil {
 		t.Fatalf("continuation=%+v err=%v", node, err)
 	}
-	if b := db.ParseIntentRoute(node).Budget; b.MaxToolCalls != db.DefaultRouteMaxToolCalls {
-		t.Fatalf("continuation budget=%+v", b)
-	}
 
-	explicit, err := ts.addOneIntent(intentItem{Summary: "explicit route", Budget: routeBudgetItem{MaxToolCalls: 7}})
+	// 旧库/旧提示词仍可能带 budget JSON：必须可解析、落库为历史统计，但不阻断。
+	legacy, err := ts.addOneIntent(intentItem{Summary: "legacy budget route",
+		Budget: routeBudgetItem{MaxToolCalls: 7}, Effort: db.EffortDeep})
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("legacy budget JSON rejected: %v", err)
 	}
-	if node, err = store.GetNode(explicit); err != nil || node == nil {
-		t.Fatalf("explicit=%+v err=%v", node, err)
+	if node, err = store.GetNode(legacy); err != nil || node == nil {
+		t.Fatalf("legacy=%+v err=%v", node, err)
 	}
-	if b := db.ParseIntentRoute(node).Budget; b.MaxToolCalls != 7 || b.MaxInputTokens != 0 {
-		t.Fatalf("explicit budget=%+v", b)
+	r := db.ParseIntentRoute(node)
+	if r.Budget.MaxToolCalls != 7 {
+		t.Fatalf("legacy budget lost: %+v", r.Budget)
+	}
+	if r.Effort != db.EffortDeep {
+		t.Fatalf("effort=%q want deep", r.Effort)
+	}
+	if lim := db.EffortRuntimeLimits(r.Effort); lim.MaxTurns != 130 || lim.MaxAutoCycles != 2 {
+		t.Fatalf("deep limits=%+v", lim)
+	}
+	if lim := db.EffortRuntimeLimits(db.EffortProbe); lim.MaxTurns != 35 || lim.MaxAutoCycles != 0 {
+		t.Fatalf("probe limits=%+v", lim)
 	}
 }
 
@@ -399,7 +463,7 @@ func TestAddIntentInheritsRouteAndCheckpointBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	second, err := ts.addOneIntent(intentItem{
-		Summary: "continue with a different object", ContinuationOf: first, Phase: "exploitation",
+		Summary: "continue with a different object", ContinuationOf: rawID(first), Phase: "exploitation",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -421,13 +485,12 @@ func TestAddIntentInheritsRouteAndCheckpointBudget(t *testing.T) {
 	if next.Budget.MaxToolCalls != 20 {
 		t.Fatalf("continuation lost route budget: %+v", next.Budget)
 	}
-	if _, err := ts.addOneIntent(intentItem{Summary: "parallel branch", ContinuationOf: first}); err == nil {
+	if _, err := ts.addOneIntent(intentItem{Summary: "parallel branch", ContinuationOf: rawID(first)}); err == nil {
 		t.Fatal("parallel continuation of the same route was accepted")
 	}
 
-	// Exhaust the route's cumulative tool-call budget. A bare continuation would
-	// be killed again on the next Fast Path tick, so add_intent must reject it and
-	// ask for an explicit larger budget.
+	// 数值预算不再阻断接续：即使 checkpoint 记录了"预算耗尽"的历史用量，接续也
+	// 只受【两振挂起】约束（本 fixture 的两次运行都产出了高价值进展 → 不挂起）。
 	if err := store.SetIntentState(second, "done"); err != nil {
 		t.Fatal(err)
 	}
@@ -438,23 +501,23 @@ func TestAddIntentInheritsRouteAndCheckpointBudget(t *testing.T) {
 	), db.RouteBudgetUsed{ToolCalls: 20, InputTokens: 5000}, ""); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ts.addOneIntent(intentItem{Summary: "keep going", ContinuationOf: second}); err == nil ||
-		!strings.Contains(err.Error(), "预算已耗尽") {
-		t.Fatalf("continuation on exhausted route err=%v", err)
+	// 该路线第二次运行确实产出了高价值进展 → 不满足两振挂起条件。
+	if _, err := store.AddNodeLinked(db.KindFact, map[string]any{
+		"fact_type": db.FactTypeClaim, "summary": "object authorization bypassed",
+		"confidence": "observed", "progress_event": "validated_weakness",
+	}, 5, "confirmed", "worker", nil, second, db.RelYields); err != nil {
+		t.Fatal(err)
 	}
-	expanded, err := ts.addOneIntent(intentItem{
-		Summary: "keep going with more budget", ContinuationOf: second,
-		Budget: routeBudgetItem{MaxToolCalls: 40, MaxInputTokens: 9000},
-	})
+	third, err := ts.addOneIntent(intentItem{Summary: "keep going", ContinuationOf: rawID(second), Effort: db.EffortDeep})
 	if err != nil {
-		t.Fatalf("continuation with expanded budget: %v", err)
+		t.Fatalf("continuation must not be blocked by the legacy budget: %v", err)
 	}
-	expandedNode, err := store.GetNode(expanded)
-	if err != nil || expandedNode == nil {
-		t.Fatalf("expanded intent=%+v err=%v", expandedNode, err)
+	thirdNode, err := store.GetNode(third)
+	if err != nil || thirdNode == nil {
+		t.Fatalf("third intent=%+v err=%v", thirdNode, err)
 	}
-	if got := db.ParseIntentRoute(expandedNode).Budget; got.MaxToolCalls != 40 || got.MaxInputTokens != 9000 {
-		t.Fatalf("expanded route budget=%+v", got)
+	if got := db.ParseIntentRoute(thirdNode).Effort; got != db.EffortDeep {
+		t.Fatalf("continuation effort=%q want deep", got)
 	}
 }
 
@@ -469,3 +532,305 @@ func parseRecordedID(t *testing.T, out string) int64 {
 }
 
 func itoa(v int64) string { return strconv.FormatInt(v, 10) }
+
+// A continuation that omits effort inherits the source route's tier: a deep chain
+// must not be silently demoted to standard by a bare continuation.
+func TestAddIntentContinuationInheritsEffort(t *testing.T) {
+	d := testDB(t)
+	t.Cleanup(func() { d.Close() })
+	task, err := d.CreateTask("effort inheritance", "fixture", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.DeleteTask(task.ID) })
+	store := d.Exploration(task.ExplorationID)
+	ts := NewToolSet(store, "planner")
+	first, err := ts.addOneIntent(intentItem{Summary: "deep chain", Effort: db.EffortDeep})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetIntentState(first, "exhausted"); err != nil {
+		t.Fatal(err)
+	}
+	// Every run of this fixture must be productive, or the two-dry-run rule (a
+	// separate concern, covered in route_health_test.go) would reject the next one.
+	if _, err := store.AddNodeLinked(db.KindFact, map[string]any{
+		"fact_type": db.FactTypeClaim, "summary": "stage progress",
+		"progress_event": "validated_weakness",
+	}, 5, "confirmed", "worker", nil, first, db.RelYields); err != nil {
+		t.Fatal(err)
+	}
+	second, err := ts.addOneIntent(intentItem{Summary: "bare continuation", ContinuationOf: rawID(first)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := store.GetNode(second)
+	if err != nil || node == nil {
+		t.Fatalf("second intent: %v", err)
+	}
+	if got := db.ParseIntentRoute(node).Effort; got != db.EffortDeep {
+		t.Fatalf("bare continuation effort=%q want deep (inherited)", got)
+	}
+	// An explicit tier still wins over the inherited one.
+	if err := store.SetIntentState(second, "exhausted"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AddNodeLinked(db.KindFact, map[string]any{
+		"fact_type": db.FactTypeClaim, "summary": "stage two progress",
+		"progress_event": "objective_milestone",
+	}, 5, "confirmed", "worker", nil, second, db.RelYields); err != nil {
+		t.Fatal(err)
+	}
+	third, err := ts.addOneIntent(intentItem{Summary: "explicit probe", ContinuationOf: rawID(second), Effort: db.EffortProbe})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err = store.GetNode(third)
+	if err != nil || node == nil {
+		t.Fatalf("third intent: %v", err)
+	}
+	if got := db.ParseIntentRoute(node).Effort; got != db.EffortProbe {
+		t.Fatalf("explicit continuation effort=%q want probe", got)
+	}
+}
+
+// 数值预算已废弃、永不强制执行，因此也永不拒绝：负数被吞成 0（不限），超限旧值
+// 被原样落库做统计。add_intent 的预算校验报错率必须是 0%。
+func TestAddIntentNeverRejectsLegacyBudget(t *testing.T) {
+	d := testDB(t)
+	t.Cleanup(func() { d.Close() })
+	task, err := d.CreateTask("legacy budget lenience", "fixture", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.DeleteTask(task.ID) })
+	store := d.Exploration(task.ExplorationID)
+	ts := NewToolSet(store, "planner")
+
+	negative, err := ts.addOneIntent(intentItem{Summary: "negative legacy budget",
+		Budget: routeBudgetItem{MaxToolCalls: -5, MaxInputTokens: -1, MaxWallSeconds: -30}})
+	if err != nil {
+		t.Fatalf("negative legacy budget rejected: %v", err)
+	}
+	if r := db.ParseIntentRoute(nodeByID(t, store, negative)); !r.Budget.Empty() {
+		t.Fatalf("negative legacy budget not normalized to unlimited: %+v", r.Budget)
+	}
+
+	huge, err := ts.addOneIntent(intentItem{Summary: "oversized legacy budget",
+		Budget: routeBudgetItem{MaxToolCalls: 999999, MaxInputTokens: 999_999_999, MaxWallSeconds: 999 * 24 * 3600}})
+	if err != nil {
+		t.Fatalf("oversized legacy budget rejected: %v", err)
+	}
+	if r := db.ParseIntentRoute(nodeByID(t, store, huge)); r.Budget.MaxToolCalls != 999999 {
+		t.Fatalf("oversized legacy budget not persisted for statistics: %+v", r.Budget)
+	}
+}
+
+// A worker that omits intent_id still writes a fully bound fact: the owner intent
+// is inferred, route_id is copied, the intent→fact yields edge is created, and the
+// latest tool_result is attached as the source activity.
+func TestRecordFactAutoBindsWorkerIntent(t *testing.T) {
+	d := testDB(t)
+	defer d.Close()
+	task, err := d.CreateTask("auto lineage", "fixture", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(task.ID)
+	store := d.Exploration(task.ExplorationID)
+	ts := NewToolSet(store, "worker")
+	intentID, err := ts.addOneIntent(intentItem{Summary: "probe redis"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts.SetOwnerNode(intentID)
+	actID, err := store.AppendActivity(db.Activity{
+		NodeID: &intentID, Worker: "worker", Kind: "tool_result", Tool: "Bash",
+		Summary: "redis-cli INFO -> no auth",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := callWrite(t, ts.recordFact(), `{"summary":"port 6379 unauthenticated"}`)
+	if res.IsError {
+		t.Fatalf("record_fact rejected: %s", res.Flatten())
+	}
+	factID := parseRecordedID(t, res.Flatten())
+	node, err := store.GetNode(factID)
+	if err != nil || node == nil {
+		t.Fatalf("fact %d: %+v err=%v", factID, node, err)
+	}
+	payload := db.ParseFactPayload(node.Payload)
+	if payload.IntentID != intentID {
+		t.Fatalf("intent_id=%d want %d", payload.IntentID, intentID)
+	}
+	if payload.RouteID != intentID {
+		t.Fatalf("route_id=%d want %d", payload.RouteID, intentID)
+	}
+	if len(payload.SourceActivityIDs) != 1 || payload.SourceActivityIDs[0] != actID {
+		t.Fatalf("source_activity_ids=%v want [%d]", payload.SourceActivityIDs, actID)
+	}
+	edges, err := store.EdgesTouching([]int64{factID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	linked := false
+	for _, e := range edges {
+		if e.From == intentID && e.Rel == db.RelYields && e.To == factID {
+			linked = true
+		}
+	}
+	if !linked {
+		t.Fatalf("intent→fact yields edge missing: %+v", edges)
+	}
+}
+
+// artifact: references written in either absolute spelling (Windows drive or the
+// WSL /mnt/<drive> form) collapse to the root-relative path; paths outside every
+// artifact root stay absolute and are rejected.
+func TestArtifactPathNormalization(t *testing.T) {
+	d := testDB(t)
+	defer d.Close()
+	task, err := d.CreateTask("artifact paths", "fixture", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(task.ID)
+	store := d.Exploration(task.ExplorationID)
+	ts := NewToolSet(store, "worker")
+	intentID, err := ts.addOneIntent(intentItem{Summary: "artifact fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts.SetOwnerNode(intentID)
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "i14846"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(root, "i14846", "out.txt")
+	if err := os.WriteFile(file, []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ts.SetArtifactRoots(root)
+	tool := ts.recordFact()
+
+	check := func(ref, want string) {
+		t.Helper()
+		input, _ := json.Marshal(map[string]any{"summary": "artifact form", "evidence_refs": []string{ref}})
+		res := callWrite(t, tool, string(input))
+		if res.IsError {
+			t.Fatalf("%s rejected: %s", ref, res.Flatten())
+		}
+		id := parseRecordedID(t, res.Flatten())
+		node, err := store.GetNode(id)
+		if err != nil || node == nil {
+			t.Fatalf("fact %d: %+v err=%v", id, node, err)
+		}
+		refs := db.ParseFactPayload(node.Payload).EvidenceRefs
+		if len(refs) != 1 || refs[0] != "artifact:"+want {
+			t.Fatalf("%s stored as %v want artifact:%s", ref, refs, want)
+		}
+	}
+	check("artifact:"+file, "i14846/out.txt")
+	if len(file) > 2 && file[1] == ':' {
+		check("artifact:"+artifactCompareKey(file), "i14846/out.txt")
+	}
+	outside := filepath.Join(t.TempDir(), "win.ini")
+	if err := os.WriteFile(outside, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	outsideInput, _ := json.Marshal(map[string]any{"summary": "outside", "evidence_refs": []string{"artifact:" + outside}})
+	if res := callWrite(t, tool, string(outsideInput)); !res.IsError {
+		t.Fatalf("artifact outside the roots accepted: %s", res.Flatten())
+	}
+}
+
+// add_intent accepts a stringified intents array, prefixed ids ("#12"), and a
+// checkpoint echoed into parent_ids during continuation without failing.
+func TestAddIntentNormalizesInputAndCheckpointParent(t *testing.T) {
+	d := testDB(t)
+	defer d.Close()
+	task, err := d.CreateTask("intent input norm", "fixture", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(task.ID)
+	store := d.Exploration(task.ExplorationID)
+	ts := NewToolSet(store, "planner")
+
+	parent, err := store.AddNode(db.KindFact, map[string]any{
+		"fact_type": db.FactTypeObservation, "summary": "seen", "progress_event": "validated_weakness",
+	}, 5, "confirmed", "worker", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tool := ts.addIntent()
+	first := callWrite(t, tool, `{"intents":"[{\"summary\":\"from parent\",\"parent_ids\":[\"#`+itoa(parent)+`\"]}]"}`)
+	if first.IsError {
+		t.Fatalf("stringified intents rejected: %s", first.Flatten())
+	}
+	var out struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.Unmarshal([]byte(first.Flatten()), &out); err != nil || len(out.IDs) != 1 || out.IDs[0] <= 0 {
+		t.Fatalf("ids decode: %v %s", err, first.Flatten())
+	}
+	firstID := out.IDs[0]
+	checkpoint, err := store.AddNodeLinked(db.KindFact, db.CheckpointPayload(
+		"stage done", "path_stage", "route", "validation", "run-1", "completed",
+		firstID, firstID, nil, nil, nil, nil, nil, nil, db.RouteBudgetUsed{ToolCalls: 2},
+	), 0, "confirmed", "system", nil, firstID, db.RelYields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetIntentState(firstID, "done"); err != nil {
+		t.Fatal(err)
+	}
+	second := callWrite(t, tool, `{"summary":"continue","continuation_of":`+itoa(firstID)+`,"parent_ids":["#`+itoa(checkpoint)+`"]}`)
+	if second.IsError {
+		t.Fatalf("checkpoint parent in continuation rejected: %s", second.Flatten())
+	}
+}
+
+// A continuation id sent as a display string ("#14825") must parse at the tool
+// boundary and inherit the source route rather than failing the whole intent.
+func TestAddIntentContinuationAcceptsStringID(t *testing.T) {
+	d := testDB(t)
+	defer d.Close()
+	task, err := d.CreateTask("string continuation", "fixture", nil, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.DeleteTask(task.ID)
+	store := d.Exploration(task.ExplorationID)
+	ts := NewToolSet(store, "planner")
+
+	first, err := ts.addOneIntent(intentItem{Summary: "first lane"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstNode, err := store.GetNode(first)
+	if err != nil || firstNode == nil {
+		t.Fatalf("first intent: %v", err)
+	}
+	wantRoute := db.ParseIntentRoute(firstNode).RouteID
+	if err := store.SetIntentState(first, "done"); err != nil {
+		t.Fatal(err)
+	}
+
+	res := callWrite(t, ts.addIntent(), `{"summary":"string continuation","continuation_of":"#`+itoa(first)+`"}`)
+	if res.IsError {
+		t.Fatalf("string continuation id rejected: %s", res.Flatten())
+	}
+	nextID, err := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(res.Flatten(), "intent created: ")), 10, 64)
+	if err != nil || nextID <= 0 {
+		t.Fatalf("continuation id decode: %v %q", err, res.Flatten())
+	}
+	next, err := store.GetNode(nextID)
+	if err != nil || next == nil {
+		t.Fatalf("continuation intent: %v", err)
+	}
+	if got := db.ParseIntentRoute(next).RouteID; got != wantRoute {
+		t.Fatalf("continuation route=%d want %d", got, wantRoute)
+	}
+}

@@ -153,6 +153,10 @@ type Engine struct {
 	steerMu  sync.Mutex
 	steerBox map[int64][]steerMessage
 
+	// costCap caches each task's cumulative equivalent cost, so the claim gate does
+	// not query the metering ledger on every 800ms poll.
+	costCap sync.Map // taskID -> costCapEntry
+
 	plannerRound sync.Map // taskID -> int, planner round counter (for UI round separators)
 
 	// 任务级超时(见 docs/任务级超时与收尾设计.md):
@@ -193,6 +197,16 @@ type workExecution struct {
 	// settle the intent even though the run context was never cancelled.
 	watchdogReason string
 	watchdogState  string
+	// humanStop marks an operator's explicit "stop" behind this termination. The
+	// settlement path needs it: a run that also reported need_human must still be
+	// stopped (that IS the human's will), not parked as resumable.
+	humanStop bool
+	// settling is set once runIntent has entered its terminal commit. A
+	// termination request that arrives after that point is refused under workMu
+	// instead of installing a cancellation the commit will never observe; without
+	// the flag the request claimed the run and then waited for a result that the
+	// normal settlement branch never wrote.
+	settling bool
 	// watchdogResult is filled by runIntent before it signals done, so the caller
 	// that asked for termination can return the settled state and write counts.
 	watchdogResult *TerminationResult
@@ -337,6 +351,12 @@ func (e *Engine) StopTask(taskID string) {
 		delete(e.runtimes, taskID)
 	}
 	e.runtimeMu.Unlock()
+
+	// The task's pooled MCP clients (a browser, its cookies, its npx tree) belong
+	// to the task; drop them now instead of waiting out the pool's idle timeout.
+	if id, err := strconv.ParseInt(taskID, 10, 64); err == nil && id != 0 {
+		mcpPoolInstance().CloseTaskSession(id)
+	}
 
 	e.started.Delete(taskID)
 	e.lastAct.Delete(taskID)
@@ -540,6 +560,10 @@ func (e *Engine) ControlWork(ctx context.Context, intentID int64, action string)
 		e.workMu.Unlock()
 		return fmt.Errorf("%w: 意图 %d 正在执行 %s 操作", errWorkControlConflict, intentID, run.action)
 	}
+	if run.settling {
+		e.workMu.Unlock()
+		return fmt.Errorf("%w: 意图 %d 已进入终态提交，%s 操作不再生效", errWorkControlConflict, intentID, action)
+	}
 	run.action = action
 	done := run.done
 	cause := error(agent.AbortWorkPausedByUser)
@@ -643,19 +667,49 @@ func (e *Engine) SteerWorkFrom(intentID int64, source, msg string) error {
 		return fmt.Errorf("不支持的调整来源 %q", source)
 	}
 	e.workMu.Lock()
-	running := e.work[intentID] != nil
-	e.workMu.Unlock()
-	if !running {
+	run := e.work[intentID]
+	if run == nil {
+		e.workMu.Unlock()
 		return fmt.Errorf("意图 %d 当前没有运行中的 work（可能已结束或未被领取）", intentID)
 	}
+	if source == "mainagent" && e.monitor != nil && run.runID != "" {
+		// The human-ownership flag must be published BEFORE workMu is released: the
+		// termination admission re-reads it under this same lock, so updating it after
+		// unlocking left a window where a SteerWork that "took the wheel" could still
+		// be terminated as autonomous.
+		//
+		// Lock order: workMu → monitor.mu. termination admission takes the same order,
+		// so this cannot deadlock.
+		e.monitor.SetHumanInvolved(run.runID, true)
+	}
+	e.workMu.Unlock()
 	e.steerMu.Lock()
 	e.steerBox[intentID] = append(e.steerBox[intentID], steerMessage{Text: msg, Source: source})
 	e.steerMu.Unlock()
 	return nil
 }
 
+// steerExemptWriteTools are pure write-back / tidying tools. A watchdog pressure
+// prompt at the queue head must NOT block them: the prompt demands exactly this
+// write-back, and blocking record_fact mid-pressure historically cancelled the
+// very response it asked for (274 Bash and 14 record_fact interruptions).
+var steerExemptWriteTools = map[string]bool{
+	"record_fact": true, "insert_assets": true, "report_finding": true, "TodoWrite": true,
+}
+
 // drainSteer pops the oldest queued steering message for intentID (FIFO), if any.
 func (e *Engine) drainSteer(intentID int64) (steerMessage, bool) {
+	return e.drainSteerForTool(intentID, "")
+}
+
+// drainSteerForTool is drainSteer with the tool-context exemption: when the queue
+// head is a watchdog pressure message and the worker is about to run a pure
+// write-back tool, the message is LEFT IN PLACE and the call passes through —
+// the pressure gets consumed by the next non-exempt tool call (typically a probe).
+// If a previous exempt call already reset the watchdog's cycle (a high-value
+// write-back did land), the stale pressure message is dropped instead of nagging
+// a run that already complied. toolName=="" restores the unconditional drain.
+func (e *Engine) drainSteerForTool(intentID int64, toolName string) (steerMessage, bool) {
 	e.steerMu.Lock()
 	defer e.steerMu.Unlock()
 	q := e.steerBox[intentID]
@@ -663,14 +717,30 @@ func (e *Engine) drainSteer(intentID int64) (steerMessage, bool) {
 		if msg.Kind != "" {
 			continue // peer notices are drained separately, after system steer
 		}
-		if len(q) == 1 {
-			delete(e.steerBox, intentID)
-		} else {
-			e.steerBox[intentID] = append(q[:i:i], q[i+1:]...)
+		if msg.Source == "watchdog" && toolName != "" && steerExemptWriteTools[toolName] {
+			// The write-back may have satisfied the pressure (cycle reset clears
+			// PressureSent in the monitor). Drop the stale nag in that case.
+			if e.monitor != nil {
+				if snap := e.monitor.Lookup(intentID); snap != nil && !snap.PressureSent {
+					e.removeSteerLocked(intentID, q, i)
+					return steerMessage{}, false
+				}
+			}
+			return steerMessage{}, false // leave it for the next non-exempt call
 		}
+		e.removeSteerLocked(intentID, q, i)
 		return msg, true
 	}
 	return steerMessage{}, false
+}
+
+// removeSteerLocked deletes index i of the intent's queue. Caller holds steerMu.
+func (e *Engine) removeSteerLocked(intentID int64, q []steerMessage, i int) {
+	if len(q) == 1 {
+		delete(e.steerBox, intentID)
+	} else {
+		e.steerBox[intentID] = append(q[:i:i], q[i+1:]...)
+	}
 }
 
 // steerHooks wraps the guard's hook runner so the planner can steer a running work:
@@ -680,7 +750,9 @@ func (e *Engine) drainSteer(intentID int64) (steerMessage, bool) {
 // 它同时负责「空转回合」的续跑，见 Stop。
 type steerHooks struct {
 	inner harness.HookRunner
-	drain func() (steerMessage, bool)
+	// drain is called with the tool name about to run, so a watchdog pressure
+	// prompt can defer past pure write-back tools (drainSteerForTool).
+	drain func(toolName string) (steerMessage, bool)
 	// drainPeer returns the batch of worker-to-worker notices waiting at this
 	// tool boundary. System steer is checked first, so a planner/watchdog
 	// correction always wins over peer traffic.
@@ -730,8 +802,10 @@ func isThinkingOnlyTurn(messages []llm.Message) bool {
 }
 
 func (h steerHooks) PreToolUse(ctx context.Context, name string, input []byte) (bool, string, []byte) {
-	if msg, ok := h.drain(); ok {
-		return true, steerPrefix(msg.Source) + msg.Text + steerSuffix(msg.Source), nil
+	if h.drain != nil {
+		if msg, ok := h.drain(name); ok {
+			return true, steerPrefix(msg.Source) + msg.Text + steerSuffix(msg.Source), nil
+		}
 	}
 	if h.drainPeer != nil {
 		if msgs := h.drainPeer(); len(msgs) > 0 {
@@ -1118,6 +1192,15 @@ func (e *Engine) workerLoop(ctx context.Context, t *Task, name string) {
 			}
 			continue // 任务已终态(done/failed/timeout):停止领取遗留意图,别在完成后空跑 frontier
 		}
+		if e.taskCostCapExceeded(t) {
+			// The task is now paused by the cap; this loop goes idle like any other
+			// paused task. Nothing already claimed is lost — those runs settle
+			// normally and their intents return to the frontier.
+			if sleepCtx(ctx, 1000*time.Millisecond) {
+				return
+			}
+			continue
+		}
 		if !e.beginTaskOperation(t.ID) {
 			return
 		}
@@ -1182,6 +1265,10 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	if e.monitor != nil {
 		e.monitor.Register(t.ID, intent.ID, runID, name)
 		e.monitor.SetRoute(runID, db.ParseIntentRoute(intent))
+		// effort 决定本次 run 的自主放行周期数（probe=0 是有效值），human_involved
+		// 决定周期边界是否允许静默强杀。两者都按 run 计算，不落到任何共享 Worker 字段。
+		effort := db.NormalizeEffort(route.Effort)
+		e.monitor.SetEffort(runID, effort, db.EffortRuntimeLimits(effort).MaxAutoCycles, humanInvolvedRoute(t.Store, intent))
 		defer e.monitor.Finish(runID, db.WorkerRunStateFinished)
 	}
 	// per-work child context so the planner's kill_work can stop just this work.
@@ -1203,7 +1290,7 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// 重跑一轮不该把额度清零重来。
 	hooks := steerHooks{
 		inner:     t.Guard.Hooks(),
-		drain:     func() (steerMessage, bool) { return e.drainSteer(iid) },
+		drain:     func(tool string) (steerMessage, bool) { return e.drainSteerForTool(iid, tool) },
 		drainPeer: func() []steerMessage { return e.drainPeer(iid, peerMaxBatch) },
 		nudges:    &atomic.Int64{},
 		limit:     e.emptyTurnNudgeLimit(),
@@ -1229,6 +1316,11 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 		reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
 	}
 	e.EndLLMCall(t.ID)
+	// A need-human hand-off must survive the model_error retry loop below. The retry
+	// re-runs Execute and OVERWRITES `wrote`, so a worker that reported need_human and
+	// then hit a retryable provider error would lose the flag on its second attempt —
+	// and with it the operator's only way back in. The marker is sticky per run.
+	humanHandoff := wrote.HumanNeeded
 	// Provider failures during the retry/backoff window are not Watchdog stalls.
 	// Mark the hot-path state immediately; the final provider_error audit is still
 	// emitted only after the configured retry chain is exhausted.
@@ -1259,6 +1351,13 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 			reason, wrote, err = worker.Execute(workCtx, name, wTaskID, e.m.assets, t.Store, intent, hooks, emit, e.m.enrich, t.NotifyFinding)
 		}
 		e.EndLLMCall(t.ID)
+		if wrote.HumanNeeded {
+			humanHandoff = true
+		}
+	}
+	// Restore the sticky flag for the settlement decision below.
+	if humanHandoff {
+		wrote.HumanNeeded = true
 	}
 	// Capture kill state before detachWork cancels workCtx. kill = this work's
 	// ctx was cancelled (planner kill_work) while the TASK ctx kept running; a
@@ -1277,6 +1376,44 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	if _, rcErr := e.reconcileFindingCandidate(t, intent, runID); rcErr != nil {
 		log.Printf("[worker %s] task %s 意图 #%d 对账 finding_candidate 失败: %v", name, t.ID, intent.ID, rcErr)
 	}
+	// Close the settlement window first: claiming the run and reading the pending
+	// termination happen in one workMu section, so a stop request either lands
+	// before this point (and is honored below) or is refused as a control conflict
+	// by terminateWork — never installed after the commit has chosen its branch.
+	wdReason, wdState, humanStop, hasWatchdog := e.claimWorkSettlement(intent.ID, runID)
+	// An explicit operator "stop" is human authority: it wins over the hand-off,
+	// and the run settles as stopped with a filled-in result. Otherwise an answered
+	// decision card could leave the intent paused or done while /decide answers 409.
+	if hasWatchdog && humanStop {
+		_, settled := e.settleWatchdogTermination(t, name, intent, runID, wdReason, wdState)
+		_, completeWork := e.detachWork(intent.ID)
+		if !settled {
+			completeWork(fmt.Errorf("%w: 意图 %d 终止时状态已被其他路径修改", errWorkControlConflict, intent.ID))
+		} else {
+			completeWork(nil)
+		}
+		return true
+	}
+	// A need-human hand-off outranks an autonomous Watchdog settlement exactly as it
+	// outranks every other terminal reason: a worker that parked on an MFA prompt and
+	// was then terminated for idling still needs the operator, and
+	// `stopped`/`exhausted` have no resume path. The hand-off is settled as paused
+	// instead, keeping the termination reason in the activity.
+	if wrote.HumanNeeded {
+		if err := transitionIntentState(t.Store, intent.ID, "running", resolveIntentState(reason, err, wrote)); err != nil {
+			log.Printf("[worker %s] task %s 意图 #%d 挂起落库失败: %v", name, t.ID, intent.ID, err)
+		} else {
+			e.emitActivity(t, db.Activity{
+				NodeID: &intent.ID, Worker: "system", Kind: "text",
+				Summary: fmt.Sprintf("意图 #%d 主动挂起：等待人工介入", intent.ID),
+				Detail: "Worker 已写回 need_human 事实，本次运行由 " + checkpointReason +
+					" 结束；意图保留为 paused，人工在会话里接手即可继续。",
+			})
+		}
+		_, completeWork := e.detachWork(intent.ID)
+		completeWork(nil)
+		return true
+	}
 	if wd := watchdogAbortCause(workCause); wd != nil {
 		_, settled := e.settleWatchdogTermination(t, name, intent, runID, wd.Text, wd.TerminalState)
 		_, completeWork := e.detachWork(intent.ID)
@@ -1290,8 +1427,13 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	// Settlement path: the context was never cancelled, the SDK consumed the
 	// Watchdog request and ran its wrap-up rounds. A natural completion or any
 	// pause/kill above wins over a late termination request.
-	if workCause == nil && reason != harness.ReasonCompleted {
-		if wdReason, wdState, ok := e.takeWatchdogTermination(intent.ID, runID); ok {
+	//
+	// EXCEPT when the pending termination is an operator's explicit stop: the worker
+	// finishing by itself (ReasonCompleted) does not cancel a human's stop, and
+	// skipping the settlement here left the decision card answered while the run
+	// settled as done — the API then reported 409 and the intent stayed resumable.
+	if workCause == nil {
+		if hasWatchdog && (reason != harness.ReasonCompleted || humanStop) {
 			_, settled := e.settleWatchdogTermination(t, name, intent, runID, wdReason, wdState)
 			_, completeWork := e.detachWork(intent.ID)
 			if !settled {
@@ -1400,22 +1542,23 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	}
 	// terminal分流：撞步数上限 ≠ 完成。max_turns→exhausted（规划者据此知道这个方向
 	// 试过但没真正做完、需换角度，而非当成已覆盖永久跳过）；出错→blocked；正常→done。
-	state := "done"
-	switch {
-	case err != nil:
-		state = "blocked"
-	case reason == harness.ReasonMaxTurns:
-		state = "exhausted"
-		log.Printf("[worker %s] intent %d 撞步数上限(exhausted)，本次写回 %s", name, intent.ID, wrote)
-	case reason == harness.ReasonTimeout:
-		state = "exhausted"
-		log.Printf("[worker %s] intent %d 运行超时(exhausted)，收尾后写回 %s", name, intent.ID, wrote)
-	}
-	// Even with the Watchdog disabled, a run that just spent the route's
-	// cumulative budget must not be reported done: the next continuation would be
-	// silently over budget. The checkpoint above persisted route_budget_used.
-	if state == "done" {
-		state = routeBudgetTerminalState(t.Store, intent.ID, state)
+	state := resolveIntentState(reason, err, wrote)
+	switch state {
+	case "paused":
+		// The hand-off outranks how the run ended; resolveIntentState explains why.
+		log.Printf("[worker %s] intent %d 主动挂起等待人工介入(paused)，终态原因 %s，本次写回 %s", name, intent.ID, reason, wrote)
+		e.emitActivity(t, db.Activity{
+			NodeID: &intent.ID, Worker: "system", Kind: "text",
+			Summary: fmt.Sprintf("意图 #%d 主动挂起：等待人工介入", intent.ID),
+			Detail: "Worker 遇到只有人才能过的卡点（验证码 / MFA / SSO / 审批 / 跳板），已写回 need_human 事实并让出执行槽。" +
+				"在会话里填入凭据或给出一句指令即可继续这条意图；不需要重新发起任务。本次运行结束原因：" + string(reason),
+		})
+	case "exhausted":
+		if reason == harness.ReasonMaxTurns {
+			log.Printf("[worker %s] intent %d 撞步数上限(exhausted)，本次写回 %s", name, intent.ID, wrote)
+		} else {
+			log.Printf("[worker %s] intent %d 运行超时(exhausted)，收尾后写回 %s", name, intent.ID, wrote)
+		}
 	}
 	if state == "blocked" && isTaskLLMChainExhausted(err) {
 		_ = t.Store.SetIntentBlockedReason(intent.ID, db.IntentBlockedLLMQuota)
@@ -1431,23 +1574,47 @@ func (e *Engine) runIntent(ctx context.Context, t *Task, name string, worker *ag
 	return true
 }
 
-// routeBudgetTerminalState downgrades a successful run to exhausted when the
-// route's cumulative budget has been spent. Called after the checkpoint has
-// persisted route_budget_used, so it works with the Watchdog disabled too.
-func routeBudgetTerminalState(store *db.ExplorationStore, intentID int64, state string) string {
-	if store == nil || intentID <= 0 {
-		return state
-	}
-	n, err := store.GetNode(intentID)
-	if err != nil || n == nil {
-		return state
-	}
-	r := db.ParseIntentRoute(n)
-	if dim, used, limit := db.RouteBudgetExhausted(r.Budget, r.BudgetUsed); dim != "" {
-		log.Printf("[worker] intent %d 路线累计预算耗尽(%s %d/%d)，标记 exhausted", intentID, dim, used, limit)
+// resolveIntentState maps how a worker run ended onto the intent's terminal state.
+// Split out from runIntent so the precedence is testable without an agent harness.
+//
+// A need-human hand-off wins over every other ending. The worker explicitly said
+// "only a person can pass this point"; how the run then stopped (turn budget, wall
+// clock, a downstream error) does not change that. `paused` is the only state the
+// human message endpoint accepts, so any other value would delete the resume path.
+func resolveIntentState(reason harness.TerminalReason, err error, wrote agent.WriteCounts) string {
+	switch {
+	case wrote.HumanNeeded:
+		return "paused"
+	case err != nil:
+		return "blocked"
+	case reason == harness.ReasonMaxTurns, reason == harness.ReasonTimeout:
 		return "exhausted"
+	default:
+		return "done"
 	}
-	return state
+}
+
+// humanInvolvedRoute reports whether a human owns the intent's route. Human-owned
+// routes are exempt from the autonomous two-dry-run suspension and from silent
+// Watchdog cycle termination (the card path is used instead). Human ownership is:
+// the intent's own origin is "human", someone sent this intent a manual message,
+// or a human answered "continue" on any of the route's Watchdog cards.
+func humanInvolvedRoute(store *db.ExplorationStore, intent *db.Node) bool {
+	if intent == nil {
+		return false
+	}
+	if intent.Origin == "human" {
+		return true
+	}
+	routeID := db.ParseIntentRoute(intent).RouteID
+	if routeID <= 0 || store == nil {
+		return false
+	}
+	health, err := store.RouteHealth(routeID)
+	if err != nil {
+		return false
+	}
+	return health.HumanInvolved
 }
 
 // runDetachedIntent runs one paused intent OUTSIDE the worker pool in its own
@@ -1512,7 +1679,10 @@ func taskExecutionPaused(cause error) bool {
 	}
 	switch abort.Code {
 	case "paused_by_user", "paused_by_orchestrator", "paused_on_reload", "paused_race_guard",
-		"queued_for_admission", "llm_unavailable_queued", "task_deleted":
+		"queued_for_admission", "llm_unavailable_queued", "task_deleted", "task_cost_cap":
+		// task_cost_cap belongs here: the cap cancels in-flight runs exactly like a
+		// pause does, so the intent must return to the frontier (and not be written
+		// back as `blocked`) or raising the ceiling could never resume the work.
 		return true
 	default:
 		return false

@@ -35,8 +35,6 @@ import type {
   EvidenceResponse,
   InformationNode,
   InformationResponse,
-  RouteBudget,
-  RouteBudgetUsed,
   TaskRoute,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -97,18 +95,19 @@ function fmtNumber(value?: number) {
 function fmtDuration(seconds?: number) {
   if (!seconds || seconds <= 0) return "—";
   if (seconds < 60) return `${Math.round(seconds)}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
-  return `${Math.floor(seconds / 3600)}h ${Math.round((seconds % 3600) / 60)}m`;
+  if (seconds < 3600) {
+    const m = Math.floor(seconds / 60);
+    const s = Math.round(seconds % 60);
+    return s === 0 ? `${m}m` : `${m}m ${s}s`;
+  }
+  const h = Math.floor(seconds / 3600);
+  const m = Math.round((seconds % 3600) / 60);
+  return m === 0 ? `${h}h` : `${h}h ${m}m`;
 }
 
-function budgetPercent(budget?: RouteBudget, used?: RouteBudgetUsed) {
-  if (!budget || !used) return null;
-  const parts: number[] = [];
-  if (budget.max_tool_calls) parts.push(((used.tool_calls ?? 0) / budget.max_tool_calls) * 100);
-  if (budget.max_input_tokens) parts.push(((used.input_tokens ?? 0) / budget.max_input_tokens) * 100);
-  if (budget.max_wall_seconds) parts.push(((used.wall_ms ?? 0) / 1000 / budget.max_wall_seconds) * 100);
-  if (parts.length === 0) return null;
-  return Math.min(100, Math.max(0, Math.max(...parts)));
+function fmtWorkSeconds(seconds?: number) {
+  if (!seconds || seconds <= 0) return null;
+  return seconds < 60 ? `${Math.round(seconds)}s` : `${Math.round(seconds / 60)}m`;
 }
 
 function Chip({ children, mono, className }: { children: React.ReactNode; mono?: boolean; className?: string }) {
@@ -161,7 +160,6 @@ function EmptyView({ icon: Icon, title, hint }: { icon: React.ElementType; title
 }
 
 function RouteCard({ route, selected, onSelect }: { route: TaskRoute; selected: boolean; onSelect: () => void }) {
-  const percent = budgetPercent(route.budget, route.budget_used);
   const latest = route.checkpoints.at(-1);
   return (
     <button
@@ -175,6 +173,10 @@ function RouteCard({ route, selected, onSelect }: { route: TaskRoute; selected: 
       <div className="flex flex-wrap items-center gap-2">
         <Chip mono>route #{route.route_id}</Chip>
         <StatusBadge domain="route" value={route.status} />
+        {!route.human_involved &&
+        (route.autonomy_status === "suspended_dry" || route.autonomy_status === "parked_stagnant") ? (
+          <StatusBadge domain="routeAutonomy" value={route.autonomy_status} />
+        ) : null}
         {route.phase ? <Chip>{route.phase}</Chip> : null}
         <ChevronRightIcon className="text-muted-foreground ml-auto size-4 shrink-0 transition-transform group-hover:translate-x-0.5" />
       </div>
@@ -188,16 +190,16 @@ function RouteCard({ route, selected, onSelect }: { route: TaskRoute; selected: 
         ) : null}
         {route.findings.length > 0 ? <span>{route.findings.length} 个漏洞</span> : null}
         {route.asset_ids?.length ? <span>{route.asset_ids.length} 个资产</span> : null}
+        {route.effort ? <span>档位 {route.effort}</span> : null}
+        <span>
+          {route.total_runs ?? 0} 棒
+          {route.consecutive_dry_runs ? (
+            <span className="text-amber-600 dark:text-amber-400"> · 连续 {route.consecutive_dry_runs} 空</span>
+          ) : null}
+        </span>
+        {fmtWorkSeconds(route.worker_seconds) ? <span>{fmtWorkSeconds(route.worker_seconds)}</span> : null}
+        {route.human_involved ? <span className="text-emerald-600 dark:text-emerald-400">人工盯盘</span> : null}
       </div>
-      {percent !== null ? (
-        <div className="mt-3">
-          <div className="text-muted-foreground mb-1 flex justify-between text-[10px]">
-            <span>路线预算</span>
-            <span>{Math.round(percent)}%</span>
-          </div>
-          <Progress value={percent} className="h-1.5" />
-        </div>
-      ) : null}
       {latest ? (
         <div className="text-muted-foreground mt-2 line-clamp-2 text-[11px]">checkpoint：{latest.summary}</div>
       ) : null}
@@ -215,6 +217,13 @@ function RouteDetail({ route }: { route: TaskRoute }) {
           <RouteIcon className="text-muted-foreground size-4" />
           <span className="font-mono text-sm">route #{route.route_id}</span>
           <StatusBadge domain="route" value={route.status} />
+          {!route.human_involved &&
+          (route.autonomy_status === "suspended_dry" || route.autonomy_status === "parked_stagnant") ? (
+            <StatusBadge domain="routeAutonomy" value={route.autonomy_status} />
+          ) : null}
+          {route.human_involved ? (
+            <Chip className="border-emerald-500/30 text-emerald-600 dark:text-emerald-400">人工盯盘</Chip>
+          ) : null}
           {route.route_kind ? <Chip>{route.route_kind}</Chip> : null}
           {route.phase ? <Chip>{route.phase}</Chip> : null}
         </div>
@@ -229,8 +238,19 @@ function RouteDetail({ route }: { route: TaskRoute }) {
             ))}
           </div>
         ) : null}
+        <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+          <RouteStat label="运行档位" value={route.effort || "standard"} />
+          <RouteStat label="已结束棒数" value={`${route.total_runs ?? 0} 棒`} />
+          <RouteStat label="连续无产出" value={`${route.consecutive_dry_runs ?? 0} 棒`} />
+          <RouteStat
+            label="距上次漏洞"
+            value={`${route.runs_since_finding ?? route.total_runs ?? 0} 棒${
+              route.worker_seconds ? ` · ${fmtDuration(route.worker_seconds)}` : ""
+            }`}
+          />
+        </div>
         {budget || used.tool_calls ? (
-          <div className="mt-4 grid gap-2 sm:grid-cols-3">
+          <div className="mt-3 grid gap-2 sm:grid-cols-3">
             <BudgetCell label="工具调用" used={used.tool_calls} max={budget?.max_tool_calls} />
             <BudgetCell label="输入 token" used={used.input_tokens} max={budget?.max_input_tokens} />
             <BudgetCell
@@ -358,6 +378,15 @@ function RouteDetail({ route }: { route: TaskRoute }) {
   );
 }
 
+function RouteStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-md bg-muted/50 px-3 py-2">
+      <div className="text-muted-foreground text-[10px]">{label}</div>
+      <div className="mt-1 font-mono text-sm tabular-nums">{value}</div>
+    </div>
+  );
+}
+
 function BudgetCell({ label, used, max, unit }: { label: string; used?: number; max?: number; unit?: string }) {
   const percent = max ? Math.min(100, Math.max(0, ((used ?? 0) / max) * 100)) : 0;
   return (
@@ -366,7 +395,7 @@ function BudgetCell({ label, used, max, unit }: { label: string; used?: number; 
         <span>{label}</span>
         <span>{max ? `${Math.round(percent)}%` : "不限"}</span>
       </div>
-      <div className="mt-1 font-mono text-sm">
+      <div className="mt-1 font-mono text-sm tabular-nums">
         {fmtNumber(used)}
         {unit ?? ""}
         {max ? (
@@ -474,7 +503,7 @@ function EvidenceTable({ evidence }: { evidence: EvidenceResponse | null }) {
       <EmptyView
         icon={Link2Icon}
         title="还没有证据引用"
-        hint="Claim、Hypothesis、Finding 的 evidence_refs，以及 report_finding 绑定的流量都会出现在这里。"
+        hint="Observation、Claim、Hypothesis、Finding 的 evidence_refs，以及 report_finding 绑定的流量都会出现在这里。"
       />
     );
   }

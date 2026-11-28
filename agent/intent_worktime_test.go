@@ -60,7 +60,7 @@ func TestCompactIntentExposesYieldCountAndWorkerTime(t *testing.T) {
 		ID: 1, Kind: db.KindIntent, State: "done", WorkerMS: 1500, WorkerRuns: 2,
 		Payload: json.RawMessage(`{"summary":"timed direction"}`),
 	}}
-	out := compactIntents(nodes, nil, map[int64][]int64{1: {10, 11}})
+	out := compactIntents(nodes, nil, map[int64][]int64{1: {10, 11}}, func(int64) string { return "observation" })
 	if len(out) != 1 {
 		t.Fatalf("compact intents: %#v", out)
 	}

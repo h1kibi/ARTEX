@@ -22,11 +22,13 @@ func noaWarn(session string) func(string) {
 
 // enableNoa 在解析器报告开启时把 noa 接入 opts。archiveRoot 是压缩原文的持久化基目录
 // (取全局 workDir,各 agent 统一落在 <workDir>/noa 下,不随任务/意图目录分散),sessionID
-// 命名其下的归档子目录(全局唯一,故同一基目录内不冲突)。
+// 命名其下的归档子目录(全局唯一,故同一基目录内不冲突)。contextLimit 是本 run 的有效上
+// 下文窗口(token),必须显式传入:省略时 noaadapter 会回退到它自己的保守默认 200000,把
+// 96k 工作窗的钳制完全旁路掉(压缩阈值/紧急水位都按 200k 算,等于没有钳制)。
 //
 // noa 是实验功能:接入失败不得中断真实任务。发生错误时经 onWarn 上报并回退内置压缩。
 // 启用成功时清掉 opts.Compaction,避免 agentcore 因「两个上下文管理器同时设置」告警。
-func enableNoa(opts *agentcore.Options, enabled func() bool, archiveRoot, sessionID string, onWarn func(string)) {
+func enableNoa(opts *agentcore.Options, enabled func() bool, archiveRoot, sessionID string, contextLimit int, onWarn func(string)) {
 	if enabled == nil || !enabled() {
 		return
 	}
@@ -34,9 +36,10 @@ func enableNoa(opts *agentcore.Options, enabled func() bool, archiveRoot, sessio
 		opts.OnWarn = onWarn
 	}
 	if err := noaadapter.Enable(opts, noaadapter.Options{
-		ArchiveBaseDir: filepath.Join(archiveRoot, "noa"),
-		SessionID:      sessionID,
-		OnWarn:         onWarn,
+		ArchiveBaseDir:    filepath.Join(archiveRoot, "noa"),
+		SessionID:         sessionID,
+		ModelContextLimit: contextLimit,
+		OnWarn:            onWarn,
 	}); err != nil {
 		if onWarn != nil {
 			onWarn("noa 压缩启用失败,回退内置压缩:" + err.Error())

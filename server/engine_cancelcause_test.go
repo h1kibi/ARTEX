@@ -68,6 +68,31 @@ func TestControlWorkCarriesUserActionCause(t *testing.T) {
 	}
 }
 
+func TestControlWorkRejectsSettlingRun(t *testing.T) {
+	e := NewEngine(nil)
+	ctx, cancel := context.WithCancelCause(context.Background())
+	e.registerWork(42, cancel)
+	e.workMu.Lock()
+	e.work[42].settling = true
+	e.workMu.Unlock()
+	for _, action := range []string{"pause", "cancel"} {
+		if err := e.ControlWork(context.Background(), 42, action); !errors.Is(err, errWorkControlConflict) {
+			t.Fatalf("%s on a settling run: err=%v, want conflict", action, err)
+		}
+	}
+	if ctx.Err() != nil {
+		t.Fatal("a refused control cancelled the settling run")
+	}
+	e.workMu.Lock()
+	action, settling := e.work[42].action, e.work[42].settling
+	e.workMu.Unlock()
+	if action != "" || !settling {
+		t.Fatalf("settling run mutated: action=%q settling=%v", action, settling)
+	}
+	_, complete := e.detachWork(42)
+	complete(nil)
+}
+
 func TestControlWorkReturnsSettlementError(t *testing.T) {
 	e := NewEngine(nil)
 	ctx, cancel := context.WithCancelCause(context.Background())

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strings"
 	"time"
 
@@ -24,9 +25,16 @@ var catastrophicBash = []*regexp.Regexp{
 	regexp.MustCompile(`\bdd\b[^\n]*\bof=/dev/(sd|nvme|hd)`),                                       // overwrite a disk
 }
 
-// disallowedAutoBackground lists commands that must never be silently moved to
-// the background on timeout.
-var disallowedAutoBackground = []string{"sleep"}
+// ShellDialectNote describes the shell that actually runs Bash commands on this
+// host. On a Windows host without an active WSL backend that is PowerShell, whose
+// syntax differs from POSIX in ways a model will otherwise get wrong; elsewhere
+// the tool prompt already describes bash, so the note is empty.
+func ShellDialectNote(wslActive bool) string {
+	if runtime.GOOS != "windows" || wslActive {
+		return ""
+	}
+	return "当前命令在本机 Windows PowerShell 中执行：控制台输入输出已设为无 BOM 的 UTF-8；`curl`、`python`、`ssh` 直接调用本机程序；多条命令使用 `;` 串联，屏蔽错误输出使用 `2>$null`；多行或复杂逻辑使用 Write 工具写入 `.py` 脚本后执行 `python script.py`。不要使用 POSIX 的 `<<'EOF'` 或 `/dev/null`。"
+}
 
 // NewBash builds the Bash tool: run a shell command with a timeout, optionally in
 // the background.
@@ -40,7 +48,7 @@ func NewBash() CoreTool {
 	if !BackgroundTasksDisabled() {
 		props["run_in_background"] = map[string]any{
 			"type":        "boolean",
-			"description": "Run in the background and return immediately; read its output later with TaskOutput or Read, and you are notified when it completes. A foreground command that exceeds its timeout is also moved to the background automatically.",
+			"description": "Run in the background and return immediately; read its output later with TaskOutput or Read, and you are notified when it completes.",
 		}
 		desc += " Set run_in_background to return immediately and read the output later."
 	}
@@ -100,7 +108,8 @@ func runBash(ctx context.Context, input json.RawMessage, tc *ToolContext) (Resul
 }
 
 // runBashManaged runs the command through the task manager, supporting explicit
-// background launch and timeout auto-backgrounding.
+// background launch; a foreground command that times out is killed with its
+// process tree and reported as an error.
 func runBashManaged(ctx context.Context, tc *ToolContext, command string, timeout time.Duration, explicitBG bool) (Result, error) {
 	spec := SpawnSpec{Command: command, Kind: KindBash, WorkingDir: tc.WorkingDir, Description: short(command), Env: tc.Env}
 
@@ -137,13 +146,9 @@ func runBashManaged(ctx context.Context, tc *ToolContext, command string, timeou
 		return Text(Capture(tc, output)), nil
 	}
 
-	// Timed out while still running.
-	if autoBackgroundAllowed(command) {
-		tc.Tasks.Background(t.ID)
-		return Text(fmt.Sprintf(
-			"Command still running after %s; moved to background as %s. Output file: %s\nUse TaskOutput{task_id:%q} to read its output; you are notified when it completes.",
-			timeout, t.ID, t.OutputPath, t.ID)), nil
-	}
+	// Timed out while still running: kill the whole tree and report what the
+	// command produced before the deadline. Nothing is left running in the
+	// background, since only an explicit request may start a background task.
 	out, _ := tc.Tasks.Output(t.ID, 0)
 	tc.Tasks.Kill(t.ID)
 	tc.Tasks.Forget(t.ID)
@@ -156,19 +161,33 @@ func runBashSync(ctx context.Context, tc *ToolContext, command string, timeout t
 	cctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	shell, flags := shellCmd()
-	cmd := exec.CommandContext(cctx, shell, append(flags, command)...)
+	var workDir string
+	var env []string
 	if tc != nil {
-		cmd.Dir = tc.WorkingDir
-		cmd.Env = withEnv(tc.Env)
-	} else {
-		cmd.Env = withEnv(nil)
+		workDir, env = tc.WorkingDir, tc.Env
 	}
+	cmd, viaWSL := shellProcess(cctx, command, workDir, env)
 	var buf bytes.Buffer
+	if viaWSL {
+		// wsl.exe prints its own NAT/proxy diagnostics to stderr in UTF-16; the
+		// filter drops those so a successful command does not come back wrapped
+		// in mojibake.
+		f := newWSLNoiseFilter(&buf)
+		cmd.Stdout, cmd.Stderr = f, f
+		err := cmd.Run()
+		_ = f.Close()
+		return finishSyncBash(tc, &buf, err, cctx, timeout)
+	}
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	err := cmd.Run()
+	return finishSyncBash(tc, &buf, err, cctx, timeout)
+}
 
+// finishSyncBash turns a finished synchronous run into a tool result: timeout
+// first (a killed child also reports an error), then the exit status, then the
+// success path, with Capture applied once at the end.
+func finishSyncBash(tc *ToolContext, buf *bytes.Buffer, err error, cctx context.Context, timeout time.Duration) (Result, error) {
 	out := Capture(tc, buf.String())
 	if cctx.Err() == context.DeadlineExceeded {
 		return Errorf(out + fmt.Sprintf("\n\n[command timed out after %s]", timeout)), nil
@@ -187,23 +206,4 @@ func runBashSync(ctx context.Context, tc *ToolContext, command string, timeout t
 		out = "(command produced no output)"
 	}
 	return Text(out), nil
-}
-
-// autoBackgroundAllowed reports whether a timed-out command may be moved to the
-// background instead of being killed.
-func autoBackgroundAllowed(command string) bool {
-	fields := strings.Fields(command)
-	if len(fields) == 0 {
-		return false
-	}
-	base := fields[0]
-	if i := strings.LastIndexAny(base, "/\\"); i >= 0 {
-		base = base[i+1:]
-	}
-	for _, d := range disallowedAutoBackground {
-		if base == d {
-			return false
-		}
-	}
-	return true
 }

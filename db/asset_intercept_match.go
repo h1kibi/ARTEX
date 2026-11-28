@@ -159,6 +159,11 @@ func (a *Asset) InterceptLabel() string {
 	return fmt.Sprintf("资产#%d[%s] %s", a.ID, a.Type, target)
 }
 
+// HasEnabledAssetRule reports whether the set contains any enabled rule. Exported
+// so callers outside the db package (guard's egress gate) can skip the evaluation
+// entirely when neither a block nor an allow rule is configured.
+func HasEnabledAssetRule(rules []AssetInterceptRule) bool { return hasEnabledRule(rules) }
+
 // hasEnabledRule 判断规则集里是否存在任一启用规则。
 func hasEnabledRule(rules []AssetInterceptRule) bool {
 	for _, r := range rules {

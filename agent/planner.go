@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/traffic"
 	"github.com/Autumn-27/norma/agentcore"
 	"github.com/Autumn-27/norma/llm"
 	"github.com/Autumn-27/norma/permission"
@@ -43,6 +45,7 @@ type Planner struct {
 	noaEnabledFn      func() bool                                   // resolver: use experimental noa compaction? (nil = off)
 	maxTokensFn       func() int                                    // resolver: per-reply output cap (nil/0 = send no cap)
 	compactor         *Compactor                                    // cold-node compaction (§7); nil = disabled
+	guard             *guard.Guard                                  // task guard: Bash/WebFetch 与 MCP 的拦截规则; nil = 不挂 hook
 
 	// todos keeps ONE plan-scratchpad per task (keyed by exploration id) so the
 	// planner's multi-step plan survives across wake-ups — each Plan() is a fresh
@@ -62,6 +65,11 @@ func (p *Planner) SetCompactionWindowResolver(fn func() int) { p.windowFn = fn }
 // planner wake-up to advance the round counter, maintain cold stamps, and
 // (off the hot path) fold cold nodes into digests. nil = feature disabled.
 func (p *Planner) SetCompactor(c *Compactor) { p.compactor = c }
+
+// SetGuard wires the task's guard (intercept rules + asset scope gate) into the
+// planner session. The planner holds Bash and WebFetch, so without hooks it was
+// the one agent able to bypass every rule. nil = no hooks (tests / chat).
+func (p *Planner) SetGuard(g *guard.Guard) { p.guard = g }
 
 // SetNonStreaming wires a resolver deciding whether runs use the non-streaming
 // model path (true = non-streaming). nil/unset = streaming (default).
@@ -369,7 +377,7 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
 
 **每次唤醒的决策流程**：
 
-1. **完整态势已附在本提示下方**（就是 graph_overview 的返回，无需再调它）：task（原始标题+目标/根节点）、资产计数、goals+状态、open/running/recent_done 意图、routes（route_id/phase/objective/预算/最近 checkpoint）、checkpoints（阶段交接）、finding_candidates（待确认漏洞）、sites_without_endpoints（无端点的站点，提示可能待探的方向）、facts（探索事实数，与漏洞是两类）、recent_facts（{id,summary,confidence?}）。**路线优先**：接续已结束意图时看它的 route_id/checkpoint；同一 route 的后续阶段用 continuation_of，阶段与下一步动作写清。
+1. **完整态势已附在本提示下方**（规划者战略索引，无需再调 graph_overview 取同一份数据）：task（原始标题+目标/根节点）、goals+状态、hints、open/running/recent_done 意图、routes（route_id/phase/objective/effort/asset_ids/active_intents/总棒数/连续跑干次数/runs_since_finding/worker_seconds/autonomy_status/是否人工介入/last_checkpoint_id/last_summary）、coverage（含 untested_total 与前 15 条 untested_targets_sample）、reusable_credentials（可复用凭据 {id,summary,route_id}）、variant_targets（同指纹兄弟资产 {fingerprint,source_finding_id,candidate_asset_ids}）、finding_candidates（待确认漏洞）、facts（探索事实数，与漏洞是两类）、recent_facts（{id,summary,confidence?}）。**路线优先**：接续已结束意图时看它的 route_id 与 last_checkpoint_id/last_summary；同一 route 的后续阶段用 continuation_of，阶段与下一步动作写清。
    - **范围**：探索节点（goals/意图/facts/findings）只含本任务；**资产图全局共享**（多任务同一份，资产计数是全局在范围内的、非本任务独有）——出现非本任务相关的资产时忽略。
    - **血缘**：每个意图带 parents（上游：派生自哪些事实/意图）和 yields（下游：产生了哪些事实/发现），recent_facts 每条带 from_intent；据此理解"哪些事实来自哪个方向、能否综合出新方向"。
    - **否定/存疑观察**（recent_facts 里"端口关闭/不可注入"等）是 worker 的观察、不是定论：采信前先 node_detail(id) 看 evidence——evidence 扎实、confidence=observed 且手段已穷尽的才视为该方向暂时封住；evidence 缺失、只是"看起来像/只探一次"、或 confidence=inferred 的，按【尚未探明】处理，若在范围内且无其它意图覆盖，默认派一条复核意图去证实或推翻（**同一否定方向至多复核一次**；复核后仍为否定、且证据合理，就尊重该结论、不再派）。
@@ -392,7 +400,7 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
    - 完全无任何意图覆盖的全新方向 → 生成。
    - 所有已知方向都被仍在 open/running 的意图覆盖 → 不生成、直接结束（有在跑/在排队的 work，等它们推进）；但若只剩 recent_done 覆盖、已无 open/running 而目标未达成 → 按顶部硬底线必须另开或续派。
    - **深度优先于覆盖度**：coverage 是下限/验收项、不是探索目标本身；发现高价值入口（可能通向 RCE/提权/数据外泄）后，优先派意图把那条路【往深打穿】，而不是为拉平覆盖度去铺广、逐个资产浅测。
-   - **耗时与产出对比**：每条意图带 worker_seconds、worker_runs 和 yield_count，yields 给出它写回的事实/发现节点。判断重派、续派或继续深挖前，把累计 worker 时间与 yield_count、finding 的严重级别和 confidence 对照。高耗时低产出不优先；产出高价值 finding 或接近目标的证据可以继续投入。
+   - **耗时与产出对比**：每条意图带 worker_seconds、worker_runs、yield_count 和 **high_value_yields / observation_yields 分质计数**，yields 给出它写回的事实/发现节点。判断重派、续派或继续深挖前，把累计 worker 时间与 high_value_yields（不是笼统 total）、finding 的严重级别和 confidence 对照——**若只有 observation_yields 增长而 high_value_yields 长期为 0，那就是"看起来在忙但没推进"**，别把它当成健康信号。高耗时低产出不优先；产出高价值 finding 或接近目标的证据可以继续投入。
    - **低价值 running 的止损**：运行中的意图若已消耗明显 worker 时间，yield_count 长期不增长，trace 里也没有接近目标的证据，先 get_worker_output / get_worker_trace 确认；能通过收窄范围保留价值的用 steer_work 纠偏，方向本身无价值的用 kill_work 停止。不要因为运行时间长就停止已有高价值 finding 或接近突破的意图。停止后从 recent_done 的 stopped 条目避免重复派回同一条低价值方向。
    - **保持路线多样、别过早收敛**：目标未达成时，若现有意图都挤在同一条路线/入口，而存在【本质不同】的未覆盖方向（另一入口面/另一类资产/另一条利用链），优先补那条分歧方向，而不是在同一线上加同义意图（看实质差异，不看措辞）；若该分歧方向已被现有意图覆盖，仍不生成。理想是 2–3 条机理不同的路线并存（如"从上传链打"与"从认证绕过打"），某条交出【目标逼近】的证据后才把资源集中过去。**但多样性永远服从顶部【操作约束】**：被约束排除的入口面/端口/主机/操作，即使本质不同也绝不生成意图。
    - **open Intent 上限**：graph_overview 的 frontier_open 是当前排队数量，open_intent_cap 是本任务上限。达到 cap_reached=true 时禁止继续提交 add_intent；先检查 open_intents，对低优先级、已过时或已被新事实覆盖的 Planner 方向调用 cancel_intent，写明原因，再提交新方向。不能取消 origin="human" 的意图，也不能为了腾位置取消高价值攻击链。
@@ -403,9 +411,27 @@ const plannerDefaultTmpl = `你是一个网络安全平台授权渗透测试系�
    - **summary**：一句话自然语言描述该方向（测试目标完整地址 + 做什么 + 为什么），不套固定分类；去重主要靠它与已有意图比对。
    - **asset_ids**：本方向要测试/攻击的目标资产 id（尽量传，0/1/多个，来自 list_assets）——只要方向围绕具体资产（站点/接口/参数/主机）就务必传，用于覆盖去重、连入资产链路，跨多资产就都传；纯全局侦察无具体资产才留空。
    - **parent_ids**：本方向由哪些上游节点综合得出（可选，0/1/多个）——多个事实结合产生一个意图就都传，派生自某上游意图/发现也传其 id，顶层全新方向留空。
-   - **continuation_of**：接续一条已经结束的意图时填写原意图 id；仅用于换一种打法，原意图仍是 open/running/paused 时调用会被拒绝。外部故障恢复优先使用 retry_work。接续会自动继承原路线的 route_id、预算余额和最近 checkpoint，不需要你手填 route_id。
+   - **continuation_of**：接续一条已经结束的意图时填写原意图 id；仅用于换一种打法，原意图仍是 open/running/paused 时调用会被拒绝。外部故障恢复优先使用 retry_work。接续会自动继承原路线的 route_id、最近 checkpoint 和 effort，不需要你手填 route_id。
    - **objective / phase / expected_evidence / success_condition**：新路线建议填写。phase 用 recon/validation/exploitation/privilege/lateral/objective/verification/evidence/cleanup；success_condition 写"确认什么或排除什么"，让下一个 worker 和 Watchdog 能判断阶段是否推进。
-   - **budget**：新路线可给 max_tool_calls/max_input_tokens/max_wall_seconds；这是整条路线的累计预算，接续默认继承剩余额度，不要每轮重置。**省略时新路线自动获得默认 240 次工具调用 / 120 万输入 token**，避免成本只靠 Watchdog 周期控制；确需更大范围再显式提高。若因单次步数或周期结束且路线仍有剩余预算，可直接用 continuation_of 继承剩余额度；若已是路线累计预算耗尽，接续时必须在 budget 中显式传入高于已用量的更大上限才能继续（否则会被拒绝），或转而停止该路线。
+   - **effort**：本意图的运行档位（省略=standard），由引擎确定性换算成轮数与自主放行周期，**不需要、也不允许你填任何数字预算**：
+     · "probe" — 网段存活/端口/指纹测绘、静态配置与清单盘点、单接口快速探针（35 轮，**首个 20 分钟周期结束即收尾交接**，不再自主续周期）；
+     · "standard" — 常规单靶点 Web/服务漏洞挖掘与闭环利用、已有凭据横向验证（80 轮，有实质进展最多自主续 1 周期）；
+     · "deep" — 多步复杂利用链（JNDI/JMX/反序列化、合约/二进制逆向、多层内网转发）（130 轮，有阶段突破最多自主续 2 周期）。
+     判据是"这条方向要把一件事做透还是只做一次测绘"：纯测绘一律 probe，别用 standard/deep 去铺广度；一个已定位入口的深挖一律 deep，别用 probe 在 35 轮被掐断后重新起棒。
+
+   **广度测绘与单点利用必须分棒（禁串行包干 Lane）**：一条意图只承载一件事。扫描器式"扫 100 台机器 + 顺手打 5 个目标"、"先扫再打同一批主机"的意图必须拆开——probe 棒负责把范围摸清并写回资产/事实，之后再按【单个入口/单个利用链】派 standard/deep 棒。把多个无关目标串成一条意图会让上下文被多目标回显挤爆，也让后续阶段接手时拿不到干净现场。
+
+   **中心互斥调度（不靠 Worker 私聊抢资源）**：目标/环境冲突由你在本轮单点裁决——先清退旧意图（cancel_intent / kill_work 并写明原因），确认其终态后再派针对同一目标的新意图；满载（线程池打满、目标侧 429/409）时**直接产出 0 条新执行意图**，宁可不派也不要让多个 worker 在同一目标上互相打架抢槽。
+
+   **路线自治状态与凭据重激活（route 视图已给 total_runs / consecutive_dry_runs / runs_since_finding / worker_seconds / autonomy_status / human_involved）**：
+     · autonomy_status=suspended_dry：该纯自治路线连续两棒既无 finding 也无高价值 ProgressEvent。**不要再原样续派**——转派一条【机理不同】的新路线（另一入口面/另一类资产/另一条利用链）。若确要用 continuation_of 重开它，必须在 parent_ids 里引用可解锁的外部证据：其他路线产出的凭据（credential/token/secret）或提权事实，或锚定本路线同一目标资产的新外部 fact/finding；普通无关资产的观察 fact 会被确定性拒绝。
+     · autonomy_status=parked_stagnant：该路线连续 4 棒没有产出新的确认 finding（或 2 棒且累计 worker_seconds >= 2400）且任务仍有未测目标时进入冷却让位。此时优先从 coverage.untested_targets_sample 挑空白目标派新意图，把执行容量让给覆盖缺口；确有该路线的新外部凭据/提权事实时才用 parent_ids 重开。
+     · human_involved=true 的路线恒为 active，豁免上述两条：人工盯盘的方向由人决定何时停，你不必、也不能替人收尾。
+     · reusable_credentials 里是跨路线可复用的凭据，新意图需要认证态时在 summary/parent_ids 明确引用；variant_targets 给出同组件指纹的兄弟资产，已确认漏洞的利用手法可优先推给这些尚未关联确认 finding 的候选资产。
+
+   **共享网络隧道单点建立**：需要内网穿透、VPN 或代理隧道时，开局单派 1 条 effort=probe 的意图把隧道建立并验证连通，写回连接参数与进程信息；后续业务意图直接在 reusable_credentials/事实里复用该隧道，不重复建第二条。
+
+   **外部环境容量让位与高代价接口约束**：目标侧返回 429/409、线程池满载或外部网络拥塞时，本轮直接产出 0 条执行意图，先让在跑 work 消化容量。带扣分、计费或配额消耗的辅助接口（第三方查询、扫描服务、付费 API）在尚未实际探测遇阻前禁止批量预调用——先派 probe/standard 意图用常规手段确认受阻点，再按需精确调用一次。
 
 不重复、不硬凑；但目标未达成、又有未覆盖且更深的打法时，该派就派。简洁、聚焦、高效。`
 
@@ -427,13 +453,19 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// cold_since_round stamps, and (if a threshold is hit) kick off background
 	// compaction. Synchronous part is cheap (a few queries); the LLM compaction
 	// runs in a detached goroutine so it never adds latency to this round.
-	p.compactor.OnPlannerRound(ctx, ts)
+	// 纯定时空闲心跳(len(triggers)==0 且无人工 hint/目标变更)不推进冷化轮次：
+	// 只有真实变动(worker 完成 / finding / steer)才算规划进度，否则等活期间的
+	// 活跃线索会被空转老化成冷摘要。
+	p.compactor.OnPlannerRound(ctx, ts, len(triggers) == 0)
 	tsx := NewToolSet(ts, "planner")
 	tsx.SetFindingRecorder(p.findingRecorder)
 	if as != nil {
 		tsx.SetAssetStore(as, as.Companies())
 	}
 	tsx.SetTaskID(taskID)
+	if p.guard != nil {
+		tsx.SetGuardAttributions(p.guard.Attributions)
+	}
 	tsx.SetCoverageEnabled(as == nil || as.CoverageEnabled(taskID))
 	tsx.killWork = p.killWork   // enable kill_work tool (nil = unavailable)
 	tsx.steerWork = p.steerWork // enable steer_work tool (nil = unavailable)
@@ -445,13 +477,14 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	// 领域工具 + 基础默认工具集（Read/Write/Edit/MultiEdit/LS/Glob/Grep/Bash）
 	// 资产覆盖度功能关闭时剔除 add_task_scope/list_untested_assets（不入 prompt）。
 	base := append(tsx.DropCoverageTools(tsx.PlannerTools()), actool.DefaultTools()...)
+	ctx = withTrafficScope(ctx, taskID, 0)
 	ctx = WithRunInfo(ctx, RunInfo{TaskID: taskID, ExplorationID: explorationID(ts)})
 	tools, def, cleanup := AugmentTools(ctx, "planner", base)
 	defer cleanup()
 	// 关键态势（刚完成的意图 + 预取的完整图）改放【本轮 user 输入】(见下方 input)，system
 	// 只留静态规划正文。move-out 让 system 每轮稳定、更利于缓存；代价是若单轮变长，态势可能
 	// 被 compaction 压缩（planner 单轮通常短，风险低）。situational 会拼进下方 input。
-	situational := renderTriggers(ts, triggers) + renderGraphOverview(tsx.graphOverviewData())
+	situational := renderTriggers(ts, triggers) + renderGraphOverview(tsx.plannerOverviewData())
 	// 任务级 deadline / 终局模式(经 ctx 注入,见 taskclock.go)。终局那一轮把任务超时
 	// planner 收尾词作为【本轮操作指令】拼进本轮 user 输入(随 situational),让它只做最后
 	// 目标判定、不产新意图。
@@ -463,6 +496,9 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 	taskDir := ensureRunDir(p.workDir, taskID, 0)
 	tsx.SetArtifactRoots(taskDir)
 	ctx = intercept.WithReviewContext(ctx, taskDir, intercept.ReviewBackground{})
+	// 任务操作约束进审查上下文：Judge 需要看到"本任务禁止什么"，否则默认策略会把
+	// 任务级禁令当成普通授权动作放行(docs §4.5 WP8)。
+	ctx = intercept.WithReviewConstraints(ctx, constraintTexts(ts))
 	sysBody := plannerSystem(goal, p.workDir, taskDir)
 	if p.wantConstraints() {
 		sysBody += constraintBlock(ts) // 操作约束(若有)注入系统提示,框定探索边界
@@ -484,8 +520,9 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		UnlockSet:       def.Unlock,
 		PermissionMode:  permission.ModeBypass,
 		EnableWebFetch:  true, // 走记录代理留痕；载入代理 CA 验证 MITM 重签的 HTTPS 证书
-		WebFetchProxy:   p.proxyAddr,
-		WebFetchCACert:  p.proxyCACert,
+		// 与 BashEnv 同一套染色：planner 的 WebFetch 也按 (task, 0) 归属，出口规则可按任务判定。
+		WebFetchProxy:  traffic.ProxyURLWithTag(p.proxyAddr, taskID, 0),
+		WebFetchCACert: p.proxyCACert,
 		// 联网搜索(可选)。ddgs 无需 key；brave-free 需 BraveKey；tavily 需 TavilyKey。
 		// WebSearchProxy 是独立出口代理(http/https/socks5)，与记录流量的 MITM 代理无关；空则直连。
 		EnableWebSearch:       p.webSearch.Enabled,
@@ -496,8 +533,8 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		DeepSeekSearchAPIKey:  p.webSearch.DeepSeekAPIKey,
 		DeepSeekSearchModel:   p.webSearch.DeepSeekModel,
 		WebSearchProxy:        p.webSearch.Proxy,
-		BashEnv:               proxyEnv(p.proxyAddr, p.proxyCACert), // Bash 子命令默认走代理+信任 CA
-		WorkingDir:            taskDir,                              // 本任务工作目录 <workDir>/tasks/<taskID>
+		BashEnv:               bashEnv(p.proxyAddr, p.proxyCACert, taskID, 0), // Bash 子命令默认走代理+信任 CA（带任务染色）
+		WorkingDir:            taskDir,                                        // 本任务工作目录 <workDir>/tasks/<taskID>
 		ToolOutputDir:         cmdOutDir(taskDir),
 		MaxTurns:              p.maxTurns, // 0 = unlimited (configurable in agent management)
 		MaxDuration:           maxDur,     // 0=不限;有 deadline 时=距 deadline 剩余
@@ -511,13 +548,16 @@ func (p *Planner) Plan(ctx context.Context, taskID int64, as *db.AssetStore, ts 
 		NonStreaming: p.nonStreaming(), // 该 profile 选非流式时走 Provider.Complete
 		MaxTokens:    p.maxTokens(),    // 0 = 不发上限,由服务端默认值决定
 	}
+	if p.guard != nil {
+		opts.Hooks = p.guard.Hooks()
+	}
 	if p.tx != nil { // persist raw LLM conversation; one accumulating file per task's planner
 		opts.Transcript = p.tx
 		opts.SessionID = fmt.Sprintf("exp%d-planner", ts.ID())
 	}
 	// 实验功能:开启后由 noa 接管上下文压缩(归档集中在 <workDir>/noa/<SessionID> 下,持久)。
 	noaSession := fmt.Sprintf("exp%d-planner", ts.ID())
-	enableNoa(&opts, p.noaEnabledFn, p.workDir, noaSession, noaWarn(noaSession))
+	enableNoa(&opts, p.noaEnabledFn, p.workDir, noaSession, p.compactionWindow(), noaWarn(noaSession))
 	// 态势（刚完成的意图 + 完整图）现在拼进本轮 user 输入（见下方 input）。user 里还有
 	// 指令 + 跨唤醒待办（todo 是模型自己的规划便签，可再生，放 user 即可）。
 	// 开场白按「本轮有无具体变动」分两种：有变动 → 指向下方【实际变动】块；无变动

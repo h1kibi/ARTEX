@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -718,29 +717,50 @@ func TestWatchdogProcessCycleTerminateDoesNotBlockTick(t *testing.T) {
 	}
 }
 
-func TestRouteBudgetExceeded(t *testing.T) {
-	now := time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)
+// Numeric route budgets are no longer a termination input: the Fast Path must not
+// kill a run because a model-authored cumulative counter crossed its limit. The
+// structure stays readable (historical JSON, checkpoint statistics); the effort
+// tier is the live run budget.
+func TestRouteBudgetNoLongerTerminates(t *testing.T) {
 	snap := RunSnapshot{
-		RouteID: 7, StartedAt: now.Add(-2 * time.Second),
+		RouteID:       7,
 		RouteBudget:   db.RouteBudget{MaxToolCalls: 10, MaxInputTokens: 1000, MaxWallSeconds: 60},
 		RouteUsedBase: db.RouteBudgetUsed{ToolCalls: 3, InputTokens: 200},
-		ToolCalls:     2, InputTokens: 100,
+		ToolCalls:     9999, InputTokens: 999999,
 	}
-	if reason, exceeded := routeBudgetExceeded(snap, now); exceeded || reason != "" {
-		t.Fatalf("budget tripped early: %s", reason)
+	used := db.RouteBudgetUsed{ToolCalls: snap.RouteUsedBase.ToolCalls + snap.ToolCalls}
+	if dim, _, _ := db.RouteBudgetExhausted(snap.RouteBudget, used); dim == "" {
+		t.Fatal("fixture no longer exceeds the legacy budget")
 	}
-	snap.ToolCalls = 9
-	if reason, exceeded := routeBudgetExceeded(snap, now); !exceeded || !strings.Contains(reason, "工具调用") {
-		t.Fatalf("tool budget not enforced: %s", reason)
+	if decision := decideCycle(0, 0, -1, cycleSignalGreen, cycleAnswerNone); decision.Action != cycleActionNext {
+		t.Fatalf("green judgment no longer advances the run: %+v", decision)
 	}
-	snap.ToolCalls = 0
-	snap.InputTokens = 900
-	if reason, exceeded := routeBudgetExceeded(snap, now); !exceeded || !strings.Contains(reason, "token") {
-		t.Fatalf("token budget not enforced: %s", reason)
+}
+
+// effort 档位是本次 run 的自主放行预算；probe=0 必须真的"首个周期结束即交接"，
+// 不能被 0 当成未设置而回退 1。
+func TestDecideCycleEffortProbeZero(t *testing.T) {
+	probe := decideCycle(0, 0, 0, cycleSignalGreen, cycleAnswerNone)
+	if probe.Action != cycleActionRequest || probe.NextCycle != 1 {
+		t.Fatalf("probe green at C0 = %+v, want a user request (no autonomous cycle)", probe)
 	}
-	snap.InputTokens = 0
-	snap.StartedAt = now.Add(-70 * time.Second)
-	if reason, exceeded := routeBudgetExceeded(snap, now); !exceeded || !strings.Contains(reason, "墙钟") {
-		t.Fatalf("wall budget not enforced: %s", reason)
+	if probe.DefaultRule != "c0_continue" {
+		t.Fatalf("probe C0 request rule=%q", probe.DefaultRule)
+	}
+	if standard := decideCycle(1, 0, 1, cycleSignalGreen, cycleAnswerNone); standard.Action != cycleActionNext {
+		t.Fatalf("standard first green should advance: %+v", standard)
+	}
+	if standard := decideCycle(1, 1, 1, cycleSignalGreen, cycleAnswerNone); standard.Action != cycleActionRequest {
+		t.Fatalf("standard second green should request: %+v", standard)
+	}
+	if deep := decideCycle(2, 1, 2, cycleSignalGreen, cycleAnswerNone); deep.Action != cycleActionNext {
+		t.Fatalf("deep second green should still advance: %+v", deep)
+	}
+	if deep := decideCycle(2, 2, 2, cycleSignalGreen, cycleAnswerNone); deep.Action != cycleActionRequest {
+		t.Fatalf("deep third green should request: %+v", deep)
+	}
+	// Unset (-1) keeps the historical default of one autonomous cycle.
+	if unset := decideCycle(0, 0, -1, cycleSignalGreen, cycleAnswerNone); unset.Action != cycleActionNext {
+		t.Fatalf("unset budget must default to 1: %+v", unset)
 	}
 }

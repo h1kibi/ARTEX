@@ -59,6 +59,8 @@ var (
 		"该意图的 20 分钟周期在用户静默或没有继续依据时结束，Fast Path 已终止本次运行；已写入的事实、资产和漏洞保留")
 	AbortPausedRaceGuard = cause("paused_race_guard", "任务暂停期间拒绝启动新运行",
 		"任务处于暂停状态时，引擎拒绝发出新的执行 context，用于防止 claim 与暂停之间的竞态导致 Worker 继续启动；已领取的意图会退回 frontier")
+	AbortTaskCostCap = cause("task_cost_cap", "任务等效成本已达上限",
+		"本次任务的累计等效成本（未缓存输入 + 0.1×缓存读 + 4×输出）达到管理员设置的上限，引擎已停止领取新意图并暂停任务；已写入的事实、资产与漏洞全部保留。提高上限或调整任务范围后恢复任务即可继续")
 
 	// Main Agent and standalone conversation contexts.
 	AbortChatStoppedByUser = cause("chat_stopped_by_user", "用户停止了本轮对话",

@@ -124,7 +124,7 @@ func TestFullTextSearchMatchesBodies(t *testing.T) {
 
 	hits := func(term string) int {
 		t.Helper()
-		rows, err := tr.query(host, "", term, 0, 10)
+		rows, err := tr.query(queryFilter{Host: host, BodyContains: term}, 0, 10)
 		if err != nil {
 			t.Fatalf("按正文搜索 %q 出错：%v", term, err)
 		}
@@ -145,7 +145,7 @@ func TestFullTextSearchMatchesBodies(t *testing.T) {
 	}
 
 	// Too-short terms are reported, not silently treated as "no match".
-	if _, err := tr.query(host, "", "ab", 0, 10); err == nil {
+	if _, err := tr.query(queryFilter{Host: host, BodyContains: "ab"}, 0, 10); err == nil {
 		t.Fatal("两字符正文关键词应返回明确错误")
 	}
 }
@@ -212,7 +212,7 @@ func TestLargeBodySpillsButStaysSearchable(t *testing.T) {
 	}
 
 	// Searchable despite living on disk — the index was fed from memory.
-	rows, err := tr.query(host, "", marker, 0, 10)
+	rows, err := tr.query(queryFilter{Host: host, BodyContains: marker}, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,7 +249,7 @@ func TestBinaryBodyStaysOutOfIndex(t *testing.T) {
 		[]byte(strings.Repeat("x", maxInlineBody)+marker)...)
 	tr.record(newFlow(host, "GET", "/logo.png", nil, png, withRespType("image/png")))
 
-	rows, err := tr.query(host, "", marker, 0, 10)
+	rows, err := tr.query(queryFilter{Host: host, BodyContains: marker}, 0, 10)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +431,7 @@ func TestQueryHostPortAndURLForms(t *testing.T) {
 		{name: "IPv6 host and port", host: "[2001:db8::1]:8443", want: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			rows, err := tr.query(tc.host, "", "", 0, 10)
+			rows, err := tr.query(queryFilter{Host: tc.host}, 0, 10)
 			if err != nil {
 				t.Fatal(err)
 			}

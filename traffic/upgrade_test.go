@@ -93,7 +93,7 @@ VALUES(?,'GET /x','','HTTP 200','老数据正文')`, row[0]); err != nil {
 	}
 	// 3. 历史全文索引仍可搜
 	if tr.fts {
-		rows, err := tr.query("old.example.com", "", "secret-token", 0, 10)
+		rows, err := tr.query(queryFilter{Host: "old.example.com", BodyContains: "secret-token"}, 0, 10)
 		if err != nil {
 			t.Fatalf("历史全文搜索失败: %v", err)
 		}

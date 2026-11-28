@@ -1,11 +1,15 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -15,10 +19,12 @@ import (
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/config"
 	pgdb "github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/enrich"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
+	"github.com/Autumn-27/artex/oast"
 	"github.com/Autumn-27/artex/traffic"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -224,6 +230,11 @@ type Manager struct {
 	interceptor *intercept.Interceptor // user-configured tool-call interception rules
 
 	companyMu sync.Mutex // serializes task/company-scope commits with live handle registration
+	// pauseMu serializes the whole pause lifecycle (engine bit + persistent row) for
+	// every caller: the manual control endpoint and the cost-cap gate. Without one
+	// lock, one path's rollback could undo a pause the other had just committed,
+	// leaving the database paused while the engine kept running.
+	pauseMu sync.Mutex
 	// taskStateMu preserves commit order between PostgreSQL lifecycle writes and
 	// their in-memory mirrors. lifecycleMu makes snapshots race-free, but without
 	// this outer write lock an older request could commit first and publish last.
@@ -245,6 +256,9 @@ type Manager struct {
 	// capture is on it becomes the MITM's upstream; when capture is off it is
 	// injected into agent bash env / WebFetch directly. See ProxyAddr.
 	globalProxy string
+	// oast is the built-in out-of-band callback listener (nil = disabled). Its two
+	// agent tools are host tools, so every agent that is bound to them sees them.
+	oast *oast.Server
 }
 
 // Settings keys the UI toggles at runtime.
@@ -378,9 +392,16 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if err := pg.EnsureLLMUsageTable(); err != nil {
 		log.Printf("[llmusage] create table: %v", err)
 	}
+	if err := pg.EnsureOASTTable(); err != nil {
+		log.Printf("[oast] create table: %v", err)
+	}
 	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
 	if proxyAddr != "" {
-		tr, err := traffic.Open(filepath.Join(dir, "traffic"), proxyAddr)
+		// TLS policy is a config-file decision (see config.Traffic): the proxy is the
+		// one enforcement point for every request now, so whether it verifies target
+		// certificates must be stated, not inherited from the MITM default.
+		tr, err := traffic.OpenWith(filepath.Join(dir, "traffic"), proxyAddr,
+			traffic.Options{VerifyUpstream: config.Load().Traffic.VerifyUpstream})
 		if err != nil {
 			log.Printf("[traffic] disabled: %v", err)
 		} else {
@@ -404,6 +425,11 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		}
 		if tr != nil {
 			m.traffic = tr
+			// 出口闸门(docs §4.5)：代理是范围拦截的最后一道——shell 可以无视 HTTP_PROXY，
+			// MCP 客户端可以自带 dialer,但只要走记录代理出去,就必须过这里。
+			tr.SetEgressGate(func(taskID int64, host string, req *http.Request) (bool, string) {
+				return m.checkEgressAllowed(taskID, host, req)
+			})
 			go func() {
 				log.Printf("[traffic] recording proxy on %s (set HTTP_PROXY=%s + trust _ca CA)", proxyAddr, tr.ProxyAddr())
 				if err := tr.Start(); err != nil {
@@ -412,9 +438,46 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 			}()
 		}
 	}
+	// 内置 OAST 带外回调服务(docs §4.3 WP6)。监听失败不阻塞启动:agent 侧拿到
+	// 的是"服务未启用"的明确报错，而不是一个永远不会回连的 URL。
+	if oa := config.OASTConfig(); oa.Enabled {
+		// Ids are 62-bit random values (see oast.nextID): no shared sequence, clock or
+		// database read is involved, so a restart, a failed persist or a second
+		// instance cannot re-mint a reference that already exists.
+		osrv := oast.New(oast.Options{
+			Addr: oa.Addr, PublicURL: oa.PublicURL, DNSAddr: oa.DNSAddr,
+			InteractshURL: oa.InteractshURL, InteractshToken: oa.InteractshToken,
+		})
+		// 回调同时落库：内存环形缓冲只保证本次进程内可回查，进程重启后
+		// checkpoint / finding 里的 oast:<id> 会失去依据。落库失败不影响回连本身。
+		osrv.SetPersist(func(ev oast.Interaction) error {
+			err := pg.InsertOASTInteraction(pgdb.OASTInteraction{
+				ID: ev.ID, Token: ev.Token, TaskID: ev.TaskID, IntentID: ev.IntentID,
+				At: ev.At, RemoteIP: ev.RemoteIP, Method: ev.Method, Path: ev.Path,
+				Query: ev.Query, Host: ev.Host, Headers: ev.Headers,
+				BodyPreview: ev.BodyPreview, BodyTruncated: ev.BodyTruncated,
+			})
+			// Bridge the db-layer conflict type to the OAST package's, which decides
+			// whether the event may be published at all (see oast.Server.handle).
+			var conflict *pgdb.IDConflictError
+			if errors.As(err, &conflict) {
+				return oast.NewConflictError(err)
+			}
+			return err
+		})
+		if err := osrv.Start(); err != nil {
+			log.Printf("[oast] 启动失败，带外检测工具将报告未启用: %v", err)
+		} else {
+			m.oast = osrv
+		}
+	}
 	// Asset auto-completion engine (§5): HTTP probes routed through the recording
 	// proxy (via m.ProxyAddr, which honors the traffic-capture toggle).
 	m.trafficOn = pg.GetBool(settingTrafficCapture, false)
+	if m.traffic != nil {
+		// Recording is a flag on the always-on proxy, not a condition for starting it.
+		m.traffic.SetRecording(m.trafficOn)
+	}
 	// LLM 录制开关（默认关）。录制器每次调用时读取此标志。
 	m.llmRecOn = pg.GetBool(settingLLMRecord, false)
 	// Load persisted web-search config (default: off, ddgs).
@@ -444,6 +507,13 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 			log.Printf("[proxy] 全局代理 %q 无效，已忽略: %v", m.globalProxy, err)
 		}
 	}
+	// 浏览器 MCP 的 --proxy-server 是全局配置，但进程按任务复用一个池。出口闸门
+	// 只靠 Proxy-Authorization 里的染色识别任务，未染色就只按全局规则判定——浏览器
+	// 请求因此绕过了本任务的允许/排除规则。拨号前把当前 run 的身份写进代理地址。
+	SetMCPProxyTagger(m.tagOwnProxy)
+	// Chromium drops URL credentials, so a task's browser is routed through a local
+	// bridge that injects the tag into each connection instead.
+	SetMCPProxyBridge(m.bridgeOwnProxy)
 	m.enrich = enrich.New(m.assets, m.ProxyAddr, 4)
 	// Reconcile the seeded browser MCP with the persisted capture state, so a
 	// restart with capture already on keeps Playwright routed through the proxy.
@@ -483,6 +553,10 @@ func (m *Manager) SetTrafficEnabled(on bool) error {
 	m.mu.Lock()
 	m.trafficOn = on
 	m.mu.Unlock()
+	// The proxy stays the egress path either way; this only starts/stops capture.
+	if m.traffic != nil {
+		m.traffic.SetRecording(on)
+	}
 	// Inject (on) or strip (off) the recording proxy + CA on the browser MCP so
 	// Playwright routes through the MITM. Must run after the flag flip above, since
 	// ProxyAddr/ProxyCACert honor it. putSettings rebuilds agents next (applyLLM),
@@ -648,6 +722,80 @@ func (m *Manager) SetWebSearch(on bool, backend string, braveKey, tavilyKey, pro
 	return nil
 }
 
+// tagOwnProxy stamps the current run's identity onto a proxy URL when it is this
+// platform's own egress proxy. Any other URL (a corporate upstream, a user's own
+// proxy) is left alone: attributing it would put our credential on something that
+// does not understand it.
+func (m *Manager) tagOwnProxy(ctx context.Context, raw string) (string, bool) {
+	base, ok := m.ownProxyAddr(raw)
+	if !ok {
+		return raw, false
+	}
+	ri := agent.RunInfoFrom(ctx)
+	if ri.TaskID == 0 && ri.IntentID == 0 {
+		return raw, false
+	}
+	return traffic.ProxyURLWithTag(base, ri.TaskID, ri.IntentID), true
+}
+
+// ownProxyAddr reports whether raw points at this platform's own recording proxy
+// and returns it with an http scheme. Decide by the LOCAL traffic proxy instance,
+// never by ProxyAddr(): when the recording proxy is disabled ProxyAddr() falls
+// back to the operator's global egress proxy, and stamping our credential onto
+// that URL would REPLACE the upstream's own user:pass (ProxyURLWithTag drops
+// existing credentials), breaking a working corporate proxy.
+func (m *Manager) ownProxyAddr(raw string) (string, bool) {
+	if m.traffic == nil {
+		return "", false
+	}
+	addr := m.traffic.ProxyAddr()
+	if addr == "" {
+		return "", false
+	}
+	// The configured value may or may not carry a scheme; compare host:port.
+	norm := func(v string) string {
+		v = strings.TrimSpace(v)
+		v = strings.TrimPrefix(v, "http://")
+		v = strings.TrimPrefix(v, "https://")
+		if at := strings.LastIndex(v, "@"); at >= 0 {
+			v = v[at+1:]
+		}
+		return strings.TrimSuffix(v, "/")
+	}
+	if norm(raw) != norm(addr) {
+		return "", false
+	}
+	// Keep whatever scheme the configured value already had (ProxyAddr returns
+	// "http://host:port"); only the credential is ours to add.
+	base := strings.TrimSpace(addr)
+	if !strings.Contains(base, "://") {
+		base = "http://" + base
+	}
+	return base, true
+}
+
+// bridgeOwnProxy starts a local credential-injection bridge for a task-scoped MCP
+// dial. Chromium does not send Proxy-Authorization from URL userinfo, so the
+// browser is pointed at the bridge and the bridge tags each connection.
+func (m *Manager) bridgeOwnProxy(ctx context.Context, raw string) (string, io.Closer, bool, error) {
+	base, ok := m.ownProxyAddr(raw)
+	if !ok {
+		return raw, nil, false, nil
+	}
+	ri := agent.RunInfoFrom(ctx)
+	if ri.TaskID <= 0 {
+		return raw, nil, false, nil
+	}
+	bridge, err := traffic.StartTagBridge(base, ri.TaskID, ri.IntentID)
+	if err != nil {
+		return "", nil, false, fmt.Errorf("启动浏览器代理染色桥: %w", err)
+	}
+	if bridge == nil {
+		return raw, nil, false, nil
+	}
+	return bridge.ProxyURL(), bridge, true, nil
+}
+
 // browserMCPName is the seeded Playwright MCP whose proxy args + CA env are kept
 // in sync with the traffic-capture toggle.
 const browserMCPName = "browser"
@@ -692,6 +840,9 @@ func (m *Manager) syncBrowserMCPProxy() {
 		log.Printf("[mcp] browser 代理同步失败: %v", err)
 		return
 	}
+	// The pooled browser was dialed with the PREVIOUS proxy args; drop it so the
+	// next use replays the new ones instead of browsing through a stale proxy.
+	closeMCPForServer(srv.ID)
 	if proxy != "" {
 		log.Printf("[mcp] browser MCP 已挂捕获代理 %s (CA %s)", proxy, cert)
 	} else {
@@ -747,26 +898,42 @@ func encodeJSON(v any) json.RawMessage {
 // traffic tools, gated by the global capture switch: empty when capture is off, so
 // no agent gets traffic_search/traffic_get regardless of binding.
 func (m *Manager) HostTools() []actool.CoreTool {
-	if m.traffic == nil || !m.TrafficEnabled() {
-		return nil
+	var tools []actool.CoreTool
+	if m.traffic != nil && m.TrafficEnabled() {
+		tools = append(tools, m.traffic.Tools()...)
 	}
-	return m.traffic.Tools()
+	// OAST 工具不受流量捕获开关影响(带外回调与 MITM 录制无关)。token 绑定当前 run
+	// 的 (task, intent)，由 RunInfo 从 ctx 读——工具装配闭包拿不到运行身份。
+	if m.oast != nil {
+		tools = append(tools, m.oast.Tools(func(ctx context.Context) (int64, int64) {
+			ri := agent.RunInfoFrom(ctx)
+			return ri.TaskID, ri.IntentID
+		})...)
+	}
+	return tools
 }
+
+// OAST returns the built-in out-of-band callback service (nil = disabled). The
+// server wires its evidence-prefix validation against it.
+func (m *Manager) OAST() *oast.Server { return m.oast }
 
 func (m *Manager) Assets() *pgdb.AssetStore  { return m.assets }
 func (m *Manager) PG() *pgdb.DB              { return m.pg }
 func (m *Manager) Traffic() *traffic.Traffic { return m.traffic }
 
-// ProxyAddr returns the egress proxy address agents route target traffic through:
-//   - capture ON  → the recording MITM proxy (which itself exits via the global
-//     proxy when one is set); agents also get its CA (see ProxyCACert).
-//   - capture OFF → the global egress proxy directly (empty CA — real target
-//     certs), or "" when no global proxy is set (direct, no recording).
+// ProxyAddr returns the egress proxy address agents route target traffic through.
 //
-// So the global proxy takes effect in both modes: at the MITM's upstream when
-// capturing, in the agent's own bash env / WebFetch when not.
+// The recording MITM is ALWAYS in the path whenever it is running, capture on or
+// off, because the scope gate lives on it: turning recording off must not turn
+// range enforcement off with it (a shell can ignore HTTP_PROXY, an MCP client can
+// bring its own dialer, so the proxy is the only place that sees everything).
+// Capture OFF then means "forward and gate, record nothing" — see
+// traffic.SetRecording.
+//
+// With no traffic proxy at all (disabled at startup) the global egress proxy is
+// used directly, or "" for a direct connection.
 func (m *Manager) ProxyAddr() string {
-	if m.traffic != nil && m.TrafficEnabled() {
+	if m.traffic != nil {
 		return m.traffic.ProxyAddr()
 	}
 	m.mu.RLock()
@@ -775,12 +942,15 @@ func (m *Manager) ProxyAddr() string {
 }
 
 // ProxyCACert returns the CA cert path agents must trust to verify HTTPS through
-// the egress proxy. Non-empty ONLY when traffic capture is on (the MITM re-signs
-// certs): the global proxy used directly (capture off) is a plain forwarder that
-// preserves real target certs, so no custom CA is needed there. Its emptiness is
-// also the worker's "recording off" signal (see workerSystem).
+// the egress proxy. It is present whenever the recording MITM is in the path —
+// INCLUDING capture off — because the MITM re-signs certs regardless of whether it
+// records them; without the CA every HTTPS request through it would fail.
+//
+// Recording is therefore a separate signal (`TrafficEnabled`), no longer inferred
+// from CA presence: that inference is what let capture-off silently remove the only
+// enforceable egress point.
 func (m *Manager) ProxyCACert() string {
-	if m.traffic == nil || !m.TrafficEnabled() {
+	if m.traffic == nil {
 		return ""
 	}
 	return m.traffic.CACertPath()
@@ -821,11 +991,18 @@ func (m *Manager) SetGlobalProxy(raw string) error {
 }
 
 func (m *Manager) Close() error {
+	// Pooled MCP clients (browsers, npx trees) are process-scoped, not task-scoped,
+	// so shutdown is the one place that must reap all of them.
+	mcpPoolInstance().CloseAll()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.traffic != nil {
 		m.traffic.Close()
 	}
+	if m.oast != nil {
+		_ = m.oast.Close()
+	}
+	actool.CloseWSLKeepalives()
 	return m.pg.Close()
 }
 
@@ -846,6 +1023,131 @@ func unixNanoOrZero(t *time.Time) int64 {
 		return 0
 	}
 	return t.UnixNano()
+}
+
+// wireTaskAssetRules installs this task's asset block/allow rules into its guard
+// (global rules ∪ task-level block/allow) so Bash/curl, WebFetch and MCP tools are
+// stopped at the tool boundary — not only at insert_assets' input. Rules are read
+// per call: an operator adding a .gov exclusion must take effect immediately, and
+// the same source feeds the recording proxy's egress gate.
+func (m *Manager) wireTaskAssetRules(t *Task) {
+	if t == nil || t.Guard == nil || m.assets == nil {
+		return
+	}
+	taskID, _ := strconv.ParseInt(t.ID, 10, 64)
+	t.Guard.SetAssetIntercept(func() (block, allow []pgdb.AssetInterceptRule, err error) {
+		return m.taskAssetRules(taskID)
+	})
+}
+
+// checkEgressAllowed applies the asset gate to one outbound request. The task is
+// resolved from the run tag on the connection; an untagged request only faces the
+// global rules (there is no task to scope it to).
+//
+// req is the outbound request as the proxy sees it. For a plain HTTP exchange it
+// carries the full URL, so exact_url/fuzzy_url rules match on the path — passing
+// nil here (the previous behaviour) made every URL-shaped rule dead at the egress.
+// For an HTTPS CONNECT there is no path yet (the tunnel is opened before any
+// request line is readable), so only the host part can be judged:
+//
+//   - block rules still apply to the host (a global .gov exclusion must refuse the
+//     tunnel outright, not merely the decrypted request inside it);
+//   - a host-only allow list is the caller's stated scope and must pass;
+//   - a URL-only allow list cannot be satisfied by a CONNECT at all. Refusing here
+//     would break every HTTPS request under such a policy, so the handshake is
+//     allowed and the inner request is filtered by its full URL — which is exactly
+//     what CONNECT is for.
+func (m *Manager) checkEgressAllowed(taskID int64, host string, req *http.Request) (bool, string) {
+	if m.assets == nil || strings.TrimSpace(host) == "" {
+		return true, ""
+	}
+	block, allow, err := m.taskAssetRules(taskID)
+	if err != nil {
+		// Fail closed. A request that reaches a forbidden target cannot be taken
+		// back, so an unreadable rule table blocks the exit rather than opening it.
+		return false, "资产拦截规则读取失败，无法确认目标是否在授权范围内，已拒绝该出站请求：" + err.Error()
+	}
+	if len(block) == 0 && !pgdb.HasEnabledAssetRule(allow) {
+		return true, ""
+	}
+	domains, ips := hostCandidates(host)
+	var urls []string
+	isConnect := true
+	if req == nil {
+		isConnect = false // no request context: judge the host alone
+	} else if req.Method != http.MethodConnect {
+		isConnect = false
+		if req.URL != nil && req.URL.String() != "" {
+			urls = []string{req.URL.String()}
+		}
+	}
+
+	if isConnect && !allowHasHostRules(allow) {
+		// URL-only allow list: cannot be judged before decryption. Check the block
+		// rules alone so a hard exclusion still stops the tunnel.
+		if d := pgdb.EvaluateAssetGate(block, nil, domains, ips, nil); !d.Allowed {
+			return false, d.Reason
+		}
+		return true, ""
+	}
+	if d := pgdb.EvaluateAssetGate(block, allow, domains, ips, urls); !d.Allowed {
+		return false, d.Reason
+	}
+	return true, ""
+}
+
+// allowHasHostRules reports whether the allow list contains any rule that can be
+// decided from a host alone (i.e. anything other than exact_url / fuzzy_url).
+func allowHasHostRules(allow []pgdb.AssetInterceptRule) bool {
+	for _, r := range allow {
+		if !r.Enabled {
+			continue
+		}
+		switch r.Kind {
+		case "exact_url", "fuzzy_url":
+			// Not decidable from a CONNECT host.
+		default:
+			return true
+		}
+	}
+	return false
+}
+
+// hostCandidates splits a request host into the domain/IP form the asset rules
+// match on. An IP literal is offered BOTH ways (rules are written both ways in the
+// wild: exact_ip/fuzzy_ip use the address, cidr rules parse it as an address).
+func hostCandidates(host string) (domains, ips []string) {
+	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if h == "" {
+		return nil, nil
+	}
+	if net.ParseIP(h) != nil {
+		return []string{h}, []string{h}
+	}
+	return []string{h}, nil
+}
+
+// taskAssetRules resolves the effective asset rules for one task. A read failure
+// is returned, never swallowed: both callers gate outbound traffic and must fail
+// closed rather than treat "cannot read the rules" as "there are no rules".
+func (m *Manager) taskAssetRules(taskID int64) (block, allow []pgdb.AssetInterceptRule, err error) {
+	if m.assets == nil {
+		return nil, nil, nil
+	}
+	rules, err := m.assets.ListAssetInterceptRules()
+	if err != nil {
+		return nil, nil, err
+	}
+	block = rules
+	if taskID > 0 {
+		tb, ta, err := m.assets.TaskInterceptRulesSplit(taskID)
+		if err != nil {
+			return nil, nil, err
+		}
+		block = append(block, tb...)
+		allow = ta
+	}
+	return block, allow, nil
 }
 
 func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor) *Task {
@@ -918,6 +1220,7 @@ func (m *Manager) CreateTaskWithOptions(description, goal string, opts pgdb.Task
 		return nil, err
 	}
 	t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor)
+	m.wireTaskAssetRules(t)
 	m.mu.Lock()
 	m.tasks[t.ID] = t
 	m.active = t.ID
@@ -1117,6 +1420,7 @@ func (m *Manager) LoadExisting() []*Task {
 			continue
 		}
 		t := taskFromPG(pt, m.pg.Exploration(pt.ExplorationID), m.interceptor)
+		m.wireTaskAssetRules(t)
 		m.tasks[id] = t
 		loaded = append(loaded, t)
 	}
@@ -1890,4 +2194,19 @@ func (t *Task) drainTriggers() []agent.TriggerEvent {
 	ev := t.pendingTriggers
 	t.pendingTriggers = nil
 	return ev
+}
+
+// TaskPersistentlyPaused reports whether the STORED lifecycle says paused. The cost
+// cap uses it to tell "my pause write failed" from "a peer already paused this task":
+// in the second case the engine bit must be left alone, not rolled back.
+func (m *Manager) TaskPersistentlyPaused(id string) bool {
+	n, err := strconv.ParseInt(id, 10, 64)
+	if err != nil {
+		return false
+	}
+	var paused bool
+	if err := m.pg.QueryRow(`SELECT paused FROM tasks WHERE id=$1 AND deleted_at IS NULL`, n).Scan(&paused); err != nil {
+		return false
+	}
+	return paused
 }

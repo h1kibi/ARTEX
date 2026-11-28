@@ -185,3 +185,84 @@ func TestHTTPToolTruncatesLargeBody(t *testing.T) {
 		t.Fatalf("oversized http body was not truncated: len=%d", len(out))
 	}
 }
+
+// TestHTTPToolDoesNotFollowRedirect: a 302 must come back as a 302 with its
+// Location and every Set-Cookie header intact. Following it silently hid exactly
+// the evidence (open redirects, login Post/Redirect/Get session cookies) the tool
+// is normally called to observe.
+func TestHTTPToolDoesNotFollowRedirect(t *testing.T) {
+	var targetHit bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/dest" {
+			targetHit = true
+			_, _ = w.Write([]byte("destination"))
+			return
+		}
+		w.Header().Set("Location", "/dest")
+		http.SetCookie(w, &http.Cookie{Name: "session", Value: "abc123", Path: "/"})
+		http.SetCookie(w, &http.Cookie{Name: "csrf", Value: "zzz", Path: "/"})
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	execRaw, _ := json.Marshal(map[string]any{"method": "GET", "url": srv.URL + "/login"})
+	res, err := (&Server{}).runHTTPTool(context.Background(), execRaw, map[string]any{}, nil)
+	if err != nil {
+		t.Fatalf("runHTTPTool: %v", err)
+	}
+	if targetHit {
+		t.Fatal("the client followed the redirect, hiding the 302 evidence")
+	}
+	var out struct {
+		Status  int                 `json:"status"`
+		Headers map[string][]string `json:"headers"`
+		Body    string              `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(res.Flatten()), &out); err != nil {
+		t.Fatalf("result is not JSON: %v\n%s", err, res.Flatten())
+	}
+	if out.Status != http.StatusFound {
+		t.Fatalf("status = %d, want 302", out.Status)
+	}
+	if loc := out.Headers["Location"]; len(loc) != 1 || loc[0] != "/dest" {
+		t.Fatalf("Location header lost: %v", out.Headers)
+	}
+	cookies := strings.Join(out.Headers["Set-Cookie"], "|")
+	for _, want := range []string{"session=abc123", "csrf=zzz"} {
+		if !strings.Contains(cookies, want) {
+			t.Fatalf("Set-Cookie missing %q: %v", want, out.Headers["Set-Cookie"])
+		}
+	}
+	if strings.Contains(out.Body, "destination") {
+		t.Fatalf("body is the redirect target's, not the 302 body: %q", out.Body)
+	}
+}
+
+// follow_redirects: true opts back into the old behaviour.
+func TestHTTPToolFollowRedirectsOptIn(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/dest" {
+			_, _ = w.Write([]byte("destination"))
+			return
+		}
+		w.Header().Set("Location", "/dest")
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer srv.Close()
+
+	execRaw, _ := json.Marshal(map[string]any{
+		"method": "GET", "url": srv.URL + "/login", "follow_redirects": true,
+	})
+	res, err := (&Server{}).runHTTPTool(context.Background(), execRaw, map[string]any{}, nil)
+	if err != nil {
+		t.Fatalf("runHTTPTool: %v", err)
+	}
+	var out struct {
+		Status int    `json:"status"`
+		Body   string `json:"body"`
+	}
+	_ = json.Unmarshal([]byte(res.Flatten()), &out)
+	if out.Status != http.StatusOK || !strings.Contains(out.Body, "destination") {
+		t.Fatalf("follow_redirects did not follow: %+v", out)
+	}
+}

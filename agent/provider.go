@@ -135,6 +135,35 @@ func compactionConfig(windowTokens int) *compaction.Config {
 	return &compaction.Config{ContextWindow: windowTokens}
 }
 
+// Worker MicroCompact tuning. A worker's run is the long, tool-heavy conversation
+// the compact spec targets: at the 96k effective window MicroCompact first fires
+// near 52.8k and drops the bulk of old tool output, which is only safe when the
+// live working set and cheap error text stay in view.
+const (
+	workerMicroKeepRecent = 8    // keep the last 8 compactable results live
+	workerMinClearChars   = 1024 // keep short output (one-line errors) verbatim
+	workerMaxOutputChars  = 12000
+)
+
+// workerExtraCompactableTools folds ARTEX's own bulk-output tools into the
+// MicroCompact whitelist: their bodies are reference-only (traffic rows, worker
+// traces, background task output) and can be re-read on demand.
+var workerExtraCompactableTools = []string{
+	"TaskOutput", "traffic_get", "traffic_blob", "traffic_search",
+	"node_detail", "get_worker_trace", "search_all_worker_traces",
+}
+
+// workerCompactionConfig is the worker's compaction config: the generic window
+// plus the MicroCompact floors above. Other agents keep the plain window so this
+// tuning cannot silently change planner/watchdog/chat behavior.
+func workerCompactionConfig(windowTokens int) *compaction.Config {
+	cfg := compactionConfig(windowTokens)
+	cfg.MicroKeepRecent = workerMicroKeepRecent
+	cfg.MinClearChars = workerMinClearChars
+	cfg.ExtraCompactableTools = append([]string(nil), workerExtraCompactableTools...)
+	return cfg
+}
+
 // FromEnv resolves the LLM provider config:
 //
 //	ARTEX_LLM_PROVIDER = anthropic|openai (default: inferred from keys)

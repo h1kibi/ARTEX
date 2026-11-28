@@ -69,15 +69,37 @@ func restoreFindingTrafficTx(tx *sql.Tx, snapshot *TaskArchiveSnapshot) error {
 	return err
 }
 
+// archivedFindingDefaults are the numeric columns added to `findings` AFTER the first
+// archive format shipped. json_populate_recordset turns a MISSING key into NULL, and
+// every one of these is NOT NULL, so an archive written before the column existed
+// would fail the whole restore. Keep this list in step with the schema: any new
+// NOT NULL column on findings belongs here with a safe default.
+var archivedFindingDefaults = map[string]any{
+	// Version columns.
+	"evidence_version":        0,
+	"report_evidence_version": 0,
+	// Added with version binding (11-27). 0 means "unbound", exactly the right meaning
+	// for a finding restored from before the binding existed.
+	"triage_evidence_version": 0,
+	// Text/JSON columns that arrived by ALTER after the first archive format. Their
+	// NOT NULL constraints would reject a NULL-filled row, and their defaults are the
+	// truthful values for an older row.
+	"status":       "pending",
+	"name":         "",
+	"report":       "",
+	"asset_ids":    []any{},
+	"triage_state": "confirmed",
+}
+
 func normalizeArchivedFindingVersions(raw json.RawMessage) (json.RawMessage, error) {
 	rows, err := decodeArchiveRows(raw)
 	if err != nil {
 		return nil, err
 	}
 	for _, row := range rows {
-		for _, key := range []string{"evidence_version", "report_evidence_version"} {
+		for key, def := range archivedFindingDefaults {
 			if row[key] == nil {
-				row[key] = 0
+				row[key] = def
 			}
 		}
 	}

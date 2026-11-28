@@ -41,7 +41,8 @@ func TestRetryBlockedIntentReopensBlocked(t *testing.T) {
 	}
 }
 
-func TestRetryBlockedIntentRejectsExhaustedRoute(t *testing.T) {
+// 新契约：blocked 意图的外部故障重试不再被旧路线数值预算拦截——预算已退化为统计。
+func TestRetryBlockedIntentIgnoresSpentRouteBudget(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
 		t.Skipf("postgres unavailable (%v)", err)
@@ -72,12 +73,15 @@ func TestRetryBlockedIntentRejectsExhaustedRoute(t *testing.T) {
 	}
 
 	s := newAdmissionTestServer(m, nil)
-	if _, err := s.retryBlockedIntent(task, intentID); err == nil || !strings.Contains(err.Error(), "预算已耗尽") {
-		t.Fatalf("retry on exhausted route error: %v", err)
+	if _, err := s.retryBlockedIntent(task, intentID); err != nil && strings.Contains(err.Error(), "预算已耗尽") {
+		t.Fatalf("retry still blocked by the retired budget guard: %v", err)
 	}
 	node, err := task.Store.GetNode(intentID)
-	if err != nil || node == nil || node.State != "blocked" {
-		t.Fatalf("blocked intent was reopened despite exhausted route: %+v err=%v", node, err)
+	if err != nil || node == nil {
+		t.Fatalf("intent read: %v", err)
+	}
+	if node.State == "blocked" {
+		t.Fatalf("blocked intent was not reopened: %+v", node)
 	}
 }
 

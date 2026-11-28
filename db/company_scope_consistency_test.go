@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -246,5 +247,82 @@ func TestCompanyScopeCheckedReturnsSystemErrorSeparately(t *testing.T) {
 	var validationErr *CompanyScopeValidationError
 	if errors.As(err, &validationErr) || errors.Is(err, ErrCompanyNotFound) {
 		t.Fatalf("system error misclassified: %v", err)
+	}
+}
+
+// Asset upserts must not serialize on the company-scope advisory lock: they only
+// read the scope rules, so they take its shared side. Two writes then proceed
+// together and still wait for an exclusive scope rewrite (asserted by
+// TestAssetUpsertWaitsForCompanyScopeMutation).
+func TestAssetWritesUseSharedScopeLock(t *testing.T) {
+	d, assets, _ := testSetup(t)
+	defer d.Close()
+
+	stamp := time.Now().UnixNano()
+	domain := fmt.Sprintf("shared-lock-%d.example", stamp)
+	ip := fmt.Sprintf("2001:db8:%x::7", uint64(stamp)&0xffff)
+	t.Cleanup(func() {
+		_, _ = d.Exec(`DELETE FROM assets WHERE domain=$1 OR ip=$2`, domain, ip)
+	})
+
+	// Two unrelated transactions hold the read advisory lock at the same time.
+	tx1, err := d.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx1.Rollback() //nolint:errcheck
+	tx2, err := d.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx2.Rollback() //nolint:errcheck
+	if err := lockCompanyScopeRead(tx1); err != nil {
+		t.Fatal(err)
+	}
+	gotSecond := make(chan error, 1)
+	go func() { gotSecond <- lockCompanyScopeRead(tx2) }()
+	select {
+	case err := <-gotSecond:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("second shared scope lock blocked behind the first")
+	}
+
+	// Concurrent upserts on separate assets must both complete while those shared
+	// locks are still open.
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		<-start
+		_, err := assets.UpsertSubdomain(UpsertSubdomainReq{Domain: domain})
+		errs <- err
+	}()
+	go func() {
+		defer wg.Done()
+		<-start
+		_, err := assets.UpsertIP(UpsertIPReq{IP: ip})
+		errs <- err
+	}()
+	close(start)
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent asset writes blocked on each other")
+	}
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 }

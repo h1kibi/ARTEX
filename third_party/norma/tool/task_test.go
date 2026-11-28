@@ -125,33 +125,36 @@ func TestBashForegroundInline(t *testing.T) {
 	}
 }
 
-// A long-running command that exceeds its timeout is moved to the background.
-func TestBashAutoBackgroundOnTimeout(t *testing.T) {
+// A foreground command that exceeds its timeout is killed with its process tree
+// and reported as an error; no task is left behind to consume resources.
+func TestBashForegroundTimeoutKillsTask(t *testing.T) {
 	m := newTestManager(t)
 	tc := &ToolContext{Tasks: m}
-	res := runTC(t, NewBash(), tc, map[string]any{
-		"command":    "while true; do echo tick; sleep 0.1; done",
-		"timeout_ms": 300,
-	})
-	if res.IsError || !strings.Contains(res.Flatten(), "background") {
-		t.Fatalf("expected auto-background: %q (err=%v)", res.Flatten(), res.IsError)
+	res := runTC(t, NewBash(), tc, map[string]any{"command": "sleep 5", "timeout_ms": 300})
+	if !res.IsError || !strings.Contains(res.Flatten(), "timed out") {
+		t.Fatalf("expected timeout error: %q (err=%v)", res.Flatten(), res.IsError)
 	}
-	tasks := m.List()
-	if len(tasks) != 1 || tasks[0].Status != TaskRunning {
-		t.Fatalf("expected 1 running task, got %+v", tasks)
-	}
-	// Stop it.
-	if r := runTC(t, NewTaskStop(), tc, map[string]any{"task_id": tasks[0].ID}); r.IsError {
-		t.Fatalf("TaskStop: %q", r.Flatten())
-	}
-	info := waitTerminal(t, m, tasks[0].ID)
-	if info.Status != TaskKilled {
-		t.Fatalf("expected killed, got %s", info.Status)
+	if tasks := m.List(); len(tasks) != 0 {
+		t.Fatalf("timed-out foreground command left %d task(s) behind", len(tasks))
 	}
 }
 
-// sleep is on the auto-background denylist: a timed-out sleep is killed, not
-// backgrounded, and surfaces a timeout error.
+// Local command output containing Chinese text reaches the model as UTF-8 with
+// no replacement characters.
+func TestBashLocalOutputUTF8(t *testing.T) {
+	m := newTestManager(t)
+	tc := &ToolContext{Tasks: m}
+	res := runTC(t, NewBash(), tc, map[string]any{"command": "echo 中文输出"})
+	if res.IsError {
+		t.Fatalf("bash failed: %q", res.Flatten())
+	}
+	if got := res.Flatten(); !strings.Contains(got, "中文输出") || strings.ContainsRune(got, '\uFFFD') {
+		t.Fatalf("Chinese output corrupted: %q", got)
+	}
+}
+
+// A timed-out sleep is killed rather than backgrounded and surfaces a timeout
+// error.
 func TestBashSleepTimesOutNotBackgrounded(t *testing.T) {
 	m := newTestManager(t)
 	tc := &ToolContext{Tasks: m}

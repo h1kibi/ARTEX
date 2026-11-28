@@ -4,6 +4,191 @@
 
 ## [Unreleased]
 
+#### 新增的功能
+
+- **Windows 默认本机 PowerShell 执行**：`config.WSLBackend` 在未显式配置 `wsl_distro` 时返回本机后端（`disabled=true`），
+  `Bash` 与 `shell_open` 优先选择 `pwsh.exe`，所有本机命令前置输入输出编码为无 BOM UTF-8、静默进度条与移除
+  `curl`/`wget` 别名的初始化；`actool.ShellDialectNote` 按当前生效后端分别注入 `server/assembly.go` 装配的 `Bash`
+  工具描述与 `agent/worker.go` 的系统提示词，规划者、主 agent、`pentest` 等角色看到的语法说明与 worker 一致。
+- **进程内 `http_request` 工具**：新增 `agent/http_tool.go`，复用 `:8788` 录制代理染色、MITM CA 根证书与任务级
+  Netscape `cookies.txt`（与 `curl -b/-c` 互通），支持自定义方法、请求头、查询参数、JSON 请求体、跳转控制与超时；
+  超过 `8,000` 字符的响应写入意图产物目录，正文截断后回传 `artifact_path`；已并入拦截工具默认集合与 `worker`/`pentest` 绑定。
+- **写回端极简与严格出口**：`record_fact` 仅 `summary` 必填、`fact_type` 省略即 `observation`，`claim`/`hypothesis`
+  缺附属字段时按已给来源自动补齐或降级；`intent_id` 缺省时依次回退到批量默认意图、`ownerNode` 与 `RunInfo.IntentID`，
+  `intent --yields--> fact` 边、`route_id` 与来源 `activity` 由引擎自动挂载；`artifact:` 引用中的工作目录绝对路径与
+  `/mnt/<drive>/...` 写法统一归一到工作目录相对路径。
+- **三图按角色投影**：`Planner` 唤醒预取改用 `plannerOverviewData()`，在 `graphOverviewData()` 快照上补齐单行路线账本、
+  未测目标样本、可复用凭据与同组件指纹候选资产，序列化体积硬上限 `12,288` 字节并按固定顺序裁剪；`Worker` 启动消息
+  改用 `renderWorkerTacticalContext`，只带任务目标、人工提示、锚定资产局部事实与可复用凭据，截断到 `4 KB`。
+  `graph_overview` 工具处理器与跨任务编排的 `get_task_graph` 读取同一投影，远端任务视图同样受该上限约束。
+- **路线双层止损**：`db.RouteHealth` 增加 `runs_since_finding`、`worker_seconds` 与 `autonomy_status`
+  （`active`/`suspended_dry`/`parked_stagnant`）；接续同一路线时依次裁决连续两棒无产出挂起、连续四棒无新漏洞
+  （或两棒满 40 分钟）且仍有未测目标的冷却让位；跨路线重激活要求外部凭据/提权事实或与路线共享目标资产；
+  `/api/tasks/{id}/routes` 与任务情报页同步展示自治状态、累计工时与距上次漏洞棒数。
+- **非 HTTP 漏洞真实输出核验**：`agent.MatchEvidenceInOutputs` 从报告证据中提取高信息量特征行，交由
+  `server/finding_triage.go` 在 `activity` 表真实 `tool_result`（含 SDK 溢出文件）与任务目录 `artifact` 原文中做确定性核对，
+  命中即晋升 `confirmed`；登录页与无工具输出支撑的叙述仍停在 `verifying`。
+- **`effort` 三档路线预算**：`add_intent` 对模型暴露可选枚举 `effort: "probe" | "standard" | "deep"`（默认
+  `standard`），由引擎换算为单棒轮数与自主放行周期：`probe` 35 轮 / 0 周期、`standard` 80 轮 / 1 周期、
+  `deep` 130 轮 / 2 周期；管理员全局 `max_turns` 仍取上限。数值预算结构保留读取兼容，不再参与终止判定。
+- **单意图轮数并发安全**：共享 `*agent.Worker` 的多个 worker goroutine 各自在 `Worker.execute` 内计算
+  `effort` 轮数，不写共享 `w.maxTurns`；每 run 的 `MaxAutoCycles` 经 `RunMonitor.SetEffort` 写入
+  `runState`/`RunSnapshot`，`0` 表示 probe 首个绿灯即转用户请求。
+- **路线两振挂起与人工优先**：`db/route_health.go` 聚合 `total_runs`、`consecutive_dry_runs` 与
+  `human_involved`，由 `graph_overview.routes` 和 `/api/tasks/{id}/routes` 暴露。纯自治路线连续两次无
+  高价值产出后，`add_intent` 的 `continuation_of` 必须引用该路线之外的新证据；`human_involved` 路线豁免挂起，
+  Watchdog 需要终止时改为生成 `ask_user` 卡片。
+- **96k 有效工作窗**：`agent/worker.go` 将压缩窗口限制为 `96,000`（模型窗口更小时取模型值），并传入内置压缩与
+  `noa`；`compaction.Config` 新增 `MicroKeepRecent`、`MinClearChars` 与 `ExtraCompactableTools`，旧输出中的
+  `cmd-output/` 路径在清理后保留以便续读，Worker 单步工具输出内联上限为 `12,000` 字符。
+- **产出分质与规划执行分棒**：`compactIntents` 增加 `high_value_yields`、`observation_yields` 与 `effort`；
+  Planner 按广度测绘与单点利用分棒、中心互斥调度和满载产 0 意图运行；Worker 按快速终止、零轮询让路、
+  Need-Human 让槽与退场副作用清理运行。
+- **零轮询门禁**：`RunMonitor` 归一化 `sleep`、`Start-Sleep`、`slot_poll`/`slot_watch` 等待与日志 tail，
+  统计 `polling_repeats`；单周期重复空等且无 Slow Path 结论时判 `terminate`，人工路线转 `ask_user`。
+- **Watchdog 写回豁免**：`drainSteerForTool` 在队首为 Watchdog 压力提示且当前工具是 `record_fact`、
+  `insert_assets`、`report_finding` 或 `TodoWrite` 时放行本次调用，下一次探测工具再消费提示；写回已触发周期重置时
+  丢弃这条旧提示。
+- **Windows 直通 WSL 原生 Bash**：`config` 新增 `wsl_distro`、`wsl_disabled` 与 `ARTEX_WSL_DISTRO`，
+  `agent.bashEnv` 注入 `NORMA_WSL_DISTRO`；Bash、后台任务与 `shell_open` 通过 `wsl.exe` 执行，自动转换工作目录，
+  透传代理与 CA 环境变量，`127.0.0.1` 代理改写为 WSL2 NAT 网关地址，`wsl.exe` 的 UTF-16 NAT 提示被解码后丢弃。
+- **WSL 发行版通用化与动态探针**：`config.WSLBackend` 与 `tool.wslListDistros` 过滤 Docker Desktop、Rancher
+  Desktop 与 Podman 的内部发行版；未显式配置时优先 `kali-linux`，否则回退到列表首个用户发行版。每个发行版首次使用
+  时用一条 15 秒命令同时探测真实盘符挂载前缀（`/mnt` 或 `/`）、`wslinfo --networking-mode` 与默认网关，
+  工作目录、证书路径与回环代理地址据此转换；镜像网络下回环代理直接透传。`NORMA_WSL_KEEPALIVE` 未关闭时，
+  WSL 命令与 PTY 会确保后台 `sleep infinity` 保活进程存在，`Manager.Close` 统一回收。
+- **Windows 交互式 PTY 改用 `go-pty`**：`third_party/norma` 引入 `github.com/aymanbagabas/go-pty`，Unix 使用
+  `creack/pty`，Windows 使用原生 ConPTY；`ptySupported()` 全平台返回 `!InteractiveShellDisabled()`，
+  纯 Windows 主机无需 WSL 也能运行 `shell_open`，WSL 会话直接由 ConPTY 传递窗口尺寸，移除 `script -qfc` 包装。
+- **Traffic 零额外端口任务归属**：Worker 代理地址携带 `http://artex:t<task>_i<intent>@<host>:<port>`；
+  代理转发前删除 `Proxy-Authorization`，按连接记住标签并写入 `exchanges.task_id`/`intent_id`，
+  `traffic_search` 支持按任务与意图过滤。
+- **`traffic_get` 分段读取**：新增 `offset`（默认 0）与 `length`（默认 4000、上限 16384），
+  `4KB～256KB` 内联响应按切片返回并附带续读提示。
+- **MCP 会话保活池**：`server/mcppool.go` 按 `(sessionKey, mcpServerID)` 复用有状态客户端
+  （`task:<id>` / `session:<id>` / `agent:<key>`），空闲 15 分钟回收，任务结束、配置改写、删除与进程退出时关闭；
+  门控服务按工具缓存广告名字，首次调用才建立连接。
+- **内置 OAST 带外检测**：`oast/` 提供 HTTP 与 DNS 双协议回调服务，默认监听 `0.0.0.0:0`（DNS 随服务启动随机端口，
+  `ARTEX_OAST_DNS_ADDR` 可独立配置或关闭）；回调基址按路由表选择目标可达的本机网卡地址，跳过 VirtualBox、VMware、
+  WSL、容器网桥与代理虚拟网段。`oast_generate` 新增可选 `target` 参数，按目标地址现场选择回调网卡；
+  `oast_poll` 返回带 `evidence_ref: "oast:<id>"` 的回调记录，DNS 查询与 HTTP 请求走同一条持久化与双环发布路径。
+  单 token 与全局交互都受环形上限约束，证据引用白名单新增 `oast:<id>`。
+- **外部 Interactsh 中继**：`ARTEX_OAST_INTERACTSH_URL` / `ARTEX_OAST_INTERACTSH_TOKEN` 配置后，服务改用
+  `projectdiscovery/interactsh` 客户端注册、轮询与注销，生成的域名与回调记录复用同一套 token 绑定和证据编号。
+- **Auto-Triager**：`report_finding` 先执行确定性守门，拒绝无证据报告、无鉴权差异的登录页误报、版本号猜测与
+  推测措辞；带流量或 OAST 证据记 `confirmed`，只有文字证据记 `verifying`。后台 `server/finding_triage.go`
+  复核绑定流量与回调，`retester` 判 `reproduced`/`fixed` 时同事务转正；`findings.triage_state` 与
+  `triage_evidence_version` 绑定判定所依据的证据版本。漏洞列表在状态列旁显示「复核中」与「未通过」分诊标签。
+- **出口资产护栏**：`guard.Guard` 新增 `AssetInterceptHook`，在 `PreToolUse` 对 Bash、WebFetch 与 MCP 的真实目标
+  判定范围；`traffic.SetEgressGate` 将同一判定用于记录代理出口，拒绝时合成 403 并注明平台管控；
+  `ExecuteExtraTool` 以解包后的真实工具名与参数通过规则和 LLM Judge。
+- **任务约束进入 Judge 输入**：`intercept.ReviewInput` 新增 `task_constraints`（版本 5），
+  `WithReviewConstraints` 从任务约束注入，只用于收紧裁决。
+- **WAF/429 计数回传**：`Guard.Attributions()` 区分 `ok`、`error`、`blocked`、`waf` 与 `rate_limited`，
+  经 `graph_overview.guard_attributions` 提供给 Planner。
+- **浏览器代理染色桥**：`traffic.TagBridge` 在 127.0.0.1 随机端口注入 `Proxy-Authorization`，浏览器无需携带凭据
+  即可让 HTTP/HTTPS 流量按 `(task_id, intent_id)` 归属；任务级 `--proxy-server` 指向平台代理时启动桥并改写为
+  无凭据地址，连接回收时关闭。启动失败直接终止该次 MCP 拨号。首个请求改由 `net/http.ReadRequest` 解析，
+  首部读取限制为 64KB 后立即解除，POST 请求体与协议升级流原样转发。
+- **出口门禁覆盖透传与原始隧道**：`CONNECT` 阶段先执行出口校验，拒绝的主机强制进入拦截器；
+  `SetUpstreamProxy` 在任何上游拨号前再次校验，透传主机和原始 TCP/WebSocket 隧道都无法连接禁测目标。
+- **录制与出口分离**：`traffic.SetRecording` 让代理常驻请求路径，录制成为独立开关；`ProxyAddr` 与
+  `ProxyCACert` 不随捕获开关变化，关闭录制仍保留唯一的出口执行点，Worker 的 `traffic_*` 工具说明由
+  `SetRecording` 控制。
+- **任务成本上限**：`db/task_cost.go` 按 `llm_usage` 账本计算任务累计等效成本
+  （`uncached_in + 0.1×cache_read + 4×out`），`server/task_cost.go` 在 worker 领取意图前判定并暂停超限任务，
+  在跑意图正常收场后退回 frontier，已写入的事实、资产和漏洞保留；成本按任务缓存 30 秒，改上限即清空缓存。
+  设置项 `task_cost_cap_enabled` 与 `task_cost_cap_tokens` 控制开关与额度。
+- **Need-Human 主动挂起**：`record_fact` 新增 `need_human` 参数，标记同时写入 fact payload 与
+  `WriteCounts.HumanNeeded`；引擎将这类运行归为 `paused`，让出执行槽并写一条接手说明，人工在会话里发消息即可
+  沿 `runDetachedIntent` 恢复。
+- **人工介入实时刷新**：`RunMonitor.SetHumanInvolved` 在运行中途记录人工作用；`SteerWorkFrom` 收到
+  `mainagent` 来源与 `watchdogContinueCycle` 时刷新该标记，刚被人工接手的 run 不再在周期边界被自动终止。
+- **战果防漏兜底**：`server/runreconcile.go` 扫描意图产出的全部 `fact`，只有带高价值 `progress_event`
+  （`validated_weakness`、`credential_obtained`、`privilege_change`、`lateral_progress`、`objective_milestone`）
+  或本身为 `finding_candidate` 时才归并为候选，并携带 `observation_ids`、`evidence_refs`、`next_actions` 与
+  `progress_events`。
+- **漏洞编号双空间**：`update_finding_report`、`get_finding_traffic` 与 `bind_finding_traffic` 同时接受
+  `finding_id`（记录编号）和 `finding_node_id`（探索节点编号），按字段对应的编号空间解析；归属由运行上下文的
+  任务身份与来源校验决定。
+- **跨任务证据证明**：`ProveGoalCheckedWithInheritance` 在事务内锁定本任务节点，未命中时联查未删除的直接来源任务
+  并加行锁；`RevalidateProofEvidenceInTx` 对继承 `fact` 复查 `CanInheritFact`，来源任务的证据编号可直接建立
+  `proves` 边。
+- **会话持久化任务授权**：`conversations.task_id` 记录触发会话的任务，每一轮（含续聊）据此注入可信 RunInfo；
+  跨任务合并批次保持为空，证据工具随即拒绝写入。`Chat` 不覆盖上下文已有的 TaskID。
+- **人工处置同步分诊**：`SetFindingStatusTx` 在 `confirmed`/`resolved`/`fixed` 时写 `triage_state='confirmed'`
+  并绑定当前证据版本，`false_positive` 时写 `rejected`，两处均镜像到图节点；`DBFinding`、`FindingDTO`、
+  任务漏洞列表与前端类型都返回 `triage_state`，`PATCH /api/exploration/findings/{id}` 接受可选 `triage_state`。
+- **Reporter 预置与提示词迁移**：Reporter 提示词、触发策略、工具绑定与 finding 触发器逐项补齐，全部成功才写完成
+  标记；默认触发消息与运行时指引使用 `finding_node_id`，只替换仍含旧写法的内置提示词，用户自定义提示词保持原样。
+- **`playwright-cli` 默认可见**：`db.builtinSkillVisibility` 与 `seedPlaywrightSkillVisibility` 将
+  `playwright-cli` 默认开放给 `worker`、`pentest` 与 `auto`。
+
+#### 修复的问题
+
+- **任务授权会话的旁路快照被拒**：`side_question_sessions` 的校验原要求会话行的 `task_id` 为空，而绑定任务的会话
+  同时携带两个身份，快照写入持续被拒并以 250ms 节奏重试，日志被同一条错误灌满。校验放宽为「会话行不得携带
+  exploration/intent，任务行必须有 exploration」；新增 `migrateSideSessionConstraint` 按解析出的表在启动时迁移旧库；
+  同一会话的持久化连续失败 20 次后放弃该快照并只记录一次原因。
+- **显式停止与终态提交交错**：`workExecution.settling` 在 `workMu` 内与挂起终止一并领取，提交开始后的终止请求
+  返回控制冲突，`ControlWork` 对 `settling` 的运行同样拒绝 `pause`/`cancel`；人工显式停止优先于 `need_human`
+  与自然完成，意图统一结算为 `stopped`。决策动作在提交竞争失败时将已作答卡片改记为 `expired`。
+- **暂停与恢复互相覆盖**：任务准入、FIFO 晋升与成本上限暂停共用 `concMu -> pauseMu -> taskStateMu` 顺序，
+  恢复成功后清除成本缓存，数据库 `paused` 与引擎暂停位保持一致；成本暂停写入数据库失败时回滚本次安装的内存暂停
+  并记审计，巡检下一轮重试。
+- **人工停止与 Need-Human 结算**：`humanStop` 记在 work 上，`need_human` 结算前先查挂起终止，显式停止时放弃人工
+  交接并按 `stopped` 结算；`runIntent` 将 `HumanNeeded` 记为 run 级粘性状态，错误重跑不覆盖该标记，
+  `HasActiveIntent` 计入 `paused`。
+- **出口与资产规则读取失败**：`Manager.taskAssetRules` 将读取错误沿调用链返回，代理出口拒绝该请求、Guard 阻断
+  本次调用、`insert_assets` 整批不插入，错误信息说明无法确认目标是否在授权范围内。
+- **任务级 URL 白名单与出口归属**：明文 HTTP 在 `Requestheaders` 中按客户端地址记住标签，MITM 解密后的 HTTPS
+  内层请求在出口判定前补全 `https://host` URL，`exact_url`/`fuzzy_url` 白名单在拨号阶段正确匹配；出口闸门也按同一
+  请求判定并返回 403。浏览器代理染色桥启动失败时终止 MCP 拨号，不回退到无任务归属的代理地址。
+- **透传标记与畸形包**：透传标记改为 5 分钟 TTL，`proxyCausedErr` 移除 `malformed`、`protocol error` 与
+  `protocol_error`，黑盒 Fuzz 的畸形包不再关闭整站录制；`DeleteHost`、`DeleteHostsExact` 与 `DeleteAll`
+  同步清除标记。
+- **WSL2 回环代理**：代理绑定 `127.0.0.1:<port>` 时，`Start()` 在 WSL 虚拟网卡的 IPv4 地址上另开同端口监听并
+  双向转发，`Close()` 关闭；`tool.wslProxyValue` 先用 150ms TCP 探测宿主机监听，可达才改写地址，不可达或未知时
+  不下发代理变量，否定结果只缓存 2 秒。
+- **PTY 按显式配置选择后端**：`tool.startPTY` 通过 `wslDistroDisabledInEnv` 区分显式关闭与未指定：显式关闭或机器未装
+  用户发行版时在本机原生 ConPTY 启动 Windows shell，绝不调用 `wsl.exe`；只有未配置时才沿用机器默认发行版。
+- **MCP 门控与连接生命周期**：`resolveMCPs` 改为门控优先，`directVisible && skillGated` 不提前拉起子进程；
+  `mcpPool.dial` 用 `context.WithoutCancel(ctx)` 建立连接并自行计时握手，池化客户端不再继承单轮取消。
+- **自定义 HTTP 工具**：默认不跟随重定向（`follow_redirects: true` 显式开启），返回 JSON 补齐完整 `headers` 与
+  `status_line`；代理地址只拼接一次协议前缀，避免工具静默直连绕过范围控制。
+- **`traffic_search` 默认端口**：`host` 写 `:443` 或 `:80` 时同时匹配省略默认端口的记录，`host` 传完整 URL 时
+  路径按 `contains` 参与过滤。
+- **旧库工具 Schema 与提示词刷新**：schema 刷新标记与 worker、planner、watchdog、reporter 提示词迁移各升一版，
+  存量库自动收到 `effort`、`need_human`、`finding_node_id`、`offset`/`length` 与任务过滤参数。
+- **OAST 持久化、唯一性与引用计数**：新增 `oast_interactions` 表与 `oast.Server.SetPersist`，回调在环形缓冲之外
+  同步写入数据库，重启后仍可回查；`Manager.validateOASTEvidence` 校验存在性与任务归属。ID 改为 62 位加密随机值，
+  进程内去重集合改为引用计数，环淘汰与令牌淘汰时递减，冲突时返回 503 且不发布事件。
+- **分诊判定与版本**：只有 proof/verification 明确拒绝才置 `refuted`，仅绑定流量或只有文字证据记 `verifying`；
+  `server/finding_impact.go` 按绑定响应正文判定影响，401/403/407、登录页与 5xx 判为证伪，2xx 且无登录页特征判为
+  证实。`SetFindingTriageStateIfVersion` 同时校验 `evidence_version` 与 `verifying` 状态，人工决定不会被旧判定覆盖；
+  `FinishFindingRetest` 按启动快照版本确认。
+- **证据角色**：`judgeBindings` 区分 `baseline` 与 `proof`/`verification`/`supporting`，对照里的 403 不再证伪
+  真实证明，证明里的登录页仍判为证伪，只有对照时保留 `verifying`；`traffic:` 与 `activity:` 引用只证明存在过一次
+  交换或命令，旁证确认收窄到 `oast`。
+- **TLS 证书校验策略**：移除运行时 `SetVerifyUpstream`，证书校验只在构造期由 `Options.VerifyUpstream` 与
+  `config.traffic.verify_upstream` 决定，查询值与监听器行为保持一致。
+- **漏洞归档恢复**：归档兼容层补齐首个归档格式之后新增的全部 `NOT NULL` 列（含 `triage_evidence_version`、
+  `triage_state`、`status`、`name`、`report` 与 `asset_ids`），升级前生成的含漏洞归档可以恢复。
+- **无任务编号读取**：`get_finding_traffic` 在只有 `finding_id` 时按跨编号空间解析并保留只读能力，写入严格按字段
+  对应的编号空间；`update_finding_report` 与 `bind_finding_traffic` 在 `RunInfo.TaskID <= 0` 时直接拒绝。
+- **资产写入并发**：资产 `Upsert*` 改用 `pg_advisory_xact_lock_shared`，并发写入互不阻塞，企业范围改写仍持排他锁。
+- **内网裸 IP 与覆盖度查询**：HTTP service/endpoint 的 URL 主机为 IP 字面量时写入 `assets.ip` 并计算 `c_segment`，
+  `domain` 与 `root_domain` 留空；`covTargetCTE`、`contextCoverageCTE`、`scopeTargetCTE` 与
+  `HostsByTaskWithSources` 统一匹配 IP/CIDR，并补齐 `ts.kind='keyword'` 分支。
+- **冷图压缩与跨任务摘要**：`buildCompressionInput` 拼入截断的 `detail`、`evidence`、`evidence_refs` 与
+  `next_actions`，压缩提示词要求保留 IP、凭据、路径与 payload 特征；`related_tasks[].cold_digests[]` 附带
+  `asset_labels`，Planner 可按主机判断是否展开。
+- **空闲心跳与报告版本**：`Planner.Plan` 在纯定时唤醒时不推进 `round_no`，等待长任务期间不把在追线索老化成冷摘要；
+  `SetFindingReportVersionByNodeID` 严格按 `node_id` 定位，避免写到另一条漏洞记录。
+- **enrich 空闲协程**：`enrich.New` 只保存配置，首个有效任务才初始化 `dnsx` 并拉起 worker，`Close` 后入队直接丢弃。
+- **Reporter 触发器幂等**：`ensureReporterTrigger` 对已存在触发器修复绑定与启用状态，不重复插入；完成标记为真但
+  缺少可用触发器时补齐。
+
 ### 三图语义与路线交接（11-24）
 
 #### 新增的功能

@@ -231,6 +231,12 @@ type httpExec struct {
 	TimeoutMs         int               `json:"timeout_ms"`
 	Proxy             string            `json:"proxy"`
 	UseRecordingProxy bool              `json:"use_recording_proxy"`
+	// FollowRedirects makes the client chase 3xx automatically. Default false: a
+	// pentest HTTP tool is usually pointed at a redirect on purpose (to read the
+	// Location of an open redirect, to capture the Set-Cookie of a login POST, to
+	// detect an auth-bypass that bounces to the dashboard). Following it silently
+	// hides exactly the evidence the caller wants.
+	FollowRedirects bool `json:"follow_redirects"`
 }
 
 func timeoutOr(ms, def int) time.Duration {
@@ -442,8 +448,11 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 		req.Header.Set(k, renderTemplate(v, params, identity))
 	}
 	client := &http.Client{Timeout: timeoutOr(spec.TimeoutMs, 30000)}
-	if tr := s.httpProxyTransport(spec); tr != nil {
+	if tr := s.httpProxyTransport(ctx, spec); tr != nil {
 		client.Transport = tr
+	}
+	if !spec.FollowRedirects {
+		client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -451,24 +460,51 @@ func (s *Server) runHTTPTool(ctx context.Context, execRaw json.RawMessage, param
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	out := map[string]any{"status": resp.StatusCode, "body": string(respBody)}
+	// Headers are returned in full: Set-Cookie carries the session the tool was
+	// called to obtain, Location carries the redirect target, and CORS/WAF
+	// headers are fingerprints. Dropping them made the tool blind to everything
+	// except the body.
+	headers := make(map[string][]string, len(resp.Header))
+	for k, v := range resp.Header {
+		headers[k] = v
+	}
+	out := map[string]any{
+		"status":      resp.StatusCode,
+		"status_line": resp.Status,
+		"headers":     headers,
+		"body":        string(respBody),
+	}
 	b, _ := json.Marshal(out)
 	return actool.Text(actool.Capture(tc, string(b))), nil
 }
 
 // httpProxyTransport builds a Transport for the http tool's proxy config, or nil
 // (direct). use_recording_proxy routes through the recording proxy + trusts its CA.
-func (s *Server) httpProxyTransport(spec httpExec) *http.Transport {
+func (s *Server) httpProxyTransport(ctx context.Context, spec httpExec) *http.Transport {
 	proxyStr := strings.TrimSpace(spec.Proxy)
 	var caFile string
+	usePlatformProxy := false
 	if spec.UseRecordingProxy {
+		// ProxyAddr already returns a scheme-qualified URL; prefixing blindly produced
+		// "http://http://host:port", which url.Parse accepts but http.ProxyURL cannot
+		// dial — the tool silently fell back to a direct connection.
 		if addr := s.m.ProxyAddr(); addr != "" {
-			proxyStr = "http://" + addr
+			proxyStr = addr
 			caFile = s.m.ProxyCACert()
+			usePlatformProxy = true
 		}
 	}
 	if proxyStr == "" {
 		return nil
+	}
+	// The platform proxy is also the egress scope gate. An un-attributed request
+	// reaches it as taskID=0, so the task's own allow/deny rules never apply — the
+	// tool would effectively be testing under the global rules only. Stamp the run
+	// identity the same way the bash env does.
+	if usePlatformProxy {
+		if tagged, ok := s.m.tagOwnProxy(ctx, proxyStr); ok {
+			proxyStr = tagged
+		}
 	}
 	pu, err := url.Parse(proxyStr)
 	if err != nil {

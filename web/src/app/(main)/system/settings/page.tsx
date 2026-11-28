@@ -3,6 +3,7 @@
 import * as React from "react";
 
 import {
+  CoinsIcon,
   CpuIcon,
   FlaskConicalIcon,
   GaugeIcon,
@@ -46,6 +47,10 @@ export default function SystemSettingsPage() {
   const [pyInterp, setPyInterp] = React.useState("");
   const [workers, setWorkers] = React.useState("3");
   const [savingWorkers, setSavingWorkers] = React.useState(false);
+  // 任务级等效成本上限(默认关)。
+  const [costCapOn, setCostCapOn] = React.useState(false);
+  const [costCapTokens, setCostCapTokens] = React.useState("20000000");
+  const [savingCostCap, setSavingCostCap] = React.useState(false);
   // 操作约束注入范围(默认都开)。
   const [injectPlanner, setInjectPlanner] = React.useState(true);
   const [injectWorker, setInjectWorker] = React.useState(true);
@@ -75,6 +80,8 @@ export default function SystemSettingsPage() {
     setGlobalProxyInput(s.global_proxy ?? "");
     setPyInterp(s.python_interpreter ?? "");
     setWorkers(String(s.workers ?? 3));
+    setCostCapOn(!!s.task_cost_cap_enabled);
+    setCostCapTokens(String(s.task_cost_cap_tokens ?? 20000000));
     setInjectPlanner(s.constraints_inject_planner !== false);
     setInjectWorker(s.constraints_inject_worker !== false);
     setNoaCompaction(!!s.noa_compaction);
@@ -102,6 +109,23 @@ export default function SystemSettingsPage() {
       })
       .catch((e) => toast.error("保存失败：" + (e as Error).message))
       .finally(() => setSavingWorkers(false));
+  };
+
+  const saveCostCap = () => {
+    const n = Number(costCapTokens);
+    if (!Number.isInteger(n) || n <= 0) {
+      toast.error("等效成本上限必须是大于 0 的整数");
+      return;
+    }
+    setSavingCostCap(true);
+    api
+      .setSettings({ task_cost_cap_enabled: costCapOn, task_cost_cap_tokens: n })
+      .then((s) => {
+        apply(s);
+        toast.success("已保存任务级等效成本上限（对运行中的任务同样生效）");
+      })
+      .catch((e) => toast.error("保存失败：" + (e as Error).message))
+      .finally(() => setSavingCostCap(false));
   };
 
   const savePython = () => {
@@ -416,7 +440,7 @@ export default function SystemSettingsPage() {
               <code>user:pass</code> 认证。留空=直连。
               <br />
               开启<b>流量捕获</b>时，它作为记录代理的<b>上游</b>（流量仍全量落库，再经此代理出网）；关闭捕获时，直接注入
-              Agent 的 bash / WebFetch 出网。与网络搜索代理、LLM 代理相互独立。
+              Agent 的 Bash / http_request / WebFetch 出网。与网络搜索代理、LLM 代理相互独立。
               <br />
               <b>提示</b>：socks5 在<b>关闭捕获</b>时依赖各命令行工具对 <code>ALL_PROXY</code> 的支持（curl
               可用，部分工具可能忽略）； 若主要用 socks5，建议开启流量捕获——此路径由 MITM
@@ -753,6 +777,45 @@ export default function SystemSettingsPage() {
                 onChange={(e) => setWorkers(e.target.value)}
               />
               <Button onClick={saveWorkers} disabled={!loaded || savingWorkers}>
+                保存
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="mb-4 break-inside-avoid md:mb-6">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-base">
+              <CoinsIcon className="size-4" />
+              任务级等效成本上限
+            </CardTitle>
+            <CardDescription>
+              开启后引擎累计每个任务的等效成本，达到上限即暂停该任务。
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="flex flex-col gap-3">
+            <div className="flex items-center justify-between gap-4">
+              <Label htmlFor="cost-cap-enabled" className="text-sm font-normal text-muted-foreground">
+                {costCapOn ? "启用任务级成本上限" : "未启用任务级成本上限"}
+              </Label>
+              <Switch
+                id="cost-cap-enabled"
+                checked={costCapOn}
+                disabled={!loaded || savingCostCap}
+                onCheckedChange={setCostCapOn}
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <Input
+                type="number"
+                min={1}
+                className="w-48 font-mono text-sm"
+                placeholder="20000000"
+                value={costCapTokens}
+                disabled={!loaded || savingCostCap || !costCapOn}
+                onChange={(e) => setCostCapTokens(e.target.value)}
+              />
+              <Button onClick={saveCostCap} disabled={!loaded || savingCostCap}>
                 保存
               </Button>
             </div>

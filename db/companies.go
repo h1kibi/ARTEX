@@ -428,6 +428,16 @@ func lockCompanyScopeMutation(tx *sql.Tx) error {
 	return err
 }
 
+// lockCompanyScopeRead takes the shared side of the same advisory lock. Asset
+// writes only resolve the company an asset belongs to; they never change scope
+// rules, so they must not serialize against each other. They still wait for an
+// in-flight scope rewrite (exclusive lock), which is what keeps a concurrently
+// recomputed attribution from being read half-written.
+func lockCompanyScopeRead(tx *sql.Tx) error {
+	_, err := tx.Exec(`SELECT pg_advisory_xact_lock_shared($1)`, companyScopeMutationLock)
+	return err
+}
+
 func insertScopeRulesTx(tx *sql.Tx, companyID int64, rules []ParsedScope, reason string) (
 	added, skipped int, needsAttribution bool, err error,
 ) {

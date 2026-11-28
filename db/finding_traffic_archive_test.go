@@ -61,9 +61,16 @@ func TestFindingTrafficLegacyArchiveDefaults(t *testing.T) {
 			if err = json.Unmarshal(snapshot.Tables["findings"], &rows); err != nil {
 				t.Fatal(err)
 			}
+			// Every column that arrived AFTER the first archive format must be absent:
+			// json_populate_recordset turns a missing key into NULL, and each of these is
+			// NOT NULL, so a real pre-upgrade archive looks exactly like this.
 			for _, row := range rows {
-				delete(row, "evidence_version")
-				delete(row, "report_evidence_version")
+				for _, col := range []string{
+					"evidence_version", "report_evidence_version", "triage_evidence_version",
+					"triage_state", "status", "name", "report", "asset_ids",
+				} {
+					delete(row, col)
+				}
 			}
 			snapshot.Tables["findings"], _ = json.Marshal(rows)
 			if _, err = d.QueueTaskArchiveRestore(archive.ID); err != nil {

@@ -23,6 +23,14 @@ type ToolSeed struct {
 	Agents []string       // 默认绑定的 agent key（worker/planner/mainagent）
 }
 
+// AddFindingTool exposes report_finding from a ToolSet so a host-side test (or a
+// cross-task path) can call the exact production handler.
+func (t *ToolSet) AddFindingTool() actool.CoreTool { return t.addFinding() }
+
+// RecordFactTool exposes record_fact for the same reason: a host-side test must
+// drive the real write path (including need_human) rather than reimplement it.
+func (t *ToolSet) RecordFactTool() actool.CoreTool { return t.recordFact() }
+
 // builtinToolsByAgent 用一个「只读空壳」ToolSet（nil stores）构造每个执行 agent 的
 // 领域工具集。工具构造函数只把闭包塞进 Spec、构造期不解引用 store，所以 nil 安全——
 // 这些工具在这里只用来读 Name()/Description()/InputSchema()，绝不 Call。
@@ -45,7 +53,7 @@ func builtinToolsByAgent() map[string][]actool.CoreTool {
 		"auto": {ts.addFinding(), ts.insertAssets(), ts.addCompanyScope(), ts.listAssets(), ts.listCompanies()},
 		// pentest（独立渗透 agent）默认绑：查资产 / 插资产 / 报漏洞 / 查漏洞 / 查企业。
 		// 新库由此 seed 写入；老库由 seedPentestDefaultBindings 迁移。
-		"pentest": {ts.listAssets(), ts.insertAssets(), ts.addFinding(), ts.listFindings(), ts.listCompanies()},
+		"pentest": {ts.listAssets(), ts.insertAssets(), ts.addFinding(), ts.listFindings(), ts.listCompanies(), ts.httpRequest()},
 	}
 }
 

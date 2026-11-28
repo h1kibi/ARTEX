@@ -260,7 +260,7 @@ function ToolEditor({
                 {r.parentKey && <span className="text-muted-foreground font-mono text-[10px]">↳</span>}
                 <span className="font-mono text-sm">{r.name}</span>
                 <Badge variant="secondary" className="px-1.5 py-0 text-[10px]">
-                  {r.type || "?"}
+                  {r.type || "json"}
                 </Badge>
                 {r.required && (
                   <Badge variant="outline" className="px-1.5 py-0 text-[10px]">

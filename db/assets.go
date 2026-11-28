@@ -110,7 +110,10 @@ func (s *AssetStore) withCompanyScopeMutation(fn func(*AssetStore) (int64, error
 		return 0, err
 	}
 	defer tx.Rollback() //nolint:errcheck
-	if err := lockCompanyScopeMutation(tx); err != nil {
+	// Asset writes only read company_scope to resolve attribution; a shared lock
+	// lets concurrent upserts proceed while still waiting for an exclusive scope
+	// rewrite (companies/tasks ownership changes) to commit.
+	if err := lockCompanyScopeRead(tx); err != nil {
 		return 0, err
 	}
 	scoped := &AssetStore{db: s.db, company: s.company, tx: tx}
@@ -694,6 +697,18 @@ func (s *AssetStore) UpsertHTTPService(req UpsertHTTPServiceReq) (int64, error) 
 	}
 	normURL := normalizeURL(req.URL)
 	domain, port, serviceName := parseURL(normURL)
+	// 内网裸 IP 站点(docs §4.5):http://10.0.180.128:8080/ 的主机是 IP 字面量，
+	// 必须落 assets.ip 而不是 assets.domain——否则覆盖度谓词 (net >>= try_inet(a.ip))
+	// 永远匹配不到，内网 IP 服务在覆盖度里隐身。同一动作也让 root_domain 保持为空，
+	// linkHostAssets 不会为它伪造一条 root_domain 资产。
+	if ip := ipLiteralHost(domain); ip != "" {
+		// The URL host IS the address the artifact was observed on; a caller-supplied
+		// req.IP that disagrees is the wrong one (typically a stale DNS answer).
+		// Overwrite unconditionally so the row, its c_segment and AddAutoScope all
+		// key off the same address.
+		req.IP = ip
+		domain = ""
+	}
 	rootDomain, _ := RootDomain(domain)
 	if rootDomain == "" {
 		rootDomain = domain
@@ -840,6 +855,12 @@ func (s *AssetStore) UpsertOtherService(req UpsertOtherServiceReq) (int64, error
 	serviceName := strings.ToLower(strings.TrimSpace(req.ServiceName))
 
 	domain := DomainKey(req.Domain)
+	if ip := ipLiteralHost(domain); ip != "" {
+		// kind=service 的 domain 字段传了裸 IP 时同样归并到 ip 列；此处 domain 已是
+		// 权威地址，覆盖调用方可能冲突的 req.IP，避免 domain 清空后 ip 仍是别的地址。
+		req.IP = ip
+		domain = ""
+	}
 	var rootDomain string
 	if domain != "" {
 		rootDomain, _ = RootDomain(domain)
@@ -937,12 +958,26 @@ RETURNING id`,
 // root_domain and (when it's a real subdomain, not the apex or an IP) subdomain
 // asset — so those asset types stay populated and can anchor task scope. Best-effort.
 func (s *AssetStore) linkHostAssets(domain, rootDomain string, taskID int64) {
-	if rootDomain != "" {
+	// An IP literal is not a domain: RootDomain() returns it unchanged as its own
+	// "root", so a naive call here created a bogus type='root_domain' row per
+	// internal IP (the dirty-asset complaint in docs §4.5). IPs belong in assets.ip.
+	if rootDomain != "" && net.ParseIP(DomainKey(rootDomain)) == nil {
 		_, _ = s.UpsertRootDomain(UpsertRootDomainReq{Domain: rootDomain, TaskID: taskID})
 	}
-	if domain != "" && domain != rootDomain && net.ParseIP(domain) == nil {
+	if domain != "" && domain != rootDomain && net.ParseIP(DomainKey(domain)) == nil {
 		_, _ = s.UpsertSubdomain(UpsertSubdomainReq{Domain: domain, TaskID: taskID})
 	}
+}
+
+// ipLiteralHost returns host itself when it is a valid IP literal (and "" when it
+// is a hostname or empty), so a URL whose authority is an address lands in the ip
+// column instead of polluting domain/root_domain.
+func ipLiteralHost(host string) string {
+	h := DomainKey(host)
+	if h == "" || net.ParseIP(h) == nil {
+		return ""
+	}
+	return h
 }
 
 // =====================================================================
@@ -978,6 +1013,15 @@ func (s *AssetStore) UpsertEndpoint(req UpsertEndpointReq) (int64, error) {
 	method := strings.ToUpper(req.Method)
 	normURL := normalizeURL(req.URL)
 	domain, port, _ := parseURL(normURL)
+	// 同 UpsertHTTPService：IP 字面量主机落 ip 列，domain 留空（见该处注释）。
+	if ip := ipLiteralHost(domain); ip != "" {
+		// The URL host IS the address the artifact was observed on; a caller-supplied
+		// req.IP that disagrees is the wrong one (typically a stale DNS answer).
+		// Overwrite unconditionally so the row, its c_segment and AddAutoScope all
+		// key off the same address.
+		req.IP = ip
+		domain = ""
+	}
 	rootDomain, _ := RootDomain(domain)
 	if rootDomain == "" {
 		rootDomain = domain

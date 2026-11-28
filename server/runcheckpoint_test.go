@@ -33,6 +33,9 @@ func TestRunCheckpointAndCandidateReconciliation(t *testing.T) {
 	claimID, err := store.AddNodeLinked(db.KindFact, map[string]any{
 		"fact_type": db.FactTypeClaim, "summary": "observed a candidate",
 		"confidence": "observed", "evidence_refs": []string{"artifact:out.txt"},
+		// A candidate now requires a high-value breakthrough signal; a bare claim
+		// is inventory and must NOT be promoted (see reconcileFindingCandidate).
+		"progress_event": "validated_weakness",
 	}, 5, "confirmed", "worker", nil, intentID, db.RelYields)
 	if err != nil {
 		t.Fatal(err)
@@ -147,8 +150,9 @@ func TestRunCheckpointAndCandidateReconciliation(t *testing.T) {
 		t.Fatalf("rejected candidate was reopened: %+v err=%v", rejected, err)
 	}
 
-	// A hypothesis-only run (no Claim) still yields a candidate; the old
-	// claim-only guard silently dropped these runs.
+	// A hypothesis-only run with no high-value signal produces NO candidate: an
+	// unvalidated "maybe" is not a breakthrough, and promoting it was exactly the
+	// noisy over-capture the previous rule produced.
 	hypIntent, _, err := store.AddIntentWithEdges(map[string]any{
 		"summary": "validate hypothesis only", "path_phase": "validation",
 	}, 5, nil, "planner", intentID, nil)
@@ -166,24 +170,21 @@ func TestRunCheckpointAndCandidateReconciliation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hypCandidateID, err := e.reconcileFindingCandidate(task, hypNode, "run-hyp-only")
-	if err != nil || hypCandidateID <= 0 {
-		t.Fatalf("hypothesis-only candidate id=%d err=%v", hypCandidateID, err)
-	}
-	hypCandidate, _ := store.GetNode(hypCandidateID)
-	hypPayload := db.ParseFactPayload(hypCandidate.Payload)
-	if len(hypPayload.HypothesisIDs) == 0 || len(hypPayload.ClaimIDs) != 0 {
-		t.Fatalf("hypothesis-only candidate payload=%+v", hypPayload)
+	if id, err := e.reconcileFindingCandidate(task, hypNode, "run-hyp-only"); err != nil || id != 0 {
+		t.Fatalf("plain hypothesis must not become a candidate: id=%d err=%v", id, err)
 	}
 }
 
-func TestRouteBudgetTerminalStateWithoutWatchdog(t *testing.T) {
+// A spent numeric route budget no longer downgrades a successful run to
+// exhausted: the counter is bookkeeping (checkpoint statistics), not a kill
+// switch. New contract: state stays "done" regardless of budget usage.
+func TestSpentRouteBudgetKeepsDoneState(t *testing.T) {
 	m, err := NewManager(t.TempDir(), "")
 	if err != nil {
 		t.Skipf("postgres unavailable: %v", err)
 	}
 	defer m.Close()
-	task, err := m.CreateTask("budget terminal", "no watchdog downgrade", nil, 0, 0)
+	task, err := m.CreateTask("budget terminal", "no budget downgrade", nil, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,6 +192,7 @@ func TestRouteBudgetTerminalStateWithoutWatchdog(t *testing.T) {
 	store := task.Store
 	intentID, _, err := store.AddIntentWithEdges(map[string]any{
 		"summary": "spend budget exactly", "budget": map[string]any{"max_tool_calls": 1},
+		"effort": "probe",
 	}, 5, nil, "planner", 0, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -202,23 +204,18 @@ func TestRouteBudgetTerminalStateWithoutWatchdog(t *testing.T) {
 	), used, ""); err != nil {
 		t.Fatal(err)
 	}
-	if got := routeBudgetTerminalState(store, intentID, "done"); got != "exhausted" {
-		t.Fatalf("terminal state=%q want exhausted", got)
+	// The checkpoint still records the usage (statistics survive); nothing reads
+	// it as a termination trigger any more.
+	node, err := store.GetNode(intentID)
+	if err != nil || node == nil {
+		t.Fatalf("intent read: %v", err)
 	}
-	openID, _, err := store.AddIntentWithEdges(map[string]any{
-		"summary": "still has budget", "budget": map[string]any{"max_tool_calls": 10},
-	}, 5, nil, "planner", 0, nil)
-	if err != nil {
-		t.Fatal(err)
+	route := db.ParseIntentRoute(node)
+	if route.Effort != db.EffortProbe {
+		t.Fatalf("effort=%q want probe", route.Effort)
 	}
-	if _, err := store.SaveRunCheckpoint(openID, 0, 0, db.CheckpointPayload(
-		"one call", "path_stage", "check budget", "validation", "run-c", "completed",
-		openID, openID, nil, nil, nil, nil, nil, nil, used,
-	), used, ""); err != nil {
-		t.Fatal(err)
-	}
-	if got := routeBudgetTerminalState(store, openID, "done"); got != "done" {
-		t.Fatalf("terminal state=%q want done", got)
+	if route.BudgetUsed.ToolCalls != 1 {
+		t.Fatalf("checkpoint budget usage lost: %+v", route.BudgetUsed)
 	}
 }
 

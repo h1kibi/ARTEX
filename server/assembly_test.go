@@ -4,11 +4,13 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
-	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/norma/skill"
+	actool "github.com/Autumn-27/norma/tool"
 )
 
 // hasSkillTool reports whether the packed tool set contains the Skill meta-tool.
@@ -90,4 +92,62 @@ func TestAssembleVisibleSkill(t *testing.T) {
 	if !hasSkillTool(combined) {
 		t.Fatalf("AugmentTools should surface the Skill meta-tool")
 	}
+}
+
+// TestSkillFrontmatterScopesentry: the shipped ScopeSentry skill must parse with a
+// real name, description and mcps gate — the broken header used to lose all three
+// plus the first 40 lines of body.
+func TestSkillFrontmatterScopesentry(t *testing.T) {
+	reg, err := skill.LoadDir(filepath.Join("..", "skills"))
+	if err != nil {
+		t.Fatalf("LoadDir: %v", err)
+	}
+	var found bool
+	for _, s := range reg.List() {
+		if filepath.Base(s.Dir) != "scopesentry" {
+			continue
+		}
+		found = true
+		if s.Name != "scopesentry-mcp" {
+			t.Errorf("name = %q, want scopesentry-mcp", s.Name)
+		}
+		if !strings.Contains(s.Description, "ScopeSentry") {
+			t.Errorf("description lost: %q", s.Description)
+		}
+		if len(s.MCPs) != 1 || s.MCPs[0] != "ScopeSentry" {
+			t.Errorf("mcps = %v, want [ScopeSentry]", s.MCPs)
+		}
+		// The body must still carry its first sections — a mangled frontmatter
+		// swallowed them along with the header.
+		for _, want := range []string{"ScopeSentry MCP 使用指南", "## 1. 准备工作", "1.3 配置 Cursor MCP"} {
+			if !strings.Contains(s.Instructions, want) {
+				t.Errorf("instructions lost %q", want)
+			}
+		}
+		if strings.Contains(s.Instructions, "## name:") {
+			t.Error("the broken header line is still inside the body")
+		}
+	}
+	if !found {
+		t.Fatal("scopesentry skill not loaded")
+	}
+}
+
+// TestSkillFrontmatterPlaywright: playwright-cli keeps parsing cleanly and needs no
+// mcp gate of its own (it drives the browser-cli directly).
+func TestSkillFrontmatterPlaywright(t *testing.T) {
+	reg, err := skill.LoadDir(filepath.Join("..", "skills"))
+	if err != nil {
+		t.Fatalf("LoadDir: %v", err)
+	}
+	for _, s := range reg.List() {
+		if filepath.Base(s.Dir) != "playwright-cli" {
+			continue
+		}
+		if s.Name != "playwright-cli" || s.Description == "" || s.Instructions == "" {
+			t.Fatalf("playwright-cli frontmatter broken: %+v", s)
+		}
+		return
+	}
+	t.Fatal("playwright-cli skill not loaded")
 }

@@ -65,11 +65,18 @@ func NewCompactor(prov llm.Provider, model string) *Compactor {
 // round, maintains the cold stamps synchronously, then (if a threshold is hit and
 // no compaction is running / cooling down) launches a background compaction that
 // outlives this planner round.
-func (c *Compactor) OnPlannerRound(ctx context.Context, ts *db.ExplorationStore) {
+//
+// idle reports a wake-up with NO trigger at all — a plain 5-minute heartbeat, not
+// a worker finishing or a finding landing. Such a round is not planning progress:
+// counting it would age every live node toward "cold" while the task merely waits
+// for a long-running worker, and a lead that is still being pursued would get
+// folded into a digest as if it were stale. An idle round therefore maintains the
+// digest summary but does NOT advance the round counter (docs §4.5 WP8).
+func (c *Compactor) OnPlannerRound(ctx context.Context, ts *db.ExplorationStore, idle bool) {
 	if c == nil || c.prov == nil || ts == nil {
 		return
 	}
-	round, uncompressed, activeDigests, err := c.maintain(ts)
+	round, uncompressed, activeDigests, err := c.maintain(ts, !idle)
 	if err != nil {
 		log.Printf("[compaction] maintain exp=%d: %v", ts.ID(), err)
 		return
@@ -105,10 +112,19 @@ func (c *Compactor) OnPlannerRound(ctx context.Context, ts *db.ExplorationStore)
 // the cold_since_round stamp/clear ops (§2.3). Returns the new round plus the
 // counts that drive the trigger: how many eligible-cold nodes are not yet covered
 // (minor) and how many active digests exist (major).
-func (c *Compactor) maintain(ts *db.ExplorationStore) (round int64, uncompressed, activeDigests int, err error) {
-	round, err = ts.BumpRound()
-	if err != nil {
-		return
+func (c *Compactor) maintain(ts *db.ExplorationStore, advance bool) (round int64, uncompressed, activeDigests int, err error) {
+	if advance {
+		round, err = ts.BumpRound()
+		if err != nil {
+			return
+		}
+	} else {
+		// Idle heartbeat: reuse the current round so cold stamps stay put (the
+		// stamp ops are then no-ops, and eligibleCold sees the same age as before).
+		round, err = ts.RoundNo()
+		if err != nil {
+			return
+		}
 	}
 	g, _, err := loadColdGraph(ts)
 	if err != nil {
@@ -504,6 +520,75 @@ func nodeConfidence(n *db.Node) string {
 	return ""
 }
 
+// Cold-digest detail budgets: long enough to keep a credential/host/path, short
+// enough that N members still fit the summarizer's own context.
+const (
+	compressionDetailLimit   = 600
+	compressionEvidenceLimit = 240
+	compressionRefsLimit     = 8
+	compressionActionLimit   = 3
+)
+
+// nodeDetailLines renders the extra per-node context a cold digest must not lose:
+// the (truncated) detail and evidence text, the evidence pointers, and any
+// next_actions the node recorded. Missing fields are skipped so a compact fact
+// still prints one line.
+func nodeDetailLines(n *db.Node) []string {
+	if n == nil || len(n.Payload) == 0 {
+		return nil
+	}
+	p := db.ParseFactPayload(n.Payload)
+	var out []string
+	if d := strings.TrimSpace(p.Detail); d != "" {
+		out = append(out, "    detail: "+clipRunes(d, compressionDetailLimit))
+	}
+	if e := strings.TrimSpace(p.Evidence); e != "" {
+		out = append(out, "    evidence: "+clipRunes(e, compressionEvidenceLimit))
+	}
+	if refs := p.EvidenceRefs; len(refs) > 0 {
+		shown := refs
+		suffix := ""
+		if len(shown) > compressionRefsLimit {
+			shown = shown[:compressionRefsLimit]
+			suffix = fmt.Sprintf(" (+%d more)", len(refs)-compressionRefsLimit)
+		}
+		out = append(out, "    evidence_refs: "+strings.Join(shown, ", ")+suffix)
+	}
+	// next_actions and validation_actions are DIFFERENT lists: the first says what
+	// the run planned to do next, the second what would validate an open hypothesis.
+	// Rendering one only as a fallback for the other silently drops the second when
+	// both are present, which is exactly the case a digest must preserve.
+	out = appendActionLine(out, "next_actions", p.NextActions)
+	out = appendActionLine(out, "validation_actions", p.ValidationActions)
+	return out
+}
+
+// appendActionLine renders one bounded action list, with an overflow marker.
+func appendActionLine(out []string, label string, actions []string) []string {
+	if len(actions) == 0 {
+		return out
+	}
+	shown, suffix := actions, ""
+	if len(shown) > compressionActionLimit {
+		shown = shown[:compressionActionLimit]
+		suffix = fmt.Sprintf(" (+%d more)", len(actions)-compressionActionLimit)
+	}
+	return append(out, "    "+label+": "+strings.Join(shown, " | ")+suffix)
+}
+
+// clipRunes truncates s to at most limit runes (never splits a multi-byte rune),
+// appending an ellipsis marker so the summarizer knows it was cut.
+func clipRunes(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= limit {
+		return s
+	}
+	return string(runes[:limit]) + "…"
+}
+
 // buildCompressionInput renders the connected sub-graph for the §4 prompt:
 // member nodes (summary + id + kind + state + confidence), the internal blood
 // edges among members, and — for a §3.1 shared-parent group — the anchor parents
@@ -533,6 +618,14 @@ func buildCompressionInput(g *coldGraph, b block, nodeByID map[int64]*db.Node) s
 		}
 		sb.WriteString(line)
 		sb.WriteByte('\n')
+		// The summary alone throws away what the next planner needs most: the
+		// internal address a credential works on, the file path, the payload that
+		// finally landed, and what was going to be tried next. Fold those in,
+		// truncated, so a cold digest keeps the meat and not just the skin (§4.5).
+		for _, extra := range nodeDetailLines(n) {
+			sb.WriteString(extra)
+			sb.WriteByte('\n')
+		}
 	}
 	// internal edges among members
 	var edgeLines []string
@@ -588,6 +681,7 @@ const compressionSystemPrompt = `你在压缩一组【彼此关联】的探索�
 
 输入是一个连通子图：
 - 节点：每条是一个意图或事实的 summary（一句话），带 id、类型(intent/fact)、state、confidence(若有)。
+- 成员节点可能附 detail / evidence / evidence_refs / next_actions 行：这些是冷摘要必须保住的"肉"——内网地址、凭据、路径、payload 特征、下一步动作。综合结论时必须体现出它们，不能只留 summary 的空壳。
 - 关系：节点之间的血缘边（A 派生自 B / A 产出 B），说明它们如何串联。
 - 若节点间没有直接血缘边、但同属一个上游意图（会另给出该上游意图作为"共同父 #p"），则按"这个意图（#p）探到了什么"来综合它们——共同父只是上下文锚、不是要压缩的成员。
 
@@ -597,6 +691,7 @@ const compressionSystemPrompt = `你在压缩一组【彼此关联】的探索�
 3. 保留证据强度：带 confidence 的结论标出 observed / inferred；inferred 的否定/存疑结论要点明它只是推断、可复核，别写成定论。
 4. 带上 id：每条结论后标注来源节点 id（如"…（#12,#28）"），让规划者能按 id 还原原节点。
 5. 正向陈述、只写输入里有的：不脑补、不引入输入中没有的判断。
+5b. **保留可执行细节**：detail/evidence 里的具体 IP/域名/端口/路径/凭据/账号/参数/payload 特征，能支撑后续利用的要写进 body（可压缩成一句话，但不能丢）。
 6. 长度随内容自适应：结论少就短，多且互不相同就写够——但整体显著短于所有输入 summary 的总和。
 
 只输出 body 正文本身。`

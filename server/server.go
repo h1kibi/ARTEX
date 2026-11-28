@@ -194,8 +194,13 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// Evidence refs are validated at the write boundary: traffic ids must exist
 		// in the local recorder; artifact/activity refs are structural plus
 		// task-scoped checks inside the agent layer.
-		agent.EvidenceRefValidator = func(_ context.Context, ref db.EvidenceRef) error {
-			if ref.Kind != "traffic" {
+		agent.EvidenceRefValidator = func(ctx context.Context, ref db.EvidenceRef) error {
+			switch ref.Kind {
+			case "oast":
+				// 带外回调证据：既要能回查（内存环形缓冲或持久表），也要归属本任务。
+				return m.validateOASTEvidence(ctx, ref.ID)
+			case "traffic":
+			default:
 				return nil
 			}
 			tr := m.Traffic()
@@ -255,9 +260,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		}
 		wireAgentAugment(m.pg, s.skillDir, s.hostTools) // 可见 skills/MCP + 流量/编排 host 工具装配进 agent 工具集
 		domainReg := buildDomainReg(m.Assets())
-		wireTools(m.pg, domainReg) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
-		seedPrompts(m.pg)          // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
-		s.seedOrchestrationTools() // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
+		wireTools(m.pg, domainReg, m) // 内置工具表：按 agent 过滤 + 覆盖描述/schema + 注入默认值
+		seedPrompts(m.pg)             // 内置 agent 默认提示词正文播种进 agent_prompts(仅空时)
+		s.seedOrchestrationTools()    // P2 跨任务编排工具 seed 进 tools 表(可按 agent 绑定)
 		if err := s.seedFindingRetester(); err != nil {
 			log.Printf("[retester] seed: %v", err)
 		}
@@ -267,6 +272,9 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 		// 漏洞 IM 推送投递引擎。与 Scheduler 并列但独立：推送的实时性要求(3s)
 		// 与触发器的业务节奏不同，且两者失败互不牵连——推送卡住不该影响 agent 触发。
 		go newNotifier(s).Run(s.ctx)
+		// 任务级等效成本巡检：worker 全部在忙时领取前的判定永远走不到，
+		// 由这里周期性兜底，避免任务烧过上限才被发现。
+		go s.runCostCapSweep(s.ctx)
 		// Fill the tool cache for any enabled MCP that has none yet (notably the
 		// seeded browser MCP on first run). Async so it never blocks startup.
 		go s.discoverEmptyMCPsOnStartup()
@@ -291,7 +299,8 @@ func New(ctx context.Context, m *Manager, skillDir string, dataDir string, keyDi
 	s.restoreTaskRuntimes()
 	go s.reconcileConcurrency()
 	s.startTaskArchiveWorker()
-	s.wireInterceptReviewer() // LLM 兜底审批:未命中拦截规则的命令交给模型判定
+	s.wireInterceptReviewer()           // LLM 兜底审批:未命中拦截规则的命令交给模型判定
+	s.wireFindingEvidenceVerification() // Auto-Triager 后台复核:verifying 漏洞核对绑定流量/带外回调后转 confirmed
 	s.watchdog.Run(s.ctx)
 	return s
 }
@@ -1281,11 +1290,6 @@ func (s *Server) retryBlockedIntent(t *Task, iid int64) (bool, error) {
 	if before == nil {
 		return false, fmt.Errorf("意图 #%d 不存在", iid)
 	}
-	if msg, err := rerunBudgetBlockMessage(t.Store, before); err != nil {
-		return false, err
-	} else if msg != "" {
-		return false, fmt.Errorf("%s", msg)
-	}
 	retryCount, reopened, err := t.Store.ReopenBlockedIntentForRetry(iid, maxPlannerIntentRetries)
 	if err != nil {
 		return false, err
@@ -1321,15 +1325,6 @@ func (s *Server) rerunIntent(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
-	}
-	if before != nil {
-		if msg, err := rerunBudgetBlockMessage(t.Store, before); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		} else if msg != "" {
-			writeErr(w, 409, msg)
-			return
-		}
 	}
 	reopened, err := t.Store.ReopenIntent(iid)
 	if err != nil {
@@ -1368,17 +1363,9 @@ func (s *Server) rerunBlocked(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	before := make([]*db.Node, 0)
-	skipped := make([]int64, 0)
 	var n int64
 	for _, intent := range intents {
 		if intent.State != "blocked" {
-			continue
-		}
-		if msg, err := rerunBudgetBlockMessage(t.Store, intent); err != nil {
-			writeErr(w, 500, err.Error())
-			return
-		} else if msg != "" {
-			skipped = append(skipped, intent.ID)
 			continue
 		}
 		copy := *intent
@@ -1391,10 +1378,6 @@ func (s *Server) rerunBlocked(w http.ResponseWriter, r *http.Request) {
 			before = append(before, &copy)
 			n++
 		}
-	}
-	if n == 0 && len(skipped) > 0 {
-		writeErr(w, 409, fmt.Sprintf("以下意图所在路线的累计预算已耗尽，重跑会被立即再次终止：%s；请改用扩容的 continuation 或停止该路线", formatIntentIDs(skipped)))
-		return
 	}
 	queued := false
 	if n > 0 {
@@ -1415,60 +1398,6 @@ func (s *Server) rerunBlocked(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[task] #%s 批量重开 %d 条 blocked 意图", t.ID, n)
 	}
 	writeJSON(w, 200, map[string]any{"id": t.ID, "reopened": n, "queued": queued})
-}
-
-// rerunBudgetBlockMessage reports why reopening this intent would be killed by
-// the next Fast Path tick: the route's cumulative budget is already spent.
-// A user-triggered rerun bypasses add_intent's continuation guard, so it needs
-// the same check at the reopen boundary.
-func rerunBudgetBlockMessage(store *db.ExplorationStore, intent *db.Node) (string, error) {
-	if store == nil || intent == nil {
-		return "", nil
-	}
-	route := db.ParseIntentRoute(intent)
-	routeID := route.RouteID
-	if routeID <= 0 {
-		routeID = intent.ID
-	}
-	budget, used := route.Budget, route.BudgetUsed
-	latest, err := store.LatestIntentForRoute(routeID)
-	if err != nil {
-		return "", err
-	}
-	if latest != nil {
-		lr := db.ParseIntentRoute(latest)
-		if !lr.Budget.Empty() {
-			budget = lr.Budget // a continuation may have raised the limit
-		}
-		if lr.BudgetUsed != (db.RouteBudgetUsed{}) {
-			used = lr.BudgetUsed
-		}
-	}
-	if cp, err := store.LatestCheckpointForRoute(routeID); err != nil {
-		return "", err
-	} else if cp != nil {
-		if u := db.ParseFactPayload(cp.Payload).BudgetUsed; u != (db.RouteBudgetUsed{}) {
-			used = u
-		}
-	}
-	if budget.Empty() {
-		return "", nil
-	}
-	dimension, usedValue, limit := db.RouteBudgetExhausted(budget, used)
-	if dimension == "" {
-		return "", nil
-	}
-	label, field := db.RouteBudgetDimensionMeta(dimension)
-	return fmt.Sprintf("意图 #%d 所在路线 #%d 的累计%s预算已耗尽（%d/%d），重跑会在下一个 Fast Path tick 再次被终止；请改用 add_intent(continuation_of=%d) 并传入更大的 budget.%s，或停止该路线。",
-		intent.ID, routeID, label, usedValue, limit, intent.ID, field), nil
-}
-
-func formatIntentIDs(ids []int64) string {
-	parts := make([]string, 0, len(ids))
-	for _, id := range ids {
-		parts = append(parts, fmt.Sprintf("#%d", id))
-	}
-	return strings.Join(parts, "、")
 }
 
 // getLLM returns the current LLM config (key never exposed).
@@ -1904,7 +1833,7 @@ func (s *Server) seedFirstIntent(t *Task) {
 	payload := map[string]any{
 		"summary": summary, "objective": t.Goal,
 		"route_kind": "path_stage", "phase": "recon", "path_phase": "recon",
-		"budget": db.DefaultRouteBudget(),
+		"effort": db.EffortProbe,
 	}
 	var edges []db.NewEdge
 	if origin, _ := t.Store.OriginFactID(); origin > 0 {
@@ -2475,10 +2404,11 @@ func (s *Server) findingLineage(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"nodes": taskNodeDTOs(nodes), "edges": edgeDTOs(edges)})
 }
 
-// patchFinding partially updates a finding: any subset of {status, severity}.
-// The id is the standalone findings-table id (DTO finding_id). Severity edits are
-// mirrored onto the originating exploration node so the per-task view stays in
-// sync. Returns the updated finding DTO.
+// patchFinding partially updates a finding: any subset of {status, severity, name,
+// vulnclass, triage_state}. The id is the standalone findings-table id (DTO
+// finding_id). Severity edits and triage verdicts are mirrored onto the originating
+// exploration node so the per-task view and prove_goal's anchor check stay in sync.
+// Returns the updated finding DTO.
 func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 	id := int64(atoiDefault(r.PathValue("id"), 0))
 	if id <= 0 {
@@ -2486,17 +2416,18 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Status    *string `json:"status"`
-		Severity  *string `json:"severity"`
-		Name      *string `json:"name"`
-		VulnClass *string `json:"vulnclass"`
+		Status      *string `json:"status"`
+		Severity    *string `json:"severity"`
+		Name        *string `json:"name"`
+		VulnClass   *string `json:"vulnclass"`
+		TriageState *string `json:"triage_state"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeErr(w, 400, "bad json: "+err.Error())
 		return
 	}
-	if body.Status == nil && body.Severity == nil && body.Name == nil && body.VulnClass == nil {
-		writeErr(w, 400, "nothing to update: provide status/severity/name/vulnclass")
+	if body.Status == nil && body.Severity == nil && body.Name == nil && body.VulnClass == nil && body.TriageState == nil {
+		writeErr(w, 400, "nothing to update: provide status/severity/name/vulnclass/triage_state")
 		return
 	}
 	if body.Status != nil {
@@ -2548,6 +2479,24 @@ func (s *Server) patchFinding(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.VulnClass != nil {
 		n, err := s.m.pg.SetFindingVulnClass(id, strings.TrimSpace(*body.VulnClass))
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if n == 0 {
+			writeErr(w, 404, "finding not found")
+			return
+		}
+	}
+	if body.TriageState != nil {
+		state := strings.TrimSpace(*body.TriageState)
+		switch state {
+		case "confirmed", "verifying", "rejected":
+		default:
+			writeErr(w, 400, "bad triage_state: "+state+" (confirmed/verifying/rejected)")
+			return
+		}
+		n, err := s.m.pg.SetFindingTriageState(id, state)
 		if err != nil {
 			writeErr(w, 500, err.Error())
 			return
@@ -3541,6 +3490,10 @@ func (s *Server) settingsPayload() map[string]any {
 		"workers":                  s.m.Workers(),               // 并发工作 agent 数(默认3)；对之后启动的任务生效
 		"task_concurrency_enabled": concOn,                      // 任务并发上限开关(默认关)
 		"task_concurrency_limit":   concLimit,                   // 同时运行任务上限(开启后默认5)
+		// 任务级等效成本上限(默认关)。开启后引擎按 llm_usage 账本折算
+		// 未缓存输入 + 0.1×缓存读 + 4×输出，达到上限即停止领取新意图并暂停任务。
+		"task_cost_cap_enabled": s.m.pg.GetBool(db.SettingTaskCostCapEnabled, false),
+		"task_cost_cap_tokens":  settingsInt(s.m.pg, db.SettingTaskCostCapTokens, db.DefaultTaskCostCapTokens),
 		// LLM 轮询(故障转移)。默认关；开启后走全局激活配置的 agent 在当前配置不可用时
 		// 自动切到下一个配置。bind_fallback 仅在轮询开启时有意义(默认关)。
 		"llm_pool_enabled":       s.m.LLMPoolEnabled(),
@@ -3618,6 +3571,9 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		// 任务并发上限:同时「运行中」的任务数上限。关闭=不限;开启后新建任务超限则排队,有空位自动启动。
 		ConcurrencyEnabled *bool `json:"task_concurrency_enabled"`
 		ConcurrencyLimit   *int  `json:"task_concurrency_limit"`
+		// 任务级等效成本上限开关与额度(单位=等效成本 token)。
+		TaskCostCapEnabled *bool  `json:"task_cost_cap_enabled"`
+		TaskCostCapTokens  *int64 `json:"task_cost_cap_tokens"`
 		// LLM 轮询(故障转移)开关 + 「绑定配置失败也兜底回轮询链」开关。两者都需要
 		// 重建 provider 链才生效，走下面的 changed → applyLLM 路径。
 		LLMPoolEnabled      *bool `json:"llm_pool_enabled"`
@@ -3737,6 +3693,34 @@ func (s *Server) putSettings(w http.ResponseWriter, r *http.Request) {
 		}
 		// 立即协调一次:关闭时放行全部排队,调高上限时补位启动,不必等下一个 tick。
 		go s.reconcileConcurrency()
+	}
+	if req.TaskCostCapEnabled != nil || req.TaskCostCapTokens != nil {
+		// 部分 PUT:未给的字段沿用当前生效值，避免只改一项把另一项重置。
+		curOn, curLimit := s.m.taskCostCap()
+		if !curOn {
+			curLimit = int64(settingsInt(s.m.pg, db.SettingTaskCostCapTokens, db.DefaultTaskCostCapTokens))
+		}
+		on, limit := curOn, curLimit
+		if req.TaskCostCapEnabled != nil {
+			on = *req.TaskCostCapEnabled
+		}
+		if req.TaskCostCapTokens != nil {
+			limit = *req.TaskCostCapTokens
+		}
+		if limit <= 0 {
+			writeErr(w, 400, "任务级等效成本上限必须是大于 0 的整数")
+			return
+		}
+		if err := s.m.pg.SetBool(db.SettingTaskCostCapEnabled, on); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if err := s.m.pg.SetSetting(db.SettingTaskCostCapTokens, strconv.FormatInt(limit, 10)); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		// 缓存的是上一次读到的成本，改完上限立刻重新判定一次，不必等 30s。
+		s.engine.costCap.Clear()
 	}
 	if req.PythonInterp != nil {
 		if err := s.m.pg.SetSetting(settingPythonInterp, strings.TrimSpace(*req.PythonInterp)); err != nil {
@@ -4090,7 +4074,7 @@ func (s *Server) fallbackChat(t *Task, msg string) string {
 		_, _, _ = t.Store.AddIntentWithEdges(map[string]any{
 			"summary": text, "objective": text,
 			"route_kind": "path_stage", "phase": "recon", "path_phase": "recon",
-			"budget": db.DefaultRouteBudget(),
+			"effort": db.EffortStandard,
 		}, 9, nil, "human", 0, nil)
 		return "已注入一条高优先级意图：" + text
 	case strings.HasPrefix(m, "提示") || strings.HasPrefix(lower, "hint"):

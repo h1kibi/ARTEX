@@ -20,17 +20,20 @@ type DBFinding struct {
 	ReportEvidenceVersion int64
 	TrafficBindings       []FindingTrafficBinding // populated only for export
 
-	ID              int64
-	TaskID          *int64
-	NodeID          *int64
-	VulnClass       string
-	Name            string // 漏洞名称(可读标题);为空时前端回退展示 VulnClass
-	Severity        string
-	Summary         string
-	Evidence        string
-	Worker          string
-	AssetIDs        []int64
-	Status          string
+	ID        int64
+	TaskID    *int64
+	NodeID    *int64
+	VulnClass string
+	Name      string // 漏洞名称(可读标题);为空时前端回退展示 VulnClass
+	Severity  string
+	Summary   string
+	Evidence  string
+	Worker    string
+	AssetIDs  []int64
+	Status    string
+	// TriageState is the Auto-Triager verdict (confirmed/verifying/rejected). It is
+	// separate from the human disposition in Status: prove_goal reads this one.
+	TriageState     string
 	Report          string // 详细报告(Markdown);仅 GetFinding 填充,列表查询不带
 	CreatedAt       time.Time
 	TaskDescription string // populated via LEFT JOIN on tasks
@@ -105,7 +108,7 @@ func (d *DB) AddFinding(taskID, nodeID int64, vulnclass, name, severity, summary
 const findingSelectCols = `f.id, f.task_id, f.node_id, f.vulnclass, COALESCE(f.name, ''), f.severity, f.summary,
 	       f.evidence, f.worker, f.asset_ids, COALESCE(f.status, 'pending'), f.created_at,
 	       COALESCE(t.description, '') AS task_description, f.evidence_version, f.report_evidence_version,
- (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id)`
+ (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=f.id), COALESCE(f.triage_state, '')`
 
 // scanFindings materializes rows selected via findingSelectCols.
 func scanFindings(rows interface {
@@ -118,7 +121,7 @@ func scanFindings(rows interface {
 		f := &DBFinding{}
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
-			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount); err != nil {
+			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt, &f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.TriageState); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -431,11 +434,12 @@ func (s *ExplorationStore) AddFindingFollowUpIntent(findingID, findingNodeID int
 		return 0, Activity{}, err
 	}
 	// A follow-up is its own new route: stable route_id = intent id, explicit
-	// recon/validation phase and the same finite default budget as planner intents.
+	// validation phase, and a standard effort tier (it is a single-target
+	// verification follow-up — a probe tier would cut it before it can confirm).
 	routeFields, err := json.Marshal(map[string]any{
 		"route_id": intentID, "route_kind": "path_stage",
 		"phase": "validation", "path_phase": "validation",
-		"objective": description, "budget": DefaultRouteBudget(),
+		"objective": description, "effort": EffortStandard,
 	})
 	if err != nil {
 		return 0, Activity{}, err
@@ -526,7 +530,7 @@ func (d *DB) ListFindingsForExport(f FindingFilter, ids []int64) ([]*DBFinding, 
 		var aidsJSON string
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 			&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report); err != nil {
+			&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.TriageState, &f.Report); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &f.AssetIDs)
@@ -654,7 +658,7 @@ func (d *DB) GetFinding(id int64) (*DBFinding, error) {
 		WHERE f.id = $1`, id).Scan(
 		&f.ID, &f.TaskID, &f.NodeID, &f.VulnClass, &f.Name, &f.Severity,
 		&f.Summary, &f.Evidence, &f.Worker, &aidsJSON, &f.Status, &f.CreatedAt,
-		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.Report)
+		&f.TaskDescription, &f.EvidenceVersion, &f.ReportEvidenceVersion, &f.TrafficCount, &f.TriageState, &f.Report)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -731,8 +735,16 @@ func (d *DB) SetFindingReportByNodeID(nodeID int64, report string) (int64, error
 // col and jsonKey MUST be trusted constants (they are interpolated into SQL) — never
 // pass user input.
 func (d *DB) setFindingCol(id int64, col, jsonKey, val string) (int64, error) {
+	// One transaction for the row and its graph mirror: a partial write would let
+	// the findings list and prove_goal (which reads the node) disagree about the
+	// same finding.
+	tx, err := d.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
 	var nodeID *int64
-	err := d.QueryRow(`UPDATE findings SET `+col+`=$1 WHERE id=$2 RETURNING node_id`, val, id).Scan(&nodeID)
+	err = tx.QueryRow(`UPDATE findings SET `+col+`=$1 WHERE id=$2 RETURNING node_id`, val, id).Scan(&nodeID)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
@@ -740,11 +752,139 @@ func (d *DB) setFindingCol(id int64, col, jsonKey, val string) (int64, error) {
 		return 0, err
 	}
 	if nodeID != nil {
-		_, _ = d.Exec(`UPDATE exploration_nodes
-			SET payload = jsonb_set(payload, '{`+jsonKey+`}', to_jsonb($1::text))
-			WHERE id = $2`, val, *nodeID)
+		if _, err := tx.Exec(`UPDATE exploration_nodes
+			SET payload = jsonb_set(payload, '{`+jsonKey+`}', to_jsonb($1::text), true)
+			WHERE id = $2`, val, *nodeID); err != nil {
+			return 0, fmt.Errorf("finding %d 的 %s 同步到图节点 %d 失败: %w", id, col, *nodeID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
 	}
 	return 1, nil
+}
+
+// setFindingTriageTx applies a triage verdict inside the caller's transaction and
+// mirrors it onto the finding's exploration node, so the table and the graph never
+// disagree (prove_goal reads the node). bindVersion re-binds a confirmation to the
+// evidence version in force at this moment: the caller reviewed exactly this evidence.
+func setFindingTriageTx(ctx context.Context, tx *sql.Tx, id int64, state string, bindVersion bool) error {
+	var nodeID *int64
+	var version int64
+	var err error
+	if bindVersion {
+		err = tx.QueryRowContext(ctx, `UPDATE findings
+SET triage_state=$2, triage_evidence_version=evidence_version
+WHERE id=$1 RETURNING node_id, evidence_version`, id, state).Scan(&nodeID, &version)
+	} else {
+		err = tx.QueryRowContext(ctx, `UPDATE findings SET triage_state=$2 WHERE id=$1 RETURNING node_id, evidence_version`, id, state).
+			Scan(&nodeID, &version)
+	}
+	if err != nil {
+		return err
+	}
+	if nodeID == nil {
+		return nil
+	}
+	if bindVersion {
+		_, err = tx.ExecContext(ctx, `UPDATE exploration_nodes SET payload = jsonb_set(
+      jsonb_set(payload, '{triage_state}', to_jsonb($1::text), true),
+      '{triage_evidence_version}', to_jsonb($2::bigint), true)
+WHERE id=$3`, state, version, *nodeID)
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE exploration_nodes SET payload = jsonb_set(
+      payload, '{triage_state}', to_jsonb($1::text), true)
+WHERE id=$2`, state, *nodeID)
+	return err
+}
+
+// SetFindingTriageState records the Auto-Triager verdict on a finding and mirrors it
+// into the exploration node payload so prove_goal's anchor check (which reads the
+// node, not the table) sees the same state. Only "confirmed" unlocks goal proof.
+// Returns rows affected (0 when no finding has that id).
+func (d *DB) SetFindingTriageState(id int64, state string) (int64, error) {
+	switch state {
+	case "confirmed", "verifying", "rejected":
+	default:
+		return 0, fmt.Errorf("无效的分诊状态 %q（confirmed/verifying/rejected）", state)
+	}
+	if state != "confirmed" {
+		return d.setFindingCol(id, "triage_state", "triage_state", state)
+	}
+	// A confirmation is bound to the evidence it judged. This path is the deliberate
+	// one (a human in the UI, or a retest verdict), so it re-binds to the CURRENT
+	// version — otherwise a confirmation made after an evidence change would stay
+	// permanently stale and could never prove a goal.
+	tx, err := d.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	if err := setFindingTriageTx(context.Background(), tx, id, state, true); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("finding %d 的分诊状态同步失败: %w", id, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return 1, nil
+}
+
+// SetFindingTriageStateIfVersion applies a background verdict ONLY when the evidence
+// the verdict was computed from is still current and nobody has settled the finding
+// in the meantime.
+//
+// A triager reads evidence, then writes a verdict; in between, a human (or a
+// retester) may have confirmed the finding, or new evidence may have been bound. An
+// unconditional UPDATE by id silently overwrites that newer decision with a stale
+// one. Both the version and the "still verifying" precondition are therefore part of
+// the same statement — and the node mirror runs in the same transaction, so the
+// findings table and the graph can never disagree (prove_goal reads the node).
+//
+// Returns applied=false when the state moved underneath the verdict.
+func (d *DB) SetFindingTriageStateIfVersion(id int64, version int64, state string) (applied bool, err error) {
+	switch state {
+	case "confirmed", "verifying", "rejected":
+	default:
+		return false, fmt.Errorf("无效的分诊状态 %q（confirmed/verifying/rejected）", state)
+	}
+	tx, err := d.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	var nodeID *int64
+	// triage_evidence_version records WHICH evidence version this verdict judged. A
+	// later evidence change (proof traffic removed, new binding added) increments
+	// evidence_version, so the auto-confirmation stops being usable as goal proof —
+	// otherwise an old confirmed verdict would keep certifying evidence it never saw.
+	err = tx.QueryRow(`UPDATE findings SET triage_state=$1, triage_evidence_version=$3
+WHERE id=$2 AND evidence_version=$3 AND triage_state='verifying'
+RETURNING node_id`, state, id, version).Scan(&nodeID)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if nodeID != nil {
+		// Same transaction: a failure here must roll the finding row back too, or the
+		// detail page and prove_goal would read different states.
+		if _, err := tx.Exec(`UPDATE exploration_nodes
+SET payload = jsonb_set(
+      jsonb_set(payload, '{triage_state}', to_jsonb($1::text), true),
+      '{triage_evidence_version}', to_jsonb($3::bigint), true)
+WHERE id = $2`, state, *nodeID, version); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // SetFindingSeverity updates one finding's severity (+ node payload sync). Returns
@@ -769,9 +909,10 @@ func (d *DB) SetFindingVulnClass(id int64, vulnclass string) (int64, error) {
 type FindingMeta struct {
 	TrafficCount int
 
-	ID       int64
-	Status   string
-	AssetIDs []int64
+	ID          int64
+	Status      string
+	TriageState string
+	AssetIDs    []int64
 }
 
 // FindingMetaByNodeID maps a task's finding node ids to their standalone-row
@@ -789,7 +930,7 @@ func (d *DB) FindingMetaByNodeID(taskID int64) (map[int64]FindingMeta, error) {
 	if taskID <= 0 {
 		return out, nil
 	}
-	rows, err := d.Query(`SELECT node_id, id, COALESCE(status,'pending'), asset_ids, (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=findings.id) FROM findings
+	rows, err := d.Query(`SELECT node_id, id, COALESCE(status,'pending'), COALESCE(triage_state,''), asset_ids, (SELECT count(*) FROM finding_traffic_bindings b WHERE b.finding_id=findings.id) FROM findings
 		WHERE task_id=$1 AND node_id IS NOT NULL`, taskID)
 	if err != nil {
 		return out, err
@@ -799,7 +940,7 @@ func (d *DB) FindingMetaByNodeID(taskID int64) (map[int64]FindingMeta, error) {
 		var nid int64
 		var m FindingMeta
 		var aidsJSON string
-		if err := rows.Scan(&nid, &m.ID, &m.Status, &aidsJSON, &m.TrafficCount); err != nil {
+		if err := rows.Scan(&nid, &m.ID, &m.Status, &m.TriageState, &aidsJSON, &m.TrafficCount); err != nil {
 			return out, err
 		}
 		_ = json.Unmarshal([]byte(aidsJSON), &m.AssetIDs)

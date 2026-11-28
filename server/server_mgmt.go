@@ -879,6 +879,10 @@ func (s *Server) pgSaveMCP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	// An edit can change command/args/env/url — everything a live pooled client was
+	// dialed with. Drop those clients so the next use reconnects with the new
+	// configuration instead of running the old one until the idle sweep.
+	closeMCPForServer(id)
 	// On initial add, auto-discover + cache the tool list so the UI shows it right
 	// away (bounded so a slow/broken server can't hang the request). Skipped on
 	// plain updates (e.g. enable toggles) to avoid re-spawning the server each time.
@@ -903,6 +907,7 @@ func (s *Server) pgDeleteMCP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	closeMCPForServer(id) // a deleted server must not keep a live subprocess
 	writeJSON(w, 200, map[string]any{"deleted": id})
 }
 

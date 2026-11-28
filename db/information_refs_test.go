@@ -20,3 +20,21 @@ func TestNormalizeEvidenceRefsRejectsBlankAndTraversal(t *testing.T) {
 		t.Fatalf("normalized refs=%v", got)
 	}
 }
+
+// OAST callbacks are addressable evidence: oast:<id> must parse, normalize and
+// dedupe like every other pointer, and a non-numeric id must be rejected so a
+// reference nobody can resolve never reaches the graph.
+func TestNormalizeEvidenceRefsAcceptsOAST(t *testing.T) {
+	got, err := NormalizeEvidenceRefs([]string{" oast:17 ", "oast:17", "traffic:3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "oast:17" || got[1] != "traffic:3" {
+		t.Fatalf("normalized refs=%v", got)
+	}
+	for _, bad := range []string{"oast:", "oast:abc", "oast:../x"} {
+		if _, err := ParseEvidenceRef(bad); err == nil {
+			t.Fatalf("malformed oast ref %q was accepted", bad)
+		}
+	}
+}

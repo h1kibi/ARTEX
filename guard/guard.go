@@ -18,6 +18,10 @@ import (
 	"github.com/Autumn-27/norma/hook"
 )
 
+// executeExtraToolName is the SDK's deferred-tool invoker (actool.ExecuteExtraToolName).
+// Redeclared here because guard must not import the tool package for one string.
+const executeExtraToolName = "ExecuteExtraTool"
+
 // AuditEntry records one gated tool call.
 type AuditEntry struct {
 	TS      int64  `json:"ts"`
@@ -32,8 +36,24 @@ type Guard struct {
 	mu          sync.Mutex
 	audit       []AuditEntry
 	attrib      map[string]int // failure attribution counts (Observer / G5)
+	attribSince int64          // unix second the counts started covering (0 = never)
 	reg         *hook.Registry
-	interceptor *intercept.Interceptor // optional; nil disables user-configured rules
+	interceptor Interceptor // optional; nil disables user-configured rules
+	// assetRules supplies this task's asset block/allow rules (docs §4.5). nil =
+	// no asset-level gating. Read per call, so a rule edit applies immediately.
+	assetRules AssetInterceptHook
+}
+
+// Interceptor is the slice of intercept.Interceptor the guard actually uses.
+// Declared as an interface so the gating logic (which rule reaches which call) can
+// be tested without a database, and so a future interceptor variant needs no
+// change here.
+type Interceptor interface {
+	IsToolEnabled(name string) bool
+	Match(toolName string, input []byte) (intercept.Decision, bool)
+	Judge(ctx context.Context, tool string, arguments json.RawMessage) (intercept.Decision, bool)
+	Log(ctx context.Context, convID int64, dec intercept.Decision, toolName string, input []byte, status string)
+	HandleAsk(ctx context.Context, convID int64, dec intercept.Decision, toolName string, input []byte) bool
 }
 
 // New creates a Guard without user-configured intercept rules (used for pentest
@@ -43,7 +63,9 @@ func New() *Guard { return newGuard(nil) }
 // NewWithInterceptor creates a Guard with user-configured intercept rules.
 func NewWithInterceptor(ic *intercept.Interceptor) *Guard { return newGuard(ic) }
 
-func newGuard(ic *intercept.Interceptor) *Guard {
+// newGuard takes the interface so tests can supply a stub; NewWithInterceptor is
+// the production entry point and keeps its concrete signature.
+func newGuard(ic Interceptor) *Guard {
 	g := &Guard{attrib: map[string]int{}, interceptor: ic}
 	g.reg = hook.NewRegistry().
 		On(hook.PreToolUse, g.preToolUse).
@@ -55,36 +77,71 @@ func newGuard(ic *intercept.Interceptor) *Guard {
 func (g *Guard) Hooks() *hook.Registry { return g.reg }
 
 func (g *Guard) preToolUse(ctx context.Context, ev hook.Event) hook.Result {
+	// A deferred MCP tool / custom tool arrives wrapped as ExecuteExtraTool. Every
+	// rule below (and the LLM judge) must see the tool that will actually run, with
+	// its real parameters — otherwise deferral is a free bypass. The audit log keeps
+	// both names so a reviewer can see the wrapper too.
+	innerName, innerInput, unwrapped := innerCall(ev.ToolName, ev.Input)
+
 	// Extract the shell-command surface for the audit log: Bash + the interactive-shell
 	// tools (shell_open's command, shell_send's text). Destructive/exfil gating is no
 	// longer hard-coded here — it now lives in the DB intercept rules, evaluated by
 	// applyIntercept below. Other tools record an empty command.
 	var cmd string
-	switch ev.ToolName {
+	switch innerName {
 	case "Bash", "shell_open":
 		var in struct {
 			Command string `json:"command"`
 		}
-		_ = json.Unmarshal(ev.Input, &in)
+		_ = json.Unmarshal(innerInput, &in)
 		cmd = in.Command
 	case "shell_send":
 		var in struct {
 			Text string `json:"text"`
 		}
-		_ = json.Unmarshal(ev.Input, &in)
+		_ = json.Unmarshal(innerInput, &in)
 		cmd = in.Text
 	}
-	g.record(ev.ToolName, "allow", "", cmd)
-	return g.applyIntercept(ctx, ev)
+	auditTool := innerName
+	if unwrapped {
+		auditTool = ev.ToolName + "→" + innerName
+	}
+	g.record(auditTool, "allow", "", cmd)
+
+	// Asset scope gate: refuse a request to an out-of-scope target (a global
+	// .gov/.edu block, a task's explicit exclusion) at the tool boundary, not only
+	// at insert_assets' input. This is what makes the block real for Bash/curl and
+	// for a browser MCP tool.
+	if ok, reason := g.assetGateDecision(innerName, innerInput); !ok {
+		return g.block(auditTool, systemBlockMessage(reason), cmd)
+	}
+
+	if unwrapped {
+		ev.ToolName, ev.Input = innerName, innerInput
+	}
+	return g.applyIntercept(ctx, ev, unwrapped)
 }
 
 // applyIntercept evaluates user-configured intercept rules against the tool call.
 // Both rules and the fallback judge receive the complete tool input.
-func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event) hook.Result {
+//
+// unwrapped means ev.ToolName is an INNER tool reached through ExecuteExtraTool
+// (an MCP server tool or a deferred custom tool). Those names are never in the
+// user's enabled-tools list — that list is a set of eight built-in names — so the
+// normal "is this tool in the intercept scope?" gate would drop every deferred tool
+// on the floor: the wrapper was reviewed, the thing that actually ran was not.
+// For an unwrapped call the scope question is therefore asked about the WRAPPER
+// (was ExecuteExtraTool itself switched off?) and, when it is on, the inner call
+// always enters rule matching + the judge.
+func (g *Guard) applyIntercept(ctx context.Context, ev hook.Event, unwrapped bool) hook.Result {
 	if g.interceptor == nil {
 		return hook.Result{}
 	}
-	if !g.interceptor.IsToolEnabled(ev.ToolName) {
+	if unwrapped {
+		if !g.interceptor.IsToolEnabled(executeExtraToolName) {
+			return hook.Result{} // the user turned the deferred-tool surface off entirely
+		}
+	} else if !g.interceptor.IsToolEnabled(ev.ToolName) {
 		return hook.Result{}
 	}
 	ctx = intercept.WithCall(ctx, ev.ToolName, ev.Input)
@@ -140,17 +197,36 @@ func systemBlockMessage(reason string) string {
 		"原因：" + reason + "。此操作被禁止。"
 }
 
-var reBlocked = regexp.MustCompile(`(?i)\b(403|forbidden|waf|blocked|rate.?limit|429|captcha|denied)\b`)
+var (
+	reBlocked   = regexp.MustCompile(`(?i)\b(403|forbidden|waf|blocked|captcha|denied)\b`)
+	reRateLimit = regexp.MustCompile(`(?i)\b(429|rate.?limit|too many requests|慢一点|限速)\b`)
+	// rePlatformBlocked spots ARTEX's own refusal text (see systemBlockMessage and
+	// traffic's synthetic egress 403) so it is never attributed to the target.
+	rePlatformBlocked = regexp.MustCompile(`ARTEX ?平台管控`)
+)
 
 // postToolUse is the Observer failure-attribution hook (G5): it classifies tool
 // results into blocked / error / ok so the planner can change strategy instead
-// of giving up at a WAF.
+// of giving up at a WAF. The counts are surfaced through graph_overview
+// (guard_attributions) so the planner can slow down on a rate-limited target.
 func (g *Guard) postToolUse(_ context.Context, ev hook.Event) hook.Result {
+	if name, _, unwrapped := innerCall(ev.ToolName, ev.Input); unwrapped {
+		ev.ToolName = name
+	}
 	if ev.ToolName != "Bash" {
+		return hook.Result{}
+	}
+	// A platform refusal (the asset scope gate above, or a task exclusion) is NOT
+	// the target defending itself. Counting it as blocked/waf would tell the
+	// planner "the site is fighting back, change technique" when what actually
+	// happened is that ARTEX stopped the call — the wrong lesson entirely.
+	if rePlatformBlocked.Match(ev.Result) {
 		return hook.Result{}
 	}
 	class := "ok"
 	switch {
+	case reRateLimit.Match(ev.Result):
+		class = "rate_limited"
 	case reBlocked.Match(ev.Result):
 		class = "blocked"
 	case ev.IsError:
@@ -158,11 +234,23 @@ func (g *Guard) postToolUse(_ context.Context, ev hook.Event) hook.Result {
 	}
 	g.mu.Lock()
 	g.attrib[class]++
+	if class == "blocked" {
+		g.attrib["waf"]++
+	}
+	// Guard attributions exist to inform pacing, so a bounded window is enough:
+	// counters from a 6-hour-old run say nothing about the current target state.
+	// "since" is the process-relative second the counts started covering.
+	if g.attribSince == 0 {
+		g.attribSince = time.Now().Unix()
+	}
 	g.mu.Unlock()
 	return hook.Result{}
 }
 
-// Attributions returns failure-attribution counts (Observer / G5).
+// Attributions returns failure-attribution counts (Observer / G5): ok / error /
+// blocked / waf / rate_limited. This is the G5 observer's output — it was
+// collected but never read, so the planner had no way to notice a target that
+// keeps answering 403/429.
 func (g *Guard) Attributions() map[string]int {
 	g.mu.Lock()
 	defer g.mu.Unlock()

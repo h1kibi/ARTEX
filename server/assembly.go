@@ -3,14 +3,16 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"log"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/config"
 	"github.com/Autumn-27/artex/db"
 	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/norma/mcp"
 	"github.com/Autumn-27/norma/skill"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -62,50 +64,21 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 			}
 		}
 
-		// --- mcp: connect enabled servers that are directly visible to this agent
-		// OR skill-gated (named in a visible skill's mcps field). Directly-visible
-		// and NOT gated → global (unlocked from session start). Skill-gated →
-		// deferred until that skill is invoked (regardless of direct visibility).
-		var closers []io.Closer
-		serverTools := map[string][]string{} // server name → its tool names
-		var allNames, globalNames []string
-		globalSet := map[string]bool{}
-		{
-			mcpIDs, _ := pg.AgentVisible(a.ID, "mcp")
-			want := idSet(mcpIDs)
-			all, _ := pg.ListMCP()
-			for _, m := range all {
-				if !m.Enabled {
-					continue
-				}
-				directVisible := want[m.ID]
-				skillGated := gated[m.Name]
-				if !directVisible && !skillGated {
-					continue // neither directly visible nor referenced by a visible skill
-				}
-				cl, err := connectMCP(ctx, m)
-				if err != nil {
-					log.Printf("[mcp] %s 连接失败: %v", m.Name, err)
-					continue
-				}
-				closers = append(closers, cl)
-				ts, err := cl.Tools(ctx)
-				if err != nil {
-					log.Printf("[mcp] %s tools/list 失败: %v", m.Name, err)
-					continue
-				}
-				for _, t := range ts {
-					extra = append(extra, t)
-					allNames = append(allNames, t.Name())
-					serverTools[m.Name] = append(serverTools[m.Name], t.Name())
-					if directVisible && !skillGated {
-						// directly visible and not gated → available from session start
-						globalNames = append(globalNames, t.Name())
-						globalSet[t.Name()] = true
-					}
-					// skill-gated tools stay out of globalNames; unlocked via unlockSkill()
-				}
-			}
+		// --- mcp: enabled servers visible to this agent or gated by one of its
+		// skills. Lifetime rules live in resolveMCPs (pooled for direct visibility,
+		// lazy stand-ins for skill-gated servers).
+		session := mcpSessionKey(ctx, a.Key)
+		pool := mcpPoolInstance()
+		mcpIDs, _ := pg.AgentVisible(a.ID, "mcp")
+		all, _ := pg.ListMCP()
+		res := resolveMCPs(ctx, pool, session, all, idSet(mcpIDs), gated, pg.MCPToolsDetailed)
+		extra = append(extra, res.Tools...)
+		allNames := append([]string(nil), res.AllNames...)
+		globalNames := append([]string(nil), res.GlobalNames...)
+		serverTools := res.ServerTools
+		globalSet := make(map[string]bool, len(res.GlobalNames))
+		for _, n := range res.GlobalNames {
+			globalSet[n] = true
 		}
 
 		// Shared call-gate: global MCP tools are unlocked from the start; skill-gated
@@ -164,11 +137,11 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 			}
 		}
 
-		cleanup := func() {
-			for _, c := range closers {
-				_ = c.Close()
-			}
-		}
+		// The clients are pool-owned, not run-owned: closing them here would undo
+		// the whole point (a browser loses its tabs and cookies between turns).
+		// Reclamation belongs to the pool's idle sweep / CloseTaskSession, so the
+		// per-run cleanup is intentionally empty.
+		cleanup := func() {}
 		def := agent.DeferredInfo{
 			Deferred:    allNames,
 			GlobalNames: globalNames,
@@ -178,6 +151,11 @@ func wireAgentAugment(pg *db.DB, skillDir string, hostTools func() ([]actool.Cor
 		return extra, def, cleanup
 	}
 }
+
+// mcpToolName is the qualified name an MCP server's tool is exposed under
+// (mcp__<server>__<tool>), matching what the MCP client wraps and what the
+// deferred-tool machinery addresses.
+func mcpToolName(server, tool string) string { return mcp.ToolName(server, tool) }
 
 func idSet(ids []int64) map[int64]bool {
 	m := make(map[int64]bool, len(ids))
@@ -209,8 +187,9 @@ func seedPrompts(pg *db.DB) {
 // tool-assembly time each built-in tool is filtered by its agent binding / enabled
 // flag and, if kept, wrapped so the model sees the DB-overridden description/schema
 // and缺省入参 get injected. MCP/skill/host tools have no row and pass through.
-func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
+func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool, m *Manager) {
 	agent.FindingTrafficBindingEnabled = func() bool { return pg.GetBool(settingAgentTrafficBinding, false) }
+	wireHTTPConfigFor(m)
 	// Seed the built-in domain tools (first-insert only; DO NOTHING preserves edits).
 	// No startup prune: rows we didn't seed are left alone so future user-defined
 	// custom tools (system=false, added via the UI) survive restarts.
@@ -287,6 +266,17 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 				out = append(out, resolve(inst, row))
 			}
 		}
+		// local shell dialect: the server-level Bash tool runs the host shell, so
+		// every agent (planner/mainagent/pentest/auto) needs the same PowerShell note
+		// the worker gets in its system prompt. Later Bash addenda append to this.
+		if note := actool.ShellDialectNote(wslDialectActive()); note != "" {
+			for i, t := range out {
+				if t.Name() == "Bash" {
+					out[i] = agent.DecorateTool(t, t.Description()+note, t.InputSchema())
+					break
+				}
+			}
+		}
 		// shell hints: user-defined kind="shell" tools are not callable — they are
 		// environment declarations that tell the model which command-line tools are
 		// installed. Collect the ones bound to this agent and append to Bash's description.
@@ -321,6 +311,39 @@ func wireTools(pg *db.DB, domainReg map[string]actool.CoreTool) {
 			}
 		}
 		return out
+	}
+}
+
+// wslDialectActive reports whether Bash runs inside WSL, matching the backend
+// test in agent.workerSystem.
+func wslDialectActive() bool {
+	distro, _ := config.WSLBackend()
+	return distro != ""
+}
+
+// wireHTTPConfigFor supplies the http_request runtime config to tool sets that
+// carry no per-run config of their own (server-level domain tools injected into
+// chat agents), tagged by the task/intent riding on the call's context.
+func wireHTTPConfigFor(m *Manager) {
+	if m == nil {
+		agent.HTTPConfigFor = nil
+		return
+	}
+	agent.HTTPConfigFor = func(ctx context.Context) agent.HTTPRequestConfig {
+		ri := agent.RunInfoFrom(ctx)
+		cfg := agent.HTTPRequestConfig{
+			Proxy:  traffic.ProxyURLWithTag(m.ProxyAddr(), ri.TaskID, ri.IntentID),
+			CACert: m.ProxyCACert(),
+		}
+		if ri.TaskID > 0 {
+			taskDir := filepath.Join(m.dir, "tasks", strconv.FormatInt(ri.TaskID, 10))
+			cfg.CookieDir = filepath.Join(taskDir, "cookies")
+			cfg.ArtifactDir = taskDir
+			if ri.IntentID > 0 {
+				cfg.ArtifactDir = filepath.Join(taskDir, "i"+strconv.FormatInt(ri.IntentID, 10))
+			}
+		}
+		return cfg
 	}
 }
 

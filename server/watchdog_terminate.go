@@ -76,22 +76,45 @@ func marshalWatchdogMetadata(a watchdogAudit) json.RawMessage {
 	return raw
 }
 
+// TerminateOptions carries the authority behind one termination request.
+type TerminateOptions struct {
+	// CycleNo, when >= 0, requires the run's current cycle to match.
+	CycleNo int
+	// HumanStop marks an operator's explicit "stop". It is the one authority that
+	// overrides human involvement: that IS the human's decision, not an autonomous
+	// judgement.
+	HumanStop bool
+}
+
 // TerminateWork stops exactly one live run. runID is matched before the cancel
 // so a late result from an older run can never stop a newer one. The caller
 // waits until runIntent has committed the final state and activity, not merely
 // until the context is cancelled.
 func (e *Engine) TerminateWork(ctx context.Context, intentID int64, runID, reason, terminalState string) (TerminationResult, error) {
-	return e.terminateWork(ctx, intentID, runID, reason, terminalState, -1)
+	return e.terminateWork(ctx, intentID, runID, reason, terminalState, TerminateOptions{CycleNo: -1})
 }
 
 // TerminateWorkForCycle additionally requires the run's current cycle to match.
 // A late Slow Path result must not terminate a cycle that has already advanced
 // after an effective write. cycleNo < 0 skips the check (Planner/UI callers).
 func (e *Engine) TerminateWorkForCycle(ctx context.Context, intentID int64, runID, reason, terminalState string, cycleNo int) (TerminationResult, error) {
-	return e.terminateWork(ctx, intentID, runID, reason, terminalState, cycleNo)
+	return e.terminateWork(ctx, intentID, runID, reason, terminalState, TerminateOptions{CycleNo: cycleNo})
 }
 
-func (e *Engine) terminateWork(ctx context.Context, intentID int64, runID, reason, terminalState string, cycleNo int) (TerminationResult, error) {
+// TerminateWorkGuarded is the Fast Path entry: like TerminateWorkForCycle, but also
+// refusing an autonomous termination of a run a human now owns.
+//
+// The ownership check lives HERE, under workMu and immediately before the run's
+// action slot is claimed, rather than in the caller. A caller-side check is a
+// separate synchronization point: a human steer landing between the check and this
+// commit would still be killed. Checking under the same lock that installs the
+// termination makes the two decisions atomic.
+func (e *Engine) TerminateWorkGuarded(ctx context.Context, intentID int64, runID, reason, terminalState string, cycleNo int, humanStop bool) (TerminationResult, error) {
+	return e.terminateWork(ctx, intentID, runID, reason, terminalState, TerminateOptions{CycleNo: cycleNo, HumanStop: humanStop})
+}
+
+func (e *Engine) terminateWork(ctx context.Context, intentID int64, runID, reason, terminalState string, opts TerminateOptions) (TerminationResult, error) {
+	cycleNo := opts.CycleNo
 	var out TerminationResult
 	if terminalState != "stopped" && terminalState != "exhausted" {
 		terminalState = "stopped"
@@ -118,6 +141,20 @@ func (e *Engine) terminateWork(ctx context.Context, intentID int64, runID, reaso
 				errWatchdogRunMismatch, intentID, cycleNo)
 		}
 	}
+	if !opts.HumanStop && e.monitor != nil {
+		// Re-read the LIVE ownership flag here, not from the decision snapshot: any
+		// human steer or "continue" answer that landed after the tick must win. The
+		// monitor takes its own lock; it is never held against workMu in the other
+		// order, so this cannot deadlock.
+		if e.monitor.HumanInvolvedRun(runID) {
+			e.workMu.Unlock()
+			return out, fmt.Errorf("%w: 意图 %d 已转为人工介入，拒绝自动终止", errWatchdogRunMismatch, intentID)
+		}
+	}
+	if run.settling {
+		e.workMu.Unlock()
+		return out, fmt.Errorf("%w: 意图 %d 已进入终态提交，终止请求不再生效", errWorkControlConflict, intentID)
+	}
 	if run.action != "" {
 		e.workMu.Unlock()
 		return out, fmt.Errorf("%w: 意图 %d 正在执行 %s 操作", errWorkControlConflict, intentID, run.action)
@@ -125,6 +162,7 @@ func (e *Engine) terminateWork(ctx context.Context, intentID int64, runID, reaso
 	run.action = "watchdog"
 	run.watchdogReason = reason
 	run.watchdogState = terminalState
+	run.humanStop = opts.HumanStop
 	done := run.done
 	settle := run.settle
 	var cause error
@@ -187,22 +225,6 @@ func (e *Engine) terminationResult(intentID int64, run *workExecution, err error
 		return out, fmt.Errorf("意图 %d 已结束，但没有返回终止结果", intentID)
 	}
 	return out, nil
-}
-
-// takeWatchdogTermination reports the termination a settlement request left on
-// the work handle. The run context stays live on this path, so runIntent uses
-// the recorded reason instead of an AbortCause.
-func (e *Engine) takeWatchdogTermination(intentID int64, runID string) (reason, state string, ok bool) {
-	e.workMu.Lock()
-	defer e.workMu.Unlock()
-	run := e.work[intentID]
-	if run == nil || (runID != "" && run.runID != runID) {
-		return "", "", false
-	}
-	if run.watchdogReason == "" && run.watchdogState == "" {
-		return "", "", false
-	}
-	return run.watchdogReason, run.watchdogState, true
 }
 
 // setWatchdogResult stores the settled result on the live work handle before
@@ -294,4 +316,39 @@ func (e *Engine) settleWatchdogTermination(t *Task, name string, intent *db.Node
 	log.Printf("[watchdog] task %s 意图 #%d 已终止(%s)，写回 facts=%d assets=%d findings=%d",
 		t.ID, intent.ID, state, result.Facts, result.Assets, result.Findings)
 	return result, true
+}
+
+// claimWorkSettlement marks the run as committing its terminal state and reads any
+// pending Watchdog termination in the SAME workMu critical section. Claiming via a
+// separate peek left a window: a termination could set action=watchdog between the
+// peek and detachWork, while the commit took the normal branch and never wrote the
+// result the caller was waiting for.
+func (e *Engine) claimWorkSettlement(intentID int64, runID string) (reason, state string, humanStop, hasWatchdog bool) {
+	e.workMu.Lock()
+	defer e.workMu.Unlock()
+	run := e.work[intentID]
+	if run == nil || (runID != "" && run.runID != runID) {
+		return "", "", false, false
+	}
+	run.settling = true
+	if run.watchdogReason == "" && run.watchdogState == "" {
+		return "", "", false, false
+	}
+	return run.watchdogReason, run.watchdogState, run.humanStop, true
+}
+
+// peekWatchdogTermination reports the pending termination WITHOUT consuming it, so a
+// settlement branch can decide precedence (an explicit human stop beats a need-human
+// hand-off) before the normal settlement path takes it.
+func (e *Engine) peekWatchdogTermination(intentID int64, runID string) (reason, state string, humanStop, ok bool) {
+	e.workMu.Lock()
+	defer e.workMu.Unlock()
+	run := e.work[intentID]
+	if run == nil || (runID != "" && run.runID != runID) {
+		return "", "", false, false
+	}
+	if run.watchdogReason == "" && run.watchdogState == "" {
+		return "", "", false, false
+	}
+	return run.watchdogReason, run.watchdogState, run.humanStop, true
 }

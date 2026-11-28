@@ -11,6 +11,29 @@ import (
 // grouped; empty string when there are no constraints (or ts is nil). The framing
 // deliberately puts these ABOVE the exploration/expansion heuristics so a declared
 // boundary wins the tug-of-war against "chase another entry surface".
+func constraintTexts(ts *db.ExplorationStore) []string {
+	if ts == nil {
+		return nil
+	}
+	rows, err := ts.ListConstraints()
+	if err != nil || len(rows) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(rows))
+	for _, c := range rows {
+		text := strings.TrimSpace(c.Text)
+		if text == "" {
+			continue
+		}
+		kind := strings.TrimSpace(c.Kind)
+		if kind == "" {
+			kind = "deny"
+		}
+		out = append(out, kind+": "+text)
+	}
+	return out
+}
+
 func constraintBlock(ts *db.ExplorationStore) string {
 	if ts == nil {
 		return ""

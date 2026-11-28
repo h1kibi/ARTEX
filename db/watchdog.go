@@ -568,6 +568,21 @@ RETURNING `+watchdogRequestCols,
 	return r, err
 }
 
+// ExpireAnsweredWatchdogAsk retracts an answer whose control action lost the race
+// with the run's settlement. The card was already committed as answered, but the
+// stop/continue was refused (the run had entered its terminal commit), so leaving
+// it answered would show a decision the system never applied.
+func (d *DB) ExpireAnsweredWatchdogAsk(ctx context.Context, id int64, answer, reason string) (bool, error) {
+	res, err := d.ExecContext(ctx, `
+UPDATE watchdog_requests SET status=$2, answer=$3, answer_reason=$4, answered_at=now(), updated_at=now()
+WHERE id=$1 AND status=$5`, id, WatchdogRequestExpired, answer, reason, WatchdogRequestAnswered)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
 // SettleWatchdogAsk closes an open decision card with a non-answer outcome
 // (expired default, superseded by effective output, cancelled by task delete).
 func (d *DB) SettleWatchdogAsk(ctx context.Context, id int64, status, answer, reason string) (bool, error) {

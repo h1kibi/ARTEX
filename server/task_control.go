@@ -118,16 +118,22 @@ func (s *Server) applyTaskControlWithCause(t *Task, action string, pauseCause er
 			return out, fmt.Errorf("任务已经暂停")
 		}
 		wasQueued := lifecycle.Queued
-		wasEnginePaused := s.engine.IsPaused(t.ID)
 		if pauseCause == nil {
 			pauseCause = agent.AbortPausedByUser
 		}
+		// One serialized pause lifecycle shared with the cost-cap gate (see
+		// Manager.pauseMu): check-and-set of the engine bit and the persistent row must
+		// not interleave with another pauser's rollback.
+		s.m.pauseMu.Lock()
+		wasEnginePaused := s.engine.IsPaused(t.ID)
 		s.engine.Pause(t.ID, pauseCause)
-		if err := s.m.ApplyTaskPause(t.ID); err != nil {
-			if !wasEnginePaused && !wasQueued {
-				s.engine.Resume(t)
-			}
-			return out, err
+		pauseErr := s.m.ApplyTaskPause(t.ID)
+		if pauseErr != nil && !wasEnginePaused && !wasQueued && !s.m.TaskPersistentlyPaused(t.ID) {
+			s.engine.Resume(t)
+		}
+		s.m.pauseMu.Unlock()
+		if pauseErr != nil {
+			return out, pauseErr
 		}
 		// Main Agent is independently cancellable. Only cancel its current turn
 		// after the persistent pause commits, so a failed control request is fully

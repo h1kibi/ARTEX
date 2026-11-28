@@ -290,6 +290,34 @@ func (s *ExplorationStore) SetNodeState(id int64, state string) error {
 // transaction. A missing goal or write failure leaves both untouched, so a goal
 // can never appear proven without its evidence edge.
 func (s *ExplorationStore) ProveGoal(goalID, evidenceID int64) error {
+	return s.ProveGoalChecked(goalID, evidenceID, nil)
+}
+
+// ProveGoalChecked is ProveGoal with an evidence re-validation that runs INSIDE the
+// transaction, under a row lock on the evidence node.
+//
+// The caller validates the evidence before deciding to prove the goal, but that is a
+// separate read: between it and this commit the evidence can change (proof traffic
+// removed → triage confirmation invalidated, a fact expiring, the node replaced).
+// Re-checking here is what makes "the evidence still supports the claim" true at the
+// instant the proves edge and the `met` state are written.
+func (s *ExplorationStore) ProveGoalChecked(goalID, evidenceID int64, verify func(kind, state string, payload []byte) error) error {
+	var adapted func(kind, state string, payload []byte, inherited bool) error
+	if verify != nil {
+		adapted = func(kind, state string, payload []byte, _ bool) error {
+			return verify(kind, state, payload)
+		}
+	}
+	return s.ProveGoalCheckedWithInheritance(goalID, evidenceID, adapted)
+}
+
+// ProveGoalCheckedWithInheritance is ProveGoalChecked for evidence that may live in
+// a DIRECT SOURCE task: the verify callback also learns whether the evidence node
+// came from one, so the cross-task inheritance policy can be re-checked inside the
+// same transaction. The proves edge itself needs no special handling — its src_id
+// references exploration_nodes(id) globally and the node id is unique across
+// explorations.
+func (s *ExplorationStore) ProveGoalCheckedWithInheritance(goalID, evidenceID int64, verify func(kind, state string, payload []byte, inherited bool) error) error {
 	if goalID <= 0 || evidenceID <= 0 {
 		return fmt.Errorf("goal_id 和 evidence_id 必填")
 	}
@@ -305,6 +333,39 @@ WHERE id=$1 AND exploration_id=$2 AND kind='goal' FOR UPDATE`, goalID, s.expID).
 			return fmt.Errorf("goal %d 不存在于本任务", goalID)
 		}
 		return err
+	}
+	if verify != nil {
+		var kind, evState string
+		var payload []byte
+		inherited := false
+		err := tx.QueryRow(`SELECT kind, state, COALESCE(payload,'{}'::jsonb)
+FROM exploration_nodes WHERE id=$1 AND exploration_id=$2 FOR UPDATE`, evidenceID, s.expID).
+			Scan(&kind, &evState, &payload)
+		if err == sql.ErrNoRows {
+			// Not ours: it may still be legitimate evidence inherited from a live
+			// direct source task. The source's node is locked (read-only for us) so
+			// its state cannot change under the verification below.
+			err = tx.QueryRow(`SELECT n.kind, n.state, COALESCE(n.payload,'{}'::jsonb)
+FROM tasks owner
+JOIN task_relations relation ON relation.task_id=owner.id
+JOIN tasks source ON source.id=relation.source_task_id AND source.deleted_at IS NULL
+JOIN exploration_nodes n ON n.exploration_id=source.exploration_id
+WHERE owner.exploration_id=$1 AND owner.deleted_at IS NULL AND n.id=$2
+FOR UPDATE OF n`, s.expID, evidenceID).
+				Scan(&kind, &evState, &payload)
+			if err == nil {
+				inherited = true
+			}
+		}
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("证据节点 %d 不属于本任务，也无法从直接来源任务继承，无法证明目标", evidenceID)
+		}
+		if err != nil {
+			return err
+		}
+		if err := verify(kind, evState, payload, inherited); err != nil {
+			return fmt.Errorf("证据节点 %d 在提交时已不再支持该结论：%w", evidenceID, err)
+		}
 	}
 	if _, err := tx.Exec(`
 INSERT INTO exploration_edges(exploration_id, src_id, rel, dst_id) VALUES ($1,$2,$3,$4)
@@ -1258,14 +1319,20 @@ ORDER BY priority DESC, id ASC LIMIT $2`, s.expID, limit)
 }
 
 // HasActiveIntent reports whether this exploration has any intent still in play
-// (state open OR running). Used to decide whether to kick the FIRST planner round:
-// a seeded task's intent may already have been claimed (open→running) by a worker
-// before the check, so counting only 'open' (Frontier) races with worker claim and
-// wrongly kicks a redundant first round. Counting open+running is race-proof.
+// (state open, running OR paused). Used to decide whether to kick the FIRST planner
+// round and whether a goalless task may be closed:
+//   - a seeded task's intent may already have been claimed (open→running) by a
+//     worker before the check, so counting only 'open' (Frontier) races with worker
+//     claim and wrongly kicks a redundant first round;
+//   - a PAUSED intent is a live hand-off, not a finished lane: a worker that parked
+//     on a need-human point leaves the intent paused while the operator is still
+//     expected to resume it. Excluding it made a goalless task close itself as done
+//     the moment its only intent parked, and the human message endpoint then refused
+//     the resume ("终态任务无法向 Worker 发送消息"), losing the hand-off entirely.
 func (s *ExplorationStore) HasActiveIntent() (bool, error) {
 	var exists bool
 	err := s.db.QueryRow(`SELECT EXISTS(SELECT 1 FROM exploration_nodes
-WHERE exploration_id=$1 AND kind='intent' AND state IN ('open','running'))`, s.expID).Scan(&exists)
+WHERE exploration_id=$1 AND kind='intent' AND state IN ('open','running','paused'))`, s.expID).Scan(&exists)
 	return exists, err
 }
 

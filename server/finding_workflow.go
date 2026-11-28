@@ -115,49 +115,114 @@ func objectProperty(parent map[string]any, key string) map[string]any {
 	return value
 }
 
-func (s *Server) agentFindingTrafficAccess(ctx context.Context, id int64, write bool) error {
+// agentFindingTrafficAccess authorizes an evidence tool call and returns the
+// CANONICAL findings.id it resolved. id may be either number a caller holds — the
+// standalone record id or the exploration node id — because report_finding prints
+// both and models mix them up; failing on the distinction lost confirmed findings
+// to a bookkeeping detail. A rejected call returns an error naming both accepted
+// forms so the retry succeeds instead of guessing.
+// idKind says which numbering the caller supplied. The two sequences are
+// independent, so an explicit kind is the only unambiguous way to address a finding:
+// "either sequence" resolution silently picks the record id when a node id happens to
+// coincide with another finding's record id.
+type idKind int
+
+const (
+	idAny  idKind = iota // legacy: resolve across both spaces (logged when ambiguous)
+	idNode               // the caller holds an exploration node id
+	idRec                // the caller holds a findings.id
+)
+
+// agentFindingTrafficAccessTyped resolves and authorizes one evidence tool call.
+func (s *Server) agentFindingTrafficAccessTyped(ctx context.Context, id int64, kind idKind, write bool) (int64, error) {
 	if id <= 0 {
-		return errors.New("finding_id 必须为独立漏洞记录 ID；不是探索节点 ID")
+		return 0, errors.New("漏洞编号必须为正整数（finding_id 为漏洞记录编号，finding_node_id 为探索节点编号）")
 	}
-	f, err := s.m.pg.GetFinding(id)
+	ri := agent.RunInfoFrom(ctx)
+	// A session without a task has no authority to change evidence: without this
+	// gate a platform-level conversation could rewrite any finding's report or bind
+	// traffic to it. Read-only lookups (get_finding_traffic) stay available.
+	if write && ri.TaskID <= 0 {
+		return 0, errors.New("当前会话未绑定任务，不能修改漏洞报告或绑定流量证据；请在任务触发的会话中操作")
+	}
+	var findingID int64
+	var err error
+	switch kind {
+	case idNode:
+		findingID, err = s.m.pg.FindingIDByNodeIDInTask(id, ri.TaskID)
+		if err == nil && findingID == 0 {
+			return 0, fmt.Errorf("%w：节点 #%d 不是本任务的漏洞节点。请确认编号来源：finding_node_id 是探索节点编号，finding_id 是漏洞记录编号（两者不能互填）", db.ErrFindingNotFound, id)
+		}
+	case idRec:
+		findingID, err = s.m.pg.FindingIDByRecordID(id, ri.TaskID)
+		if err == nil && findingID == 0 {
+			// Name both accepted forms: the caller may simply have used the wrong
+			// parameter, and making that obvious beats sending it hunting for a third id.
+			return 0, fmt.Errorf("%w：漏洞记录 #%d 不存在。请确认编号来源：finding_id 是漏洞记录编号，finding_node_id 是探索节点编号（两者不能互填）", db.ErrFindingNotFound, id)
+		}
+	default:
+		// Legacy callers (older prompts, UI paths) still send one bare number. It is
+		// resolved as before — task-scoped when a task is known — and the ambiguity is
+		// logged in db.FindingIDForAnyIDInTask.
+		findingID, err = s.m.pg.FindingIDForAnyIDInTask(id, ri.TaskID)
+	}
 	if err != nil {
-		return err
+		return 0, err
+	}
+	if findingID == 0 {
+		return 0, fmt.Errorf("%w：finding_id=%d。请用 report_finding 返回的 finding_id 或 finding_node_id，或 list_task_findings / get_task_node_detail 里的编号", db.ErrFindingNotFound, id)
+	}
+	f, err := s.m.pg.GetFinding(findingID)
+	if err != nil {
+		return 0, err
 	}
 	if f == nil {
-		return fmt.Errorf("%w：finding_id=%d。证据工具使用独立漏洞记录 ID，请从 list_task_findings / get_task_node_detail 的 finding_id 字段读取；不要传 id / finding_node_id", db.ErrFindingNotFound, id)
+		return 0, fmt.Errorf("%w：finding_id=%d", db.ErrFindingNotFound, id)
 	}
+	// Task identity comes from the RUN, never from the tool arguments: a model could
+	// otherwise name any task and read or overwrite that task's findings.
 	if ri := agent.RunInfoFrom(ctx); ri.TaskID > 0 {
 		task := s.m.ResolveTask(strconv.FormatInt(ri.TaskID, 10))
 		if task == nil {
-			return errors.New("任务不存在")
+			return 0, errors.New("任务不存在")
 		}
 		_, inherited, allowed := findingProvenanceInTask(task, f.TaskID)
 		if !allowed {
-			return errors.New("当前任务不可读取该漏洞")
+			return 0, errors.New("当前任务不可读取该漏洞")
 		}
 		if write && inherited {
-			return errors.New("继承漏洞的流量证据只读，请到来源任务修改")
+			return 0, errors.New("继承漏洞的流量证据只读，请到来源任务修改")
 		}
 	}
-	return nil
+	return findingID, nil
+}
+
+// agentFindingTrafficAccess is the legacy entry: an id of unknown kind.
+func (s *Server) agentFindingTrafficAccess(ctx context.Context, id int64, write bool) (int64, error) {
+	return s.agentFindingTrafficAccessTyped(ctx, id, idAny, write)
 }
 
 func (s *Server) toolBindFindingTraffic() actool.CoreTool {
-	return wrTool("bind_finding_traffic", "为已登记漏洞补绑经核实的真实 HTTP 流量。finding_id 使用独立漏洞记录 ID；不要传探索节点 ID。同批引用全部成功或全部失败，重复引用不覆盖已有说明。补绑会使已有报告标记待更新；不要为补包重新探测或重复创建漏洞。",
-		objSchema(map[string]any{"finding_id": strParam("独立漏洞记录 ID，从 list_task_findings / get_task_node_detail 的 finding_id 字段读取"), "traffic_refs": agent.HintTrafficSchema()}, "finding_id", "traffic_refs"),
+	return wrTool("bind_finding_traffic", "为已登记漏洞补绑经核实的真实 HTTP 流量。漏洞编号二选一：finding_id（漏洞记录编号）或 finding_node_id（探索节点编号）；两者给哪一个就用哪一个的编号空间解析，不会互相顶替。同批引用全部成功或全部失败，重复引用不覆盖已有说明。补绑会使已有报告标记待更新；不要为补包重新探测或重复创建漏洞。",
+		objSchema(map[string]any{
+			"finding_id":      intParam("漏洞记录编号（findings.id，report_finding 返回的 finding_id）"),
+			"finding_node_id": intParam("探索节点编号（exploration_nodes.id，report_finding 返回的 finding_node_id）"),
+			"traffic_refs":    agent.HintTrafficSchema(),
+		}, "traffic_refs"),
 		func(ctx context.Context, raw json.RawMessage) (actool.Result, error) {
 			if !s.m.pg.GetBool(settingAgentTrafficBinding, false) {
 				return actool.Errorf("Agent 自动绑定流量已关闭；请在系统设置开启，或使用页面人工绑定。"), nil
 			}
 			var args struct {
-				FindingID json.RawMessage `json:"finding_id"`
-				Refs      []db.TrafficRef `json:"traffic_refs"`
+				FindingID     json.RawMessage `json:"finding_id"`
+				FindingNodeID json.RawMessage `json:"finding_node_id"`
+				Refs          []db.TrafficRef `json:"traffic_refs"`
 			}
 			if err := json.Unmarshal(raw, &args); err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			id := parseProfileID(args.FindingID)
-			if err := s.agentFindingTrafficAccess(ctx, id, true); err != nil {
+			id, err := s.resolveFindingArg(ctx, args.FindingID, args.FindingNodeID, true)
+			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
 			if len(args.Refs) == 0 {
@@ -169,4 +234,31 @@ func (s *Server) toolBindFindingTraffic() actool.CoreTool {
 			}
 			return jsonResult(trafficSummary(list))
 		})
+}
+
+// resolveFindingArg turns the two optional id arguments of an evidence tool into a
+// canonical findings.id, honouring which numbering the caller used. Supplying both
+// is refused rather than guessed: they are different numbers for the same finding,
+// so accepting both would only hide a caller bug.
+//
+// A READ that supplies only `finding_id` keeps the legacy resolution: older prompts
+// and UI paths pass the node id there, and refusing them would break reads that have
+// always worked. That path is `idAny`, so it also goes through the ambiguity warning.
+// WRITES stay strict — a misaddressed write corrupts another finding's report.
+func (s *Server) resolveFindingArg(ctx context.Context, recordID, nodeID json.RawMessage, write bool) (int64, error) {
+	rec, node := parseProfileID(recordID), parseProfileID(nodeID)
+	switch {
+	case rec > 0 && node > 0:
+		return 0, fmt.Errorf("finding_id 与 finding_node_id 只能给一个（finding_id=%d 是漏洞记录编号，finding_node_id=%d 是节点编号）", rec, node)
+	case node > 0:
+		return s.agentFindingTrafficAccessTyped(ctx, node, idNode, write)
+	case rec > 0:
+		kind := idRec
+		if !write {
+			kind = idAny
+		}
+		return s.agentFindingTrafficAccessTyped(ctx, rec, kind, write)
+	default:
+		return 0, errors.New("必须提供 finding_id 或 finding_node_id")
+	}
 }

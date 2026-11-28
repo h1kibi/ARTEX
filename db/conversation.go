@@ -50,14 +50,17 @@ GROUP BY c.id`)
 // Conversation is one ChatGPT-style chat thread bound to an agent key. It lives
 // independent of the pentest exploration graph — see schema.sql §I.
 type Conversation struct {
-	ID           int64      `json:"id"`
-	AgentKey     string     `json:"agent_key"`
-	Title        string     `json:"title"`
-	LLMProfileID *int64     `json:"llm_profile_id,omitempty"`
-	Pinned       bool       `json:"pinned"`
-	PinnedAt     *time.Time `json:"pinned_at,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	ID           int64  `json:"id"`
+	AgentKey     string `json:"agent_key"`
+	Title        string `json:"title"`
+	LLMProfileID *int64 `json:"llm_profile_id,omitempty"`
+	// TaskID is the trusted task scope of this conversation (a trigger fire runs on
+	// behalf of one task). NULL = no task authorization.
+	TaskID    *int64     `json:"task_id,omitempty"`
+	Pinned    bool       `json:"pinned"`
+	PinnedAt  *time.Time `json:"pinned_at,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+	UpdatedAt time.Time  `json:"updated_at"`
 }
 
 // ConversationPatch updates only the fields whose pointers are non-nil.
@@ -66,12 +69,17 @@ type ConversationPatch struct {
 	Pinned *bool
 }
 
-const convCols = `id, agent_key, title, llm_profile_id, pinned_at, created_at, updated_at`
+const convCols = `id, agent_key, title, llm_profile_id, task_id, pinned_at, created_at, updated_at`
 
 func scanConv(row interface{ Scan(...any) error }) (Conversation, error) {
 	var c Conversation
 	var pinnedAt sql.NullTime
-	err := row.Scan(&c.ID, &c.AgentKey, &c.Title, &c.LLMProfileID, &pinnedAt, &c.CreatedAt, &c.UpdatedAt)
+	var taskID sql.NullInt64
+	err := row.Scan(&c.ID, &c.AgentKey, &c.Title, &c.LLMProfileID, &taskID, &pinnedAt, &c.CreatedAt, &c.UpdatedAt)
+	if taskID.Valid {
+		v := taskID.Int64
+		c.TaskID = &v
+	}
 	if pinnedAt.Valid {
 		c.Pinned = true
 		c.PinnedAt = &pinnedAt.Time
@@ -324,4 +332,12 @@ func (d *DB) ConvActivityDetail(convID, id int64) (string, error) {
 		return "", nil
 	}
 	return s.String, err
+}
+
+// SetConversationTaskScope records (or clears) the conversation's trusted task scope.
+// Trigger conversations set it once at creation; clearing it means "no task
+// authorization", which the evidence tools treat as fail-closed.
+func (d *DB) SetConversationTaskScope(id int64, taskID *int64) error {
+	_, err := d.Exec(`UPDATE conversations SET task_id=$2 WHERE id=$1`, id, taskID)
+	return err
 }

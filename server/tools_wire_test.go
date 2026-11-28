@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"testing"
 
-	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	actool "github.com/Autumn-27/norma/tool"
 )
 
 func names(tools []actool.CoreTool) map[string]actool.CoreTool {
@@ -32,7 +32,7 @@ func TestWireTools(t *testing.T) {
 	}
 	t.Cleanup(func() { pg.Close() })
 
-	wireTools(pg, nil) // nil domainReg: test only covers filter/decoration, not injection
+	wireTools(pg, nil, nil) // nil domainReg: test only covers filter/decoration, not injection
 	t.Cleanup(func() { agent.ToolResolve = nil })
 	// Prevent interactive-shell Bash decoration: if the worker agent has
 	// interactive_shell=true in the DB, ToolResolve would append a note to
@@ -56,13 +56,13 @@ func TestWireTools(t *testing.T) {
 	if _, ok := worker["record_fact"]; !ok {
 		t.Error("worker lost record_fact")
 	}
-	// SDK generic tools aren't seeded → ToolResolve passes them through unchanged
-	// (same object, original description — not decorated). No startup prune touches
+	// SDK generic tools aren't seeded → ToolResolve passes them through; Bash still
+	// carries the host shell dialect note every agent gets. No startup prune touches
 	// non-catalog rows, so future user-defined custom tools survive too.
 	if bash, ok := worker["Bash"]; !ok {
 		t.Error("worker lost Bash (should pass through)")
-	} else if bash.Description() != actool.NewBash().Description() {
-		t.Error("Bash should pass through undecorated, but description changed")
+	} else if want := actool.NewBash().Description() + actool.ShellDialectNote(wslDialectActive()); bash.Description() != want {
+		t.Errorf("Bash description lost the host dialect note: got %q want %q", bash.Description(), want)
 	}
 	// planner is not bound to record_fact → resolving a base that contains it drops it.
 	planner := names(agent.ToolResolve(ctx, "planner", base))

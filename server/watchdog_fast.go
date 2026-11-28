@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -62,8 +63,12 @@ type cycleDecision struct {
 // decideCycle implements the autonomy budget table. autoUsed is the number of
 // green-light advances already consumed by this run; cycleNo remains the current
 // cycle label for user-default rules and audit messages.
+//
+// maxAutoCycles < 0 means "unset" → the historical default of 1. 0 is a real
+// value: effort=probe grants no autonomous cycle, so the first green judgment
+// must go to the user instead of silently advancing the run.
 func decideCycle(cycleNo, autoUsed, maxAutoCycles int, signal cycleSignal, answer cycleAnswer) cycleDecision {
-	if maxAutoCycles < 1 {
+	if maxAutoCycles < 0 {
 		maxAutoCycles = 1
 	}
 	if maxAutoCycles > 4 {
@@ -131,8 +136,7 @@ func newWatchdogFast(s *Server, monitor *RunMonitor) *watchdogFast {
 	return &watchdogFast{s: s, monitor: monitor, now: time.Now}
 }
 
-// routeBudgetExceeded compares the current route usage (previous checkpoints +
-// this run) against the intent's declared budget. Zero means unlimited.
+// candidateSnapshot distills a finding_candidate for the Slow Path.
 func candidateSnapshot(n *db.Node, p db.FactPayload) map[string]any {
 	m := map[string]any{
 		"id": n.ID, "summary": p.Summary, "route_id": p.RouteID,
@@ -145,33 +149,6 @@ func candidateSnapshot(n *db.Node, p db.FactPayload) map[string]any {
 		m["evidence_refs"] = p.EvidenceRefs
 	}
 	return m
-}
-
-func routeBudgetExceeded(snap RunSnapshot, now time.Time) (string, bool) {
-	b := snap.RouteBudget
-	if b.Empty() {
-		return "", false
-	}
-	usedCalls := snap.RouteUsedBase.ToolCalls + snap.ToolCalls
-	usedInput := snap.RouteUsedBase.InputTokens + snap.InputTokens
-	started := snap.StartedAt
-	if started.IsZero() {
-		started = snap.HeartbeatAt
-	}
-	usedWall := snap.RouteUsedBase.WallMS
-	if !started.IsZero() {
-		usedWall += now.Sub(started).Milliseconds()
-	}
-	switch {
-	case b.MaxToolCalls > 0 && usedCalls >= b.MaxToolCalls:
-		return fmt.Sprintf("路线 #%d 工具调用预算耗尽（%d/%d）", snap.RouteID, usedCalls, b.MaxToolCalls), true
-	case b.MaxInputTokens > 0 && usedInput >= b.MaxInputTokens:
-		return fmt.Sprintf("路线 #%d 输入 token 预算耗尽（%d/%d）", snap.RouteID, usedInput, b.MaxInputTokens), true
-	case b.MaxWallSeconds > 0 && usedWall >= int64(b.MaxWallSeconds)*1000:
-		return fmt.Sprintf("路线 #%d 墙钟预算耗尽（%ds/%ds）", snap.RouteID, usedWall/1000, b.MaxWallSeconds), true
-	default:
-		return "", false
-	}
 }
 
 // Tick runs once per 5 seconds. Flush happens even while the watchdog is
@@ -200,14 +177,6 @@ func (f *watchdogFast) Tick(ctx context.Context) {
 		// 审批等待与供应商错误不属于停滞：一个在等人，一个由模型链处理。
 		if snap.Phase == db.WorkerRunPhaseApproval || snap.Phase == db.WorkerRunPhasePaused ||
 			snap.Phase == db.WorkerRunPhaseSettling {
-			continue
-		}
-		if reason, exceeded := routeBudgetExceeded(snap, now); exceeded {
-			// A route budget is a fixed control input, not a semantic judgment.
-			// Settle the run (the Worker keeps its wrap-up rounds and writes a
-			// checkpoint), then the Planner can continue the route with a new
-			// intent; the cumulative budget is not refreshed.
-			f.terminateAsync(ctx, snap, reason, "exhausted")
 			continue
 		}
 		cycleStart := snap.CycleStart
@@ -276,6 +245,20 @@ func (f *watchdogFast) refreshUnavailableCard(ctx context.Context, taskID string
 	_ = f.s.m.pg.RefreshOpenWatchdogUnavailable(ctx, taskID, count, first, last, card.NextRetryAt)
 }
 
+// pollingStallSignal applies the zero-polling gate: a cycle in which the worker
+// only produced normalized wait actions (repeated sleep / slot_poll / log tail)
+// made no progress at all, so it must not get a green cycle. A slow-path verdict
+// for this cycle still wins; a human-owned route asks instead of terminating.
+func pollingStallSignal(snap RunSnapshot, signal cycleSignal) cycleSignal {
+	if signal != cycleSignalNone || snap.PollingRepeats < 2 || snap.SlowPathCycle == snap.CycleNo {
+		return signal
+	}
+	if snap.HumanInvolved {
+		return cycleSignalAsk
+	}
+	return cycleSignalTerminate
+}
+
 // processCycle reads the current card and Slow Path result, applies the pure
 // cycle table, then performs exactly one action.
 func (f *watchdogFast) processCycle(ctx context.Context, t *Task, snap RunSnapshot, cfg watchdogConfig) {
@@ -319,6 +302,7 @@ func (f *watchdogFast) processCycle(ctx context.Context, t *Task, snap RunSnapsh
 			return
 		}
 	}
+	signal = pollingStallSignal(snap, signal)
 	if signal == cycleSignalAsk && answer == cycleAnswerNone && ask == nil {
 		// Slow Path 要求用户判断但卡片完全未创建（例如创建失败/服务重启）。
 		// 在边界补一张卡，给它一个完整周期，而不是把"没有请求"当成静默终止。
@@ -332,7 +316,24 @@ func (f *watchdogFast) processCycle(ctx context.Context, t *Task, snap RunSnapsh
 		// consents to C1, C1+ defaults to termination. Fall through and apply it
 		// instead of leaving the Worker alive until the next tick.
 	}
-	decision := decideCycle(snap.CycleNo, snap.AutoCyclesUsed, cfg.MaxAutoCycles, signal, answer)
+	maxAuto := cfg.MaxAutoCycles
+	if snap.HasEffortMaxAutoCycles {
+		// effort 档位（probe=0 / standard=1 / deep=2）覆盖全局默认：全局值是没标档位
+		// 时的兜底，不是对所有 run 的统一上限。0 是有效值（probe 首个周期结束即交接）。
+		maxAuto = snap.EffortMaxAutoCycles
+	}
+	decision := decideCycle(snap.CycleNo, snap.AutoCyclesUsed, maxAuto, signal, answer)
+	// 人工意志高于自治止损（Human Override Invariant）：origin="human" 或曾有人工
+	// 消息/人工"继续"的路线，到达周期边界且无突破时不再静默强杀，转 ask_user 卡片
+	// 等人裁决。但【用户显式点了 "stop"】必须照常终止——那是人工意志本身，不是自治
+	// 止损；把显式拒绝覆盖回请求会让路线永远停不下来。
+	if decision.Action == cycleActionTerminate && snap.HumanInvolved && answer != cycleAnswerNo {
+		decision = cycleDecision{
+			Action: cycleActionRequest, NextCycle: snap.CycleNo + 1,
+			RequestKind: db.WatchdogRequestAsk, DefaultRule: "human_involved_no_silent_kill",
+			Reason: "人工介入路线：周期边界无突破，转待确认卡片（不静默强杀）",
+		}
+	}
 	switch decision.Action {
 	case cycleActionNext:
 		if ask != nil && ask.Status == db.WatchdogRequestOpen {
@@ -358,6 +359,16 @@ func (f *watchdogFast) processCycle(ctx context.Context, t *Task, snap RunSnapsh
 		// C2/C3+ green light needs a user card. The unavailable default card or a
 		// database write failure prevented it; terminate at this boundary rather
 		// than loop forever without a decision.
+		// A human-owned run must not be terminated just because the card could not be
+		// created: the point of the card is to ask the operator, and killing the run
+		// instead is the silent stop the Human Override Invariant forbids. The next
+		// tick retries card creation.
+		if snap.HumanInvolved || (f.monitor != nil && f.monitor.HumanInvolvedRun(snap.RunID)) {
+			f.s.emitWatchdogActivity(t, "watchdog_cycle",
+				fmt.Sprintf("意图 #%d 周期边界：人工介入路线，判断卡创建失败，下个周期重试", snap.IntentID),
+				"人工介入路线不做静默终止", watchdogAudit{CycleNo: snap.CycleNo, Phase: snap.Phase})
+			return
+		}
 		reason := "Watchdog Agent 不可用，无法创建用户请求；按周期规则终止"
 		if result == askCreateFailed {
 			reason = "创建用户判断卡失败；按周期规则终止"
@@ -379,13 +390,16 @@ func (f *watchdogFast) processCycle(ctx context.Context, t *Task, snap RunSnapsh
 			}
 		}
 		reason := decision.Reason
+		if snap.PollingRepeats >= 2 {
+			reason = fmt.Sprintf("连续 %d 次轮询/空等动作（sleep 或等待其他 worker 放槽），本周期零实质推进", snap.PollingRepeats)
+		}
 		if snap.SlowPathClass == "terminate" && snap.SlowPathSummary != "" {
 			reason = "慢速判断：" + snap.SlowPathSummary
 			if snap.ProviderError == "" && len(snap.SlowPathEvidence) > 0 {
 				reason += "（" + snap.SlowPathEvidence[0] + "）"
 			}
 		}
-		f.terminateAsync(ctx, snap, reason, decision.TerminalState)
+		f.terminateAsyncFrom(ctx, snap, reason, decision.TerminalState, answer == cycleAnswerNo)
 	}
 }
 
@@ -496,23 +510,44 @@ func (f *watchdogFast) createAsk(ctx context.Context, t *Task, snap RunSnapshot,
 // is in flight at a time; a later cycle retries after it returns. ctx should be
 // the long-lived server/service root so shutdown still bounds the attempt.
 func (f *watchdogFast) terminateAsync(ctx context.Context, snap RunSnapshot, reason, terminalState string) {
+	f.terminateAsyncFrom(ctx, snap, reason, terminalState, false)
+}
+
+// terminateAsyncFrom is terminateAsync with the caller's authority: humanStop means
+// the operator explicitly answered "stop", which must terminate regardless of any
+// human-involvement flag (that IS the human's will, not an autonomous judgement).
+func (f *watchdogFast) terminateAsyncFrom(ctx context.Context, snap RunSnapshot, reason, terminalState string, humanStop bool) {
 	if _, loaded := f.terminating.LoadOrStore(snap.RunID, struct{}{}); loaded {
 		return
 	}
 	go func() {
 		defer f.terminating.Delete(snap.RunID)
-		if _, err := f.terminate(ctx, snap, reason, terminalState); err != nil {
+		if _, err := f.terminate(ctx, snap, reason, terminalState, humanStop); err != nil {
 			log.Printf("[watchdog] task %s 意图 #%d 周期终止未生效: %v", snap.TaskID, snap.IntentID, err)
 		}
 	}()
 }
 
-// terminate is the only place Fast Path cancels a worker. The Engine validates
-// the run id and waits until runIntent has committed the final state.
-func (f *watchdogFast) terminate(ctx context.Context, snap RunSnapshot, reason, terminalState string) (TerminationResult, error) {
+// terminate is the only place Fast Path cancels a worker. The Engine validates the
+// run id, re-checks the LIVE human-ownership flag under its own work lock, and waits
+// until runIntent has committed the final state.
+//
+// The ownership decision is deliberately left to the Engine (TerminateWorkGuarded):
+// a check here is a separate synchronization point from the commit, so a human steer
+// landing in between would still be killed. The only thing this layer adds is the
+// visible audit line when the Engine refuses.
+func (f *watchdogFast) terminate(ctx context.Context, snap RunSnapshot, reason, terminalState string, humanStop bool) (TerminationResult, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, watchdogSettlementWait+workControlWaitTimeout+5*time.Second)
 	defer cancel()
-	result, err := f.s.engine.TerminateWorkForCycle(waitCtx, snap.IntentID, snap.RunID, reason, terminalState, snap.CycleNo)
+	result, err := f.s.engine.TerminateWorkGuarded(waitCtx, snap.IntentID, snap.RunID, reason, terminalState, snap.CycleNo, humanStop)
+	if err != nil && !humanStop && errors.Is(err, errWatchdogRunMismatch) && f.monitor != nil && f.monitor.HumanInvolvedRun(snap.RunID) {
+		if t, ok := f.s.m.Task(snap.TaskID); ok {
+			f.s.emitWatchdogActivity(t, "watchdog_cycle",
+				fmt.Sprintf("意图 #%d 周期终止已取消：运行已转为人工介入", snap.IntentID),
+				"人工介入状态在终止提交时生效，本次改为等待人工裁决", watchdogAudit{CycleNo: snap.CycleNo, Phase: snap.Phase})
+		}
+		return result, err
+	}
 	if err != nil {
 		return result, err
 	}
@@ -531,6 +566,9 @@ func (s *Server) watchdogContinueCycle(t *Task, snap RunSnapshot, reason string)
 	if current == nil || current.State != db.WorkerRunStateRunning || current.CycleNo != snap.CycleNo {
 		return fmt.Errorf("该运行或周期已结束")
 	}
+	// The operator just took ownership of this run by answering "continue". From
+	// here it must not be silently terminated at a later boundary.
+	s.watchdog.monitor.SetHumanInvolved(snap.RunID, true)
 	s.watchdog.fast.advanceCycle(t, *current, snap.CycleNo+1, reason, false)
 	return nil
 }
@@ -544,7 +582,9 @@ func (s *Server) watchdogTerminateCycle(t *Task, snap RunSnapshot, reason, termi
 	if current == nil || current.State != db.WorkerRunStateRunning || current.CycleNo != snap.CycleNo {
 		return TerminationResult{}, fmt.Errorf("该运行或周期已结束")
 	}
-	return s.watchdog.fast.terminate(s.ctx, *current, reason, terminalState)
+	// An explicit operator "stop" is human authority, not an autonomous judgement,
+	// so it must terminate even on a run the same operator is otherwise steering.
+	return s.watchdog.fast.terminate(s.ctx, *current, reason, terminalState, true)
 }
 
 // buildWatchdogSnapshot captures bounded evidence for the Slow Path. Details are
@@ -640,6 +680,7 @@ func (s *Server) buildWatchdogSnapshot(t *Task, snap RunSnapshot) (json.RawMessa
 		"facts": snap.Facts, "assets": snap.Assets, "findings": snap.Findings,
 		"tool_calls": snap.ToolCalls, "input_tokens": snap.InputTokens,
 		"output_tokens": snap.OutputTokens, "duplicate_actions": snap.DuplicateActions,
+		"polling_repeats": snap.PollingRepeats,
 		"progress_events": snap.ProgressEvents,
 		"recent_steps":    steps,
 	}

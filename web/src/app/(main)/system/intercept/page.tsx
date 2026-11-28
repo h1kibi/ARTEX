@@ -111,6 +111,7 @@ function sdkTool(key: string, description: string): Tool {
 const SDK_EXEC: Tool[] = [
   sdkTool("Bash",        "在 shell 中执行命令"),
   sdkTool("WebFetch",    "发起 HTTP/HTTPS 请求（含代理支持）"),
+  sdkTool("http_request", "发起单次 HTTP/HTTPS 请求（含会话 Cookie 与代理支持）"),
   sdkTool("web_search",  "网络搜索"),
   sdkTool("shell_open",  "开启持久 PTY 交互会话"),
   sdkTool("shell_send",  "向交互会话发送输入"),

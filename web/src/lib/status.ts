@@ -76,6 +76,12 @@ const finding: Record<string, StatusMeta> = {
   risk_accepted: { label: "风险接受", tone: "violet" },
 };
 
+// 自动分诊结论，与人工处置的 finding 状态分开展示。
+const triage: Record<string, StatusMeta> = {
+  verifying: { label: "复核中", tone: "blue" },
+  rejected: { label: "未通过", tone: "slate" },
+};
+
 const engine: Record<string, StatusMeta> = {
   exploring: { label: "探索中", tone: "blue" },
   paused: { label: "已暂停", tone: "amber" },
@@ -100,6 +106,13 @@ const route: Record<string, StatusMeta> = {
   exhausted: { label: "预算耗尽", tone: "violet" },
   stopped: { label: "已停止", tone: "slate" },
   superseded: { label: "已被取代", tone: "slate" },
+};
+
+// 路线自治调度状态：区分正常轮转、连续空跑挂起、冷却让位。
+const routeAutonomy: Record<string, StatusMeta> = {
+  active: { label: "正常轮转", tone: "blue" },
+  suspended_dry: { label: "连续空跑挂起", tone: "amber" },
+  parked_stagnant: { label: "冷却让位", tone: "violet" },
 };
 
 const audit: Record<string, StatusMeta> = {
@@ -128,9 +141,11 @@ const maps = {
   task,
   severity,
   finding,
+  triage,
   engine,
   goal,
   route,
+  routeAutonomy,
   audit,
   node,
   delivery,

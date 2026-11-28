@@ -217,14 +217,31 @@ func (d *DB) FinishFindingRetest(id int64, status, reason string) error {
 	}
 	defer tx.Rollback()
 	// Lock the finding before the retest, matching creation and cascading deletion.
+	// The snapshot records the evidence version the run started from: a retest may
+	// finish after the finding's evidence changed, and its verdict then judged
+	// evidence that no longer exists.
 	var findingID int64
-	err = tx.QueryRow(`SELECT f.id FROM findings f WHERE f.id=(SELECT finding_id FROM finding_retests WHERE id=$1) FOR UPDATE OF f`, id).Scan(&findingID)
+	var snapshot []byte
+	err = tx.QueryRow(`SELECT f.id, COALESCE(r.snapshot,'{}'::jsonb)
+FROM finding_retests r JOIN findings f ON f.id=r.finding_id
+WHERE r.id=$1 FOR UPDATE OF f`, id).Scan(&findingID, &snapshot)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil // Finding/retest already deleted.
 	}
 	if err != nil {
 		return err
 	}
+	// Missing evidence_version in an old snapshot counts as 0, which only matches a
+	// finding whose evidence has never been versioned.
+	var snap struct {
+		Finding struct {
+			EvidenceVersion int64 `json:"evidence_version"`
+		} `json:"finding"`
+	}
+	if err := json.Unmarshal(snapshot, &snap); err != nil {
+		return err
+	}
+	snapshotVersion := snap.Finding.EvidenceVersion
 	var finalStatus, verdict string
 	err = tx.QueryRow(`UPDATE finding_retests SET
 	status=CASE WHEN $2='completed' AND verdict='' THEN 'failed' ELSE $2 END,
@@ -236,6 +253,38 @@ func (d *DB) FinishFindingRetest(id int64, status, reason string) error {
 	if err != nil {
 		return err
 	}
+	if finalStatus == "completed" && (verdict == "reproduced" || verdict == "fixed") {
+		// A completed reproduction (still vulnerable, or verified-then-fixed) is
+		// exactly the corroboration the Auto-Triager was waiting for: promote the
+		// finding so it can prove goals. "inconclusive" deliberately does NOT —
+		// the evidence still has not been settled. Same tx as the verdict, so a
+		// half-applied state cannot happen.
+		// Bind the confirmation to the evidence version the retest actually judged.
+		// Without this the old triage_evidence_version stays behind, and once any
+		// evidence change bumps the version, a fresh successful reproduction would
+		// still be rejected by the goal-proof gate as "confirmation is stale".
+		var currentVersion int64
+		if err := tx.QueryRow(`SELECT evidence_version FROM findings WHERE id=$1`, findingID).Scan(&currentVersion); err != nil {
+			return err
+		}
+		// The run started from a snapshot; if the evidence changed while it ran, the
+		// verdict judged evidence nobody can read anymore. Confirming then would bind
+		// the finding to a version the retester never saw.
+		if currentVersion == snapshotVersion {
+			if _, err := tx.Exec(`UPDATE findings
+SET triage_state='confirmed', triage_evidence_version=evidence_version
+WHERE id=$1`, findingID); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`UPDATE exploration_nodes n SET payload = jsonb_set(
+        jsonb_set(n.payload, '{triage_state}', to_jsonb('confirmed'::text), true),
+        '{triage_evidence_version}', to_jsonb(f.evidence_version), true)
+FROM findings f
+WHERE f.id=$1 AND n.id = f.node_id AND n.kind='finding'`, findingID); err != nil {
+				return err
+			}
+		}
+	}
 	if finalStatus == "completed" && verdict == "fixed" {
 		// 走带通知的版本，与人工在详情页改状态共用同一套语义。
 		//
@@ -246,7 +295,7 @@ func (d *DB) FinishFindingRetest(id int64, status, reason string) error {
 		// 用 context.Background()：本函数整条都是无 ctx 的旧风格（d.Begin()/
 		// tx.QueryRow/tx.Exec），没有可传递的取消信号，硬加一个 ctx 参数会
 		// 牵动 server 侧调用点与多处测试，超出本次改动的范围。
-		if _, _, _, _, err := SetFindingStatusTx(context.Background(), tx, findingID, FindingFixed); err != nil {
+		if _, _, _, _, err := setFindingStatusTx(context.Background(), tx, findingID, FindingFixed, false); err != nil {
 			return err
 		}
 	}

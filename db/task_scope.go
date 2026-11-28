@@ -127,7 +127,14 @@ func (s *AssetStore) AddAutoScope(taskID int64, assetType, domain, rawURL, ip st
 		if host != "" && net.ParseIP(host) == nil {
 			return s.upsertTaskScope(TaskScope{TaskID: taskID, Kind: "subdomain", Domain: host})
 		}
-		// IP-literal host or no host → fall back to ip scope if we have one.
+		// IP-literal host: the address in the URL IS the target, so scope it directly
+		// even when the caller never filled the ip field (a bare 10.0.0.5:8080 URL).
+		if hostIP := ipLiteralHost(host); hostIP != "" {
+			if c := ipToHostCIDR(hostIP); c != "" {
+				return s.upsertTaskScope(TaskScope{TaskID: taskID, Kind: "ip", Net: c})
+			}
+		}
+		// No host at all → fall back to ip scope if we have one.
 		if c := ipToHostCIDR(ip); c != "" {
 			return s.upsertTaskScope(TaskScope{TaskID: taskID, Kind: "ip", Net: c})
 		}
@@ -309,7 +316,13 @@ target AS (
        (ts.kind='company'     AND a.company_id = ts.company_id)
     OR (ts.kind='root_domain' AND a.root_domain = ts.domain)
     OR (ts.kind='subdomain'   AND a.domain = ts.domain)
-    OR (ts.kind IN ('ip','cidr') AND ts.net >>= try_inet(a.ip))
+    OR (ts.kind IN ('ip','cidr') AND (ts.net >>= try_inet(a.ip) OR ts.net >>= try_inet(a.domain)))
+    OR (ts.kind='keyword' AND (
+         strpos(lower(COALESCE(a.domain,'')), lower(ts.value)) > 0
+         OR strpos(lower(COALESCE(a.url,'')), lower(ts.value)) > 0
+         OR strpos(lower(COALESCE(a.app_name,'')), lower(ts.value)) > 0
+         OR strpos(lower(COALESCE(a.service_name,'')), lower(ts.value)) > 0
+       ))
     OR (ts.kind='icp' AND (
          lower(regexp_replace(COALESCE(a.icp,''), '[[:space:]]+', '', 'g')) = ts.value
          OR lower(regexp_replace(COALESCE(a.app_icp,''), '[[:space:]]+', '', 'g')) = ts.value

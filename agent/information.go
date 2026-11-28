@@ -31,8 +31,7 @@ var progressEvents = map[string]bool{
 func IsHighValueProgress(event string) bool {
 	switch event {
 	case "validated_weakness", "credential_obtained", "privilege_change",
-		"lateral_progress", "objective_milestone", "finding_written",
-		"cleanup_completed":
+		"lateral_progress", "objective_milestone", "finding_written":
 		return true
 	default:
 		return false
@@ -53,7 +52,7 @@ func (t *ToolSet) normalizeFactInput(ctx context.Context, it factItem, defaultIn
 	}
 	factType := strings.ToLower(strings.TrimSpace(it.FactType))
 	if factType == "" {
-		return nil, 0, fmt.Errorf("fact_type 必填：%s（历史节点由系统读为 legacy_unknown，新节点不能写它）", factTypeList())
+		factType = db.FactTypeObservation
 	}
 	if !db.IsWritableFactType(factType) {
 		return nil, 0, fmt.Errorf("不支持的 fact_type %q；可用类型：%s", factType, factTypeList())
@@ -63,36 +62,83 @@ func (t *ToolSet) normalizeFactInput(ctx context.Context, it factItem, defaultIn
 		intentID = defaultIntent
 	}
 	var intentNode *db.Node
-	if intentID > 0 {
-		n, err := t.ts.GetNode(intentID)
-		if err != nil {
-			return nil, 0, err
+	resolveIntent := func(id int64) bool {
+		if id <= 0 {
+			return false
 		}
-		if n == nil || n.Kind != db.KindIntent {
-			return nil, 0, fmt.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）")
+		n, err := t.ts.GetNode(id)
+		if err != nil || n == nil || n.Kind != db.KindIntent {
+			return false
 		}
+		intentID = id
 		intentNode = n
+		return true
+	}
+	if !resolveIntent(intentID) && intentID > 0 && pid(it.IntentID) > 0 {
+		return nil, 0, fmt.Errorf("intent_id 必须是本任务的意图（关联任务意图只读）")
+	}
+	if intentNode == nil && t.ownerNode > 0 {
+		resolveIntent(t.ownerNode)
+	}
+	runInfo := RunInfoFrom(ctx)
+	if intentNode == nil {
+		resolveIntent(runInfo.IntentID)
+	}
+	if intentNode == nil {
+		intentID = 0
 	}
 	routeID := int64(0)
 	if intentNode != nil {
 		routeID = db.ParseIntentRoute(intentNode).RouteID
 	}
-	runInfo := RunInfoFrom(ctx)
 
-	evidenceRefs, err := db.NormalizeEvidenceRefs(it.EvidenceRefs)
+	evidenceRefs, err := db.NormalizeEvidenceRefs(t.normalizeEvidenceRefPaths(it.EvidenceRefs))
 	if err != nil {
 		return nil, 0, err
 	}
+	sourceIDs := pidList(it.SourceActivityIDs)
+	observationIDs := pidList(it.ObservationIDs)
+	claimIDs := pidList(it.ClaimIDs)
+	hypothesisIDs := pidList(it.HypothesisIDs)
+	validationActions := trimmedStrings(it.ValidationActions)
+	nextActions := trimmedStrings(it.NextActions)
+
+	confidence := strings.TrimSpace(it.Confidence)
+	if factType == db.FactTypeClaim {
+		if confidence == "" {
+			confidence = "inferred"
+		}
+		if confidence != "observed" && confidence != "inferred" {
+			return nil, 0, fmt.Errorf("confidence 只能是 observed 或 inferred")
+		}
+	}
+	if factType == db.FactTypeHypothesis && len(validationActions) == 0 {
+		if len(nextActions) > 0 {
+			validationActions = append(validationActions, nextActions...)
+		} else if len(sourceIDs)+len(evidenceRefs)+len(observationIDs)+len(claimIDs) > 0 {
+			// No validation step and no next action: the claim is an observation of
+			// what was seen, not a testable hypothesis. Keep the knowledge instead of
+			// rejecting the write; claim-only provenance becomes node refs.
+			if len(sourceIDs) == 0 && len(evidenceRefs) == 0 && len(observationIDs) == 0 {
+				for _, id := range claimIDs {
+					evidenceRefs = append(evidenceRefs, "node:"+itoa64(id))
+				}
+				var err error
+				evidenceRefs, err = db.NormalizeEvidenceRefs(evidenceRefs)
+				if err != nil {
+					return nil, 0, err
+				}
+			}
+			factType = db.FactTypeObservation
+		}
+	}
+
 	for _, ref := range evidenceRefs {
 		parsed, _ := db.ParseEvidenceRef(ref)
 		if err := t.validateEvidenceRef(ctx, parsed); err != nil {
 			return nil, 0, err
 		}
 	}
-	sourceIDs := pidList(it.SourceActivityIDs)
-	observationIDs := pidList(it.ObservationIDs)
-	claimIDs := pidList(it.ClaimIDs)
-	hypothesisIDs := pidList(it.HypothesisIDs)
 
 	// A worker records a conclusion about the tool result it just saw. When the
 	// model omits explicit provenance, attach the newest tool_result for this
@@ -127,8 +173,6 @@ func (t *ToolSet) normalizeFactInput(ctx context.Context, it factItem, defaultIn
 		return nil, 0, err
 	}
 
-	validationActions := trimmedStrings(it.ValidationActions)
-	nextActions := trimmedStrings(it.NextActions)
 	progressEvent := strings.TrimSpace(it.ProgressEvent)
 	if progressEvent != "" && !progressEvents[progressEvent] {
 		return nil, 0, fmt.Errorf("未知 progress_event %q", progressEvent)
@@ -161,8 +205,8 @@ func (t *ToolSet) normalizeFactInput(ctx context.Context, it factItem, defaultIn
 	if e := strings.TrimSpace(it.Evidence); e != "" {
 		payload["evidence"] = e
 	}
-	if c := strings.TrimSpace(it.Confidence); c != "" {
-		payload["confidence"] = c
+	if confidence != "" {
+		payload["confidence"] = confidence
 	}
 	if len(evidenceRefs) > 0 {
 		payload["evidence_refs"] = evidenceRefs
@@ -201,6 +245,11 @@ func (t *ToolSet) normalizeFactInput(ctx context.Context, it factItem, defaultIn
 	if progressEvent != "" {
 		payload["progress_event"] = progressEvent
 	}
+	if it.NeedHuman {
+		// Recorded so the hand-off survives a restart and is visible to the planner
+		// and the human, not only to the in-memory WriteCounts of this run.
+		payload["need_human"] = true
+	}
 	if routeID > 0 {
 		payload["route_id"] = routeID
 	}
@@ -217,13 +266,8 @@ func (t *ToolSet) normalizeFactInput(ctx context.Context, it factItem, defaultIn
 			return nil, 0, fmt.Errorf("observation 必须带 source_activity_ids 或 evidence_refs（traffic:<id>/artifact:<path>）；模型文字本身不能作为观察来源")
 		}
 	case db.FactTypeClaim:
-		if len(sourceIDs) == 0 && len(evidenceRefs) == 0 && len(observationIDs) == 0 {
-			return nil, 0, fmt.Errorf("claim 必须引用 observation（observation_ids）或 evidence_refs / source_activity_ids")
-		}
-		if c := strings.TrimSpace(it.Confidence); c == "" {
-			return nil, 0, fmt.Errorf("claim 必须标注 confidence（observed|inferred）")
-		} else if c != "observed" && c != "inferred" {
-			return nil, 0, fmt.Errorf("confidence 只能是 observed 或 inferred")
+		if len(sourceIDs) == 0 && len(evidenceRefs) == 0 && len(observationIDs) == 0 && len(claimIDs) == 0 {
+			return nil, 0, fmt.Errorf("claim 必须引用 observation（observation_ids）、claim（claim_ids）或 evidence_refs / source_activity_ids")
 		}
 	case db.FactTypeHypothesis:
 		if len(validationActions) == 0 {
@@ -309,6 +353,19 @@ func (t *ToolSet) validateProofAnchor(n *db.Node) error {
 		if n.State != "confirmed" {
 			return fmt.Errorf("漏洞节点 #%d 状态为 %q，只有 confirmed 漏洞能作为已确认证据", n.ID, n.State)
 		}
+		// Auto-Triager: a finding whose evidence was never corroborated (text only,
+		// state verifying) is stored, but it must not be able to prove a goal —
+		// otherwise an unverified guess still ends the task.
+		if ts := FindingTriageState(n); ts == TriageVerifying || ts == TriageRejected {
+			return fmt.Errorf("漏洞节点 #%d 分诊状态为 %q：证据尚未核实（无绑定流量/带外回调），不能作为证明目标的已确认证据", n.ID, ts)
+		}
+		// A version-bound confirmation only certifies the evidence it judged. If the
+		// evidence moved on (proof traffic removed, a new binding added), the old
+		// confirmed verdict must not keep proving a goal the current evidence no longer
+		// supports. triage_evidence_version = 0 means unbound (legacy / human verdict).
+		if stale := staleTriageVersion(n); stale != "" {
+			return fmt.Errorf("漏洞节点 #%d %s：漏洞证据已变更，请重新核验后再用作证明", n.ID, stale)
+		}
 		return nil
 	}
 	if n.Kind != db.KindFact {
@@ -329,6 +386,26 @@ func (t *ToolSet) validateProofAnchor(n *db.Node) error {
 		}
 	}
 	return nil
+}
+
+// FindingTriageState reads a finding node's Auto-Triager state. Missing/empty =
+// confirmed, so every pre-existing finding keeps proving goals.
+func FindingTriageState(n *db.Node) string {
+	if n == nil || n.Kind != db.KindFinding || len(n.Payload) == 0 {
+		return TriageConfirmed
+	}
+	var p struct {
+		TriageState string `json:"triage_state"`
+	}
+	if err := json.Unmarshal(n.Payload, &p); err != nil {
+		return TriageConfirmed
+	}
+	switch st := strings.ToLower(strings.TrimSpace(p.TriageState)); st {
+	case "":
+		return TriageConfirmed
+	default:
+		return st
+	}
 }
 
 // validateIntentAnchor is the looser lineage boundary used by add_intent:
@@ -418,6 +495,57 @@ func (t *ToolSet) validateInformationNodes(ids []int64, allowed []string, field 
 		}
 	}
 	return nil
+}
+
+// normalizeArtifactPath folds an absolute artifact path that points inside one of
+// this run's artifact roots back to the clean relative form the graph stores.
+// Windows drive form and the WSL /mnt/<drive>/... form are the same path. Paths
+// outside every root are returned unchanged and are rejected by
+// db.ValidateArtifactPath because they remain absolute.
+func (t *ToolSet) normalizeArtifactPath(raw string) string {
+	p := strings.TrimSpace(raw)
+	if p == "" {
+		return raw
+	}
+	key := artifactCompareKey(p)
+	for _, root := range t.artifactRoots {
+		root = strings.TrimSpace(root)
+		if root == "" {
+			continue
+		}
+		rootKey := strings.TrimSuffix(artifactCompareKey(root), "/")
+		if rootKey == "" {
+			continue
+		}
+		lowerKey, lowerRoot := strings.ToLower(key), strings.ToLower(rootKey)
+		if !strings.HasPrefix(lowerKey, lowerRoot+"/") {
+			continue
+		}
+		rel := key[len(rootKey)+1:]
+		if rel == "" || strings.HasPrefix(rel, "/") || strings.Contains("/"+rel+"/", "/../") {
+			continue
+		}
+		return rel
+	}
+	return p
+}
+
+// normalizeEvidenceRefPaths rewrites artifact refs to their root-relative form
+// before structural validation; other ref kinds pass through untouched.
+func (t *ToolSet) normalizeEvidenceRefPaths(refs []string) []string {
+	if len(refs) == 0 || len(t.artifactRoots) == 0 {
+		return refs
+	}
+	out := make([]string, len(refs))
+	for i, ref := range refs {
+		kind, id, ok := strings.Cut(strings.TrimSpace(ref), ":")
+		if !ok || !strings.EqualFold(strings.TrimSpace(kind), "artifact") {
+			out[i] = ref
+			continue
+		}
+		out[i] = "artifact:" + t.normalizeArtifactPath(id)
+	}
+	return out
 }
 
 // validateEvidenceRef verifies that every referenced evidence pointer resolves
@@ -526,18 +654,6 @@ func mergeRouteBudget(requested, inherited db.RouteBudget) db.RouteBudget {
 	return out
 }
 
-// exhaustedBudgetMessage prevents a continuation from inheriting an already
-// exhausted route budget and getting killed again on the next Fast Path tick.
-func exhaustedBudgetMessage(routeID int64, budget db.RouteBudget, used db.RouteBudgetUsed) string {
-	dimension, usedValue, limit := db.RouteBudgetExhausted(budget, used)
-	if dimension == "" {
-		return ""
-	}
-	label, field := db.RouteBudgetDimensionMeta(dimension)
-	return fmt.Sprintf("路线 #%d 累计%s预算已耗尽（%d/%d），不追加预算时接续会在下一周期立即再次被终止；若需继续此路线，请显式传入更大的 budget.%s（须大于 %d），否则请停止该路线或改派新路线",
-		routeID, label, usedValue, limit, field, usedValue)
-}
-
 func trimmedStrings(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, v := range in {
@@ -568,4 +684,90 @@ func FactTypeFromInput(raw json.RawMessage) string {
 		}
 	}
 	return ""
+}
+
+// staleTriageVersion reports a non-empty reason when a finding's confirmation was
+// bound to an evidence version that no longer matches. It reads the finding's own
+// payload: triage_evidence_version is written next to triage_state, and
+// evidence_version is mirrored into the payload by the binding path.
+// ConfirmationIsStale reports whether a finding node's automatic confirmation was
+// bound to an evidence version that no longer matches. Exported for the host's
+// regression tests; the goal-proof gate uses the same predicate.
+func ConfirmationIsStale(n *db.Node) bool { return staleTriageVersion(n) != "" }
+
+func staleTriageVersion(n *db.Node) string {
+	if n == nil || len(n.Payload) == 0 {
+		return ""
+	}
+	var p struct {
+		TriageEvidenceVersion int64 `json:"triage_evidence_version"`
+		EvidenceVersion       int64 `json:"evidence_version"`
+	}
+	if err := json.Unmarshal(n.Payload, &p); err != nil {
+		return ""
+	}
+	if p.TriageEvidenceVersion <= 0 {
+		return "" // unbound: legacy or human verdict
+	}
+	if p.TriageEvidenceVersion != p.EvidenceVersion {
+		return "的确认版本 " + itoa64(p.TriageEvidenceVersion) + " 与当前证据版本 " + itoa64(p.EvidenceVersion) + " 不一致"
+	}
+	return ""
+}
+
+func itoa64(n int64) string {
+	return strconv.FormatInt(n, 10)
+}
+
+// RevalidateProofEvidence re-runs the evidence rules that can change BETWEEN the
+// caller's pre-check and the prove transaction: state, expiry, and (for findings) the
+// triage verdict and the evidence version that verdict was bound to. It is the
+// in-transaction half of validateProofAnchor.
+func RevalidateProofEvidence(kind, state string, payload []byte) error {
+	switch kind {
+	case db.KindFinding:
+		if state != "confirmed" {
+			return fmt.Errorf("漏洞节点状态为 %q，只有 confirmed 漏洞能作为已确认证据", state)
+		}
+		n := &db.Node{Kind: kind, State: state, Payload: payload}
+		if ts := FindingTriageState(n); ts == TriageVerifying || ts == TriageRejected {
+			return fmt.Errorf("分诊状态为 %q：证据已不再被确认为可证明目标", ts)
+		}
+		if stale := staleTriageVersion(n); stale != "" {
+			return fmt.Errorf("%s", stale)
+		}
+		return nil
+	case db.KindFact:
+		if state == db.StateOrigin {
+			return fmt.Errorf("任务根事实不能作为已确认证据")
+		}
+		n := &db.Node{Kind: kind, State: state, Payload: payload}
+		if ft := n.FactType(); !anchorableFactType(ft) {
+			return fmt.Errorf("fact_type 为 %s，不能证明目标", ft)
+		}
+		if db.IsFactExpired(db.ParseFactPayload(payload), time.Now()) {
+			return fmt.Errorf("已超过 valid_until 有效期")
+		}
+		return nil
+	default:
+		return fmt.Errorf("节点类型 %q 不能作为已确认证据", kind)
+	}
+}
+
+// RevalidateProofEvidenceInTx is RevalidateProofEvidence plus the cross-task
+// inheritance policy for evidence inherited from a DIRECT SOURCE task. The caller's
+// pre-check reads the node through the source view; inside the transaction the same
+// node is identified by id alone, so the policy (sensitivity, validity, fact type)
+// must be re-applied there instead of trusting the earlier read.
+func RevalidateProofEvidenceInTx(kind, state string, payload []byte, inherited bool) error {
+	if err := RevalidateProofEvidence(kind, state, payload); err != nil {
+		return err
+	}
+	if !inherited || kind != db.KindFact {
+		return nil
+	}
+	if ok, why := db.CanInheritFact(&db.Node{Kind: kind, State: state, Payload: payload}, time.Now()); !ok {
+		return fmt.Errorf("来源任务的证据受继承策略限制（%s），不能作为已确认证据", why)
+	}
+	return nil
 }

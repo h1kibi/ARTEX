@@ -60,22 +60,31 @@ type RouteFindingDTO struct {
 }
 
 type RouteDTO struct {
-	RouteID          int64                `json:"route_id"`
-	RouteKind        string               `json:"route_kind,omitempty"`
-	Objective        string               `json:"objective,omitempty"`
-	Phase            string               `json:"phase,omitempty"`
-	SuccessCondition string               `json:"success_condition,omitempty"`
-	ExpectedEvidence []string             `json:"expected_evidence,omitempty"`
-	Status           string               `json:"status"`
-	Budget           db.RouteBudget       `json:"budget,omitempty"`
-	BudgetUsed       db.RouteBudgetUsed   `json:"budget_used"`
-	IntentCount      int                  `json:"intent_count"`
-	ActiveIntents    int                  `json:"active_intents"`
-	AssetIDs         []int64              `json:"asset_ids,omitempty"`
-	Intents          []RouteIntentDTO     `json:"intents"`
-	Checkpoints      []RouteCheckpointDTO `json:"checkpoints"`
-	Findings         []RouteFindingDTO    `json:"findings"`
-	CreatedAt        string               `json:"created_at"`
+	RouteID          int64    `json:"route_id"`
+	RouteKind        string   `json:"route_kind,omitempty"`
+	Objective        string   `json:"objective,omitempty"`
+	Phase            string   `json:"phase,omitempty"`
+	SuccessCondition string   `json:"success_condition,omitempty"`
+	ExpectedEvidence []string `json:"expected_evidence,omitempty"`
+	Status           string   `json:"status"`
+	// Budget/BudgetUsed are historical statistics; effort + the autonomy fields
+	// below are what actually govern the run.
+	Budget             db.RouteBudget       `json:"budget,omitempty"`
+	BudgetUsed         db.RouteBudgetUsed   `json:"budget_used"`
+	Effort             string               `json:"effort,omitempty"`
+	TotalRuns          int                  `json:"total_runs"`
+	ConsecutiveDryRuns int                  `json:"consecutive_dry_runs"`
+	RunsSinceFinding   int                  `json:"runs_since_finding"`
+	WorkerSeconds      int64                `json:"worker_seconds"`
+	AutonomyStatus     string               `json:"autonomy_status,omitempty"`
+	HumanInvolved      bool                 `json:"human_involved"`
+	IntentCount        int                  `json:"intent_count"`
+	ActiveIntents      int                  `json:"active_intents"`
+	AssetIDs           []int64              `json:"asset_ids,omitempty"`
+	Intents            []RouteIntentDTO     `json:"intents"`
+	Checkpoints        []RouteCheckpointDTO `json:"checkpoints"`
+	Findings           []RouteFindingDTO    `json:"findings"`
+	CreatedAt          string               `json:"created_at"`
 }
 
 type InformationNodeDTO struct {
@@ -300,6 +309,11 @@ func (s *Server) taskRoutes(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	routeIDs := make([]int64, 0, len(routes))
+	for id := range routes {
+		routeIDs = append(routeIDs, id)
+	}
+	health, _ := t.Store.RouteHealthByID(routeIDs)
 	out := make([]RouteDTO, 0, len(routes))
 	for _, rd := range routes {
 		sort.Slice(rd.Intents, func(i, j int) bool { return lessNodeID(rd.Intents[i].ID, rd.Intents[j].ID) })
@@ -308,6 +322,14 @@ func (s *Server) taskRoutes(w http.ResponseWriter, r *http.Request) {
 			rd.BudgetUsed = rd.Checkpoints[n-1].BudgetUsed
 		}
 		rd.Status = routeStatus(rd.Intents)
+		if h, ok := health[rd.RouteID]; ok {
+			rd.TotalRuns = h.TotalRuns
+			rd.ConsecutiveDryRuns = h.ConsecutiveDryRuns
+			rd.RunsSinceFinding = h.RunsSinceLastFinding
+			rd.WorkerSeconds = h.WorkerSeconds
+			rd.AutonomyStatus = h.AutonomyStatus
+			rd.HumanInvolved = h.HumanInvolved
+		}
 		out = append(out, *rd)
 	}
 	sort.Slice(out, func(i, j int) bool {

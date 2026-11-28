@@ -131,7 +131,7 @@ const (
 // TrafficSearchDescription is persisted into the tool catalog for new and
 // upgraded installations. Keep it in the traffic package so the runtime tool
 // and the catalog migration cannot drift apart.
-const TrafficSearchDescription = "查询记录代理已抓取的目标流量（必须指定 host；支持裸主机、主机:端口或完整 URL，可再按 URL 子串或正文关键词过滤）。指定端口时只返回该服务的流量，避免同一 IP 的不同端口串包。body_contains 会在已抓取的请求/响应头与正文中做全文搜索，支持任意子串和中文（至少 3 个字符）。仅返回极轻量索引(id/method/url/status/resp_len)，不含响应内容；结果非空后必须用 traffic_get 逐条核实请求/响应，再把确实支持当前漏洞的 ID 交给 bind_finding_traffic。默认只返回 3 条、每页最多 10 条；结果多时用 page 翻页。"
+const TrafficSearchDescription = "查询记录代理已抓取的目标流量（必须指定 host；支持裸主机、主机:端口或完整 URL，可再按 URL 子串或正文关键词过滤）。指定端口时只返回该服务的流量，避免同一 IP 的不同端口串包。body_contains 会在已抓取的请求/响应头与正文中做全文搜索，支持任意子串和中文（至少 3 个字符）。仅返回极轻量索引(id/method/url/status/resp_len)，不含响应内容；结果非空后必须用 traffic_get 逐条核实请求/响应，再把确实支持当前漏洞的 ID 交给 bind_finding_traffic。默认只返回 3 条、每页最多 10 条；结果多时用 page 翻页。worker 运行时默认只看本任务抓到的流量（可用 task_id/intent_id 显式指定）；host 写 :443 或 :80 也会匹配省略了默认端口的记录。"
 
 // Traffic runs the recording proxy and owns the file tree + index.
 type Traffic struct {
@@ -161,19 +161,200 @@ type Traffic struct {
 	// stopping() treats as "not closing".
 	closed    chan struct{}
 	closeOnce sync.Once
-	// pass is the set of hosts whose MITM interception failed for a proxy/protocol
-	// reason; connections to them are tunneled transparently (fail-open) so the
-	// request still reaches the target — unrecorded — instead of being killed.
-	pass sync.Map // hostname(string) -> struct{}
+	// pass maps a host whose MITM interception failed for a proxy/protocol reason
+	// to the instant that fallback expires; until then connections to it are
+	// tunneled transparently (fail-open) so the request still reaches the target —
+	// unrecorded — instead of being killed. The entry is deliberately VOID after
+	// passTTL: one odd response (a fuzz payload the target answered with junk)
+	// must not blind the recorder for the rest of the process's life.
+	pass sync.Map // hostname(string) -> time.Time (expiry)
+	// tags carries the (task_id, intent_id) a request was made under, extracted
+	// from the Proxy-Authorization credentials the host injects per worker run.
+	// Keyed by connection (or flow, when no ConnContext is attached) because an
+	// HTTPS tunnel sends the credential once on CONNECT and every request after
+	// it shares the connection.
+	tags sync.Map // tagKey(string) -> exchangeTag
+	// wsl bridges a loopback-only proxy to the WSL virtual NIC so a WSL2 guest
+	// can reach it (see wslbridge_windows.go). nil when unused.
+	wsl *wslBridge
 	// upstream is the global egress proxy every captured request is forwarded
 	// through (nil = dial targets directly). Both the intercepted and the
 	// transparent-passthrough paths honor it (go-mitmproxy's getUpstreamConn),
 	// so no host escapes it. Hot-swappable at runtime via SetUpstreamProxy.
 	upstream atomic.Pointer[url.URL]
+	// egressGate, when set, decides whether a request may leave for its target at
+	// all. It is the LAST line of scope enforcement (docs §4.5): a tool hook can be
+	// bypassed by a shell that ignores HTTP_PROXY or by an MCP client with its own
+	// dialer, but nothing reaches the target through this proxy without passing
+	// here. nil = no gate.
+	egressGate atomic.Pointer[EgressGateFunc]
+	// blocked counts requests the gate refused (diagnostics/tests).
+	blocked atomic.Int64
+	// verifyUpstream, when set, makes the proxy verify target certificates. Off by
+	// default because a pentest target is usually self-signed; see Open.
+	verifyUpstream atomic.Bool
+	// noRecord gates the RECORDING half only. The proxy itself stays in the request
+	// path whenever it is running: the egress scope gate lives on it, and turning
+	// capture off must not turn range enforcement off with it.
+	//
+	// Stored inverted so the zero value (every Traffic built directly, including
+	// tests and embedders) keeps the historical behaviour: record. Only the host
+	// opts out, via SetRecording(false), when the capture setting is off.
+	noRecord atomic.Bool
+}
+
+// VerifyUpstream reports whether the proxy verifies target certificates. There is
+// deliberately NO setter: the TLS config is baked into the listener at construction
+// (Options.VerifyUpstream), so a runtime setter could only change this boolean while
+// the live proxy kept its original behaviour — a state that reports one thing and
+// does another. Reconfigure and restart to change it.
+
+// VerifyUpstream reports whether the proxy verifies target certificates.
+func (t *Traffic) VerifyUpstream() bool {
+	if t == nil {
+		return false
+	}
+	return t.verifyUpstream.Load()
+}
+
+// SetRecording enables or disables exchange recording. The proxy keeps running (and
+// keeps enforcing the egress gate) either way; only the exchange capture stops.
+func (t *Traffic) SetRecording(on bool) {
+	if t == nil {
+		return
+	}
+	t.noRecord.Store(!on)
+}
+
+// Recording reports whether exchanges are currently captured.
+func (t *Traffic) Recording() bool {
+	if t == nil {
+		return false
+	}
+	return !t.noRecord.Load()
+}
+
+// EgressGateFunc decides one outbound request. taskID is the run tag carried by
+// the connection (0 when the caller sent no Proxy-Authorization credential, which
+// means only global rules apply). Allowed=false drops the request with a synthetic
+// response so the caller sees the refusal instead of a hang; reason is shown to the
+// agent. Implementations must be concurrency-safe.
+type EgressGateFunc func(taskID int64, host string, req *http.Request) (allowed bool, reason string)
+
+// SetEgressGate installs the egress scope gate. nil removes it.
+func (t *Traffic) SetEgressGate(fn EgressGateFunc) {
+	if fn == nil {
+		t.egressGate.Store(nil)
+		return
+	}
+	t.egressGate.Store(&fn)
+}
+
+// BlockedCount reports how many requests the egress gate refused.
+func (t *Traffic) BlockedCount() int64 {
+	if t == nil {
+		return 0
+	}
+	return t.blocked.Load()
+}
+
+// gateRequest materializes the outbound request handed to the gate. go-mitmproxy's
+// *Request.Raw() is usually set, but a flow built without it (tests, and some
+// synthetic paths) would hand the gate nil and silently disable every URL-shaped
+// rule — so fall back to reconstructing the essential parts.
+func gateRequest(f *mproxy.Flow) *http.Request {
+	if f == nil || f.Request == nil || f.Request.URL == nil {
+		return nil
+	}
+	if raw := f.Request.Raw(); raw != nil {
+		return raw
+	}
+	req := &http.Request{
+		Method: f.Request.Method,
+		URL:    f.Request.URL,
+		Header: f.Request.Header,
+		Host:   f.Request.URL.Host,
+	}
+	if req.Method == "" {
+		req.Method = http.MethodGet
+	}
+	return req
+}
+
+// egressRequestForRule fills a decrypted HTTPS inner request's URL. go-mitmproxy
+// may hand the upstream dial a request whose URL is only the relative path; URL
+// rules must see scheme and host or every exact_url/fuzzy_url allow rule fails.
+func egressRequestForRule(req *http.Request) *http.Request {
+	if req == nil || req.Method == http.MethodConnect || req.URL == nil || req.URL.Host != "" || req.Host == "" {
+		return req
+	}
+	out := *req
+	u := *req.URL
+	u.Scheme = "https"
+	u.Host = req.Host
+	out.URL = &u
+	return &out
+}
+
+// egressDecision evaluates the gate for a raw inbound request without writing a
+// response or counting a block. configured=false means no gate is installed.
+func (t *Traffic) egressDecision(req *http.Request) (allowed bool, reason string, configured bool) {
+	g := t.egressGate.Load()
+	if g == nil || req == nil {
+		return true, "", false
+	}
+	req = egressRequestForRule(req)
+	tag := t.tagForRequest(req)
+	allowed, reason = (*g)(tag.TaskID, hostOnly(req.Host), req)
+	return allowed, reason, true
+}
+
+// gateEgress applies the egress gate to one flow. A refusal answers 403 with an
+// explicit platform-governance body (so the agent does not read it as the target's
+// WAF and start evading) and reports true.
+func (t *Traffic) gateEgress(f *mproxy.Flow) bool {
+	g := t.egressGate.Load()
+	if g == nil || f == nil || f.Request == nil || f.Request.URL == nil {
+		return false
+	}
+	tag := t.tagFor(f)
+	req := egressRequestForRule(gateRequest(f))
+	host := f.Request.URL.Hostname()
+	if host == "" && req != nil && req.URL != nil {
+		host = req.URL.Hostname()
+	}
+	allowed, reason := (*g)(tag.TaskID, host, req)
+	if allowed {
+		return false
+	}
+	t.blocked.Add(1)
+	if reason == "" {
+		reason = "该目标不在本任务允许测试的资产范围内"
+	}
+	f.Response = &mproxy.Response{
+		StatusCode: http.StatusForbidden,
+		Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+		Body: []byte("【ARTEX 平台管控·非目标防御】此请求被平台拦截。原因：" + reason +
+			"。该资产不在授权范围内，绕过拦截不属于测试内容。"),
+	}
+	log.Printf("[traffic] 出口拦截 %s %s: %s", f.Request.Method, f.Request.URL.Host, reason)
+	return true
 }
 
 // Open initializes the traffic tree, blob store and SQLite index under dir.
-func Open(dir, addr string) (*Traffic, error) {
+// Options are the construction-time settings of the intercepting proxy. They must
+// be decided before the listener is built (the TLS config is baked into it), which
+// is why they are not setters.
+type Options struct {
+	// VerifyUpstream makes the proxy verify target certificates. Off by default:
+	// pentest targets routinely present self-signed or mismatched certificates.
+	VerifyUpstream bool
+}
+
+func Open(dir, addr string) (*Traffic, error) { return OpenWith(dir, addr, Options{}) }
+
+// OpenWith is Open with explicit construction-time options.
+func OpenWith(dir, addr string, opts Options) (*Traffic, error) {
 	for _, d := range []string{dir, filepath.Join(dir, "_index"), filepath.Join(dir, "_blobs"), filepath.Join(dir, "_ca")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return nil, err
@@ -196,14 +377,25 @@ func Open(dir, addr string) (*Traffic, error) {
 		return nil, err
 	}
 	t := &Traffic{dir: dir, addr: addr, db: db, closed: make(chan struct{})}
+	t.verifyUpstream.Store(opts.VerifyUpstream)
 	if err := t.initIndex(); err != nil {
 		db.Close()
 		return nil, err
 	}
 
 	p, err := mproxy.NewProxy(&mproxy.Options{
-		Addr:        addr,
-		SslInsecure: true,
+		Addr: addr,
+		// Documented, deliberate: this proxy exists to MITM authorized pentest
+		// targets, which routinely present self-signed or mismatched certificates.
+		// With capture OFF the proxy stays in the request path to enforce scope, so
+		// this setting now also covers requests that were previously direct — that is
+		// the cost of having one enforceable egress point, and it must stay explicit
+		// rather than being inherited silently.
+		//
+		// Upstream certificate verification for ORDINARY traffic is a separate
+		// concern: Traffic.SetVerifyUpstream flips this when an operator needs real
+		// verification, at the cost of the pentest targets above.
+		SslInsecure: !opts.VerifyUpstream,
 		CaRootPath:  filepath.Join(dir, "_ca"),
 	})
 	if err != nil {
@@ -218,13 +410,38 @@ func Open(dir, addr string) (*Traffic, error) {
 	// a direct dial. When a global egress proxy IS configured (SetUpstreamProxy),
 	// every captured request — intercepted AND transparently tunneled — is
 	// forwarded through it instead, so no host leaks the real source IP.
-	p.SetUpstreamProxy(func(*http.Request) (*url.URL, error) { return t.upstream.Load(), nil })
+	p.SetUpstreamProxy(func(req *http.Request) (*url.URL, error) {
+		// The last dial point for every path: intercepted requests, transparent
+		// passthrough, raw CONNECT tunnels and WebSockets all go through here.
+		// Refusing before the dial is what keeps a forbidden target at zero TCP
+		// connections even when the CONNECT was not intercepted.
+		if allowed, reason, configured := t.egressDecision(req); configured && !allowed {
+			if reason == "" {
+				reason = "该目标不在本任务允许测试的资产范围内"
+			}
+			return nil, fmt.Errorf("egress blocked: %s", reason)
+		}
+		return t.upstream.Load(), nil
+	})
 	// Fail-open: MITM every host by default, EXCEPT ones a prior request proved we
 	// can't intercept without breaking (see maybePassthrough). Those are tunneled
 	// transparently so the request still reaches the target instead of being killed.
+	//
+	// A CONNECT the egress gate refuses must NOT take the transparent path: direct
+	// transfer would dial the forbidden target and bypass the refusal. Forcing
+	// interception makes the client receive the platform 403 (HTTPS) or hit the
+	// blocked upstream dial (raw TCP).
 	p.SetShouldInterceptRule(func(req *http.Request) bool {
-		_, tunnel := t.pass.Load(hostOnly(req.Host))
-		return !tunnel
+		// The credential is still present here, before the Requestheaders addon
+		// runs; remember it by client address so later upstream dials can attribute
+		// the connection even after the header is stripped.
+		if tag, ok := tagFromProxyAuth(req.Header); ok {
+			t.setAddrTag(req.RemoteAddr, tag)
+		}
+		if allowed, _, configured := t.egressDecision(req); configured && !allowed {
+			return true
+		}
+		return !t.passing(hostOnly(req.Host))
 	})
 	p.AddAddon(&sink{t: t})
 	t.proxy = p
@@ -283,11 +500,57 @@ func (t *Traffic) initIndex() error {
 	if _, err := conn.ExecContext(ctx, indexSchema); err != nil {
 		return err
 	}
+	if err := t.migrateTagColumns(ctx, conn); err != nil {
+		return err
+	}
 	if _, err := conn.ExecContext(ctx, ftsSchema); err != nil {
 		log.Printf("[traffic] 全文索引不可用，正文搜索将被禁用（元数据搜索不受影响）：%v", err)
 		return nil
 	}
 	t.fts = true
+	return nil
+}
+
+// migrateTagColumns adds the (task_id, intent_id) attribution columns to an
+// existing index. SQLite's ADD COLUMN is the whole migration: both columns carry
+// NOT NULL DEFAULT 0, so every historical exchange reads as "unattributed" and
+// nothing needs rewriting. Idempotent — the column list is checked first so a
+// second start (or a database created by a newer build) is a no-op.
+func (t *Traffic) migrateTagColumns(ctx context.Context, conn *sql.Conn) error {
+	have := map[string]bool{}
+	rows, err := conn.QueryContext(ctx, `SELECT name FROM pragma_table_info('exchanges')`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		have[name] = true
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	for _, col := range []string{"task_id", "intent_id"} {
+		if have[col] {
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, `ALTER TABLE exchanges ADD COLUMN `+col+` INTEGER NOT NULL DEFAULT 0`); err != nil {
+			return err
+		}
+	}
+	for _, idx := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_ex_task ON exchanges(task_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_ex_task_intent ON exchanges(task_id, intent_id)`,
+	} {
+		if _, err := conn.ExecContext(ctx, idx); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -356,7 +619,15 @@ func (t *Traffic) CACertPath() string {
 }
 
 // Start runs the proxy (blocking); run in a goroutine.
-func (t *Traffic) Start() error { return t.proxy.Start() }
+func (t *Traffic) Start() error {
+	// The WSL bridge must accept connections as soon as the proxy does; it is
+	// started here (not in Open) because Open runs before Start in every caller,
+	// and a listener that outlives a failed Start would be a leak.
+	if t.wsl == nil {
+		t.wsl = startWSLBridge(t.addr)
+	}
+	return t.proxy.Start()
+}
 
 // Close waits for background tree reclamation to finish before closing the
 // index, so shutdown never leaves a goroutine unlinking files out from under a
@@ -367,6 +638,7 @@ func (t *Traffic) Close() error {
 	if t.closed != nil {
 		t.closeOnce.Do(func() { close(t.closed) })
 	}
+	t.wsl.Close()
 	t.reaping.Wait()
 	return t.db.Close()
 }
@@ -393,18 +665,69 @@ func (s *sink) Response(f *mproxy.Flow) {
 	if f.Request == nil || f.Response == nil {
 		return
 	}
+	if !s.t.Recording() {
+		// Capture is off, but this proxy is still the egress path (and therefore the
+		// scope gate below). Forwarding without recording is the whole point.
+		return
+	}
 	s.t.record(f)
 }
 
+// Requestheaders captures the run tag (task_id / intent_id) the caller put in its
+// Proxy-Authorization credentials and REMOVES that header before the request is
+// forwarded — the target server must never learn the platform's internal
+// bookkeeping. An HTTPS tunnel carries the credential once on CONNECT and reuses
+// the connection, so the tag is remembered per connection and re-attached to
+// every request thereafter.
+func (s *sink) Requestheaders(f *mproxy.Flow) {
+	if f == nil || f.Request == nil {
+		return
+	}
+	if tag, ok := tagFromProxyAuth(f.Request.Header); ok {
+		s.t.setTag(f, tag)
+		s.t.setAddrTag(flowRemoteAddr(f), tag)
+	}
+	f.Request.Header.Del(proxyAuthHeader)
+	// Egress scope gate: filling f.Response here makes go-mitmproxy answer the
+	// client directly and never contact the target (the documented addon contract).
+	s.t.gateEgress(f)
+}
+
 // RequestError fires when a request through an established MITM tunnel fails. If
-// the failure looks proxy/protocol-caused (h2 quirks, HEAD-with-body, protocol
-// errors) — not a plain target-unreachable error — we flag the host for
-// transparent passthrough so future requests to it succeed instead of dying.
+// the failure looks proxy/protocol-caused (h2 quirks, HEAD-with-body) — not a
+// plain target-unreachable error — we fall back to transparent passthrough for
+// this host for passTTL so future requests reach the target.
 func (s *sink) RequestError(f *mproxy.Flow, err error) { s.t.maybePassthrough(f, err) }
 
-// maybePassthrough marks a host to be tunneled transparently on the next
-// connection, but only for errors the proxy itself caused — a target that is
-// simply down/filtered would fail without us too, and must stay MITM'd+recorded.
+// passTTL bounds how long a host stays on the transparent-passthrough path. It is
+// long enough to let a genuinely incompatible endpoint (an h2-only service, a
+// server that answers HEAD with a body) finish its work unrecorded, and short
+// enough that the recorder always comes back: a target that merely answered one
+// malformed fuzz payload must not be lost for the whole process lifetime.
+const passTTL = 5 * time.Minute
+
+// passing reports whether host is currently on the transparent path, retiring an
+// expired mark on the way. Expiry is checked here rather than by a sweeper: the
+// check is on the connection-establishment path, which is exactly where the value
+// is read, so no background goroutine is needed and a stale entry costs nothing.
+func (t *Traffic) passing(host string) bool {
+	if host == "" {
+		return false
+	}
+	v, ok := t.pass.Load(host)
+	if !ok {
+		return false
+	}
+	if exp := v.(time.Time); time.Now().Before(exp) {
+		return true
+	}
+	t.pass.Delete(host)
+	return false
+}
+
+// maybePassthrough marks a host to be tunneled transparently for passTTL, but only
+// for errors the proxy itself caused — a target that is simply down/filtered would
+// fail without us too, and must stay MITM'd+recorded.
 func (t *Traffic) maybePassthrough(f *mproxy.Flow, err error) {
 	if err == nil || f == nil || f.Request == nil || f.Request.URL == nil || !proxyCausedErr(err) {
 		return
@@ -413,16 +736,21 @@ func (t *Traffic) maybePassthrough(f *mproxy.Flow, err error) {
 	if host == "" {
 		return
 	}
-	if _, loaded := t.pass.LoadOrStore(host, struct{}{}); !loaded {
-		log.Printf("[traffic] 与 %s 的 MITM 出错，改为透传（该 host 后续直连目标、不再记录，但请求照常）：%v", host, err)
+	if t.passing(host) {
+		return // already on the transparent path; keep the original deadline
 	}
+	t.pass.Store(host, time.Now().Add(passTTL))
+	log.Printf("[traffic] 与 %s 的 MITM 出错，%s 内改为透传（该 host 后续直连目标、不再记录，但请求照常）：%v", host, passTTL, err)
 }
 
 // proxyCausedErr reports whether err indicates the interception layer (not the
-// target) is at fault — HTTP/2 handling, HEAD-with-body, or a protocol violation.
+// target) is at fault: HTTP/2 handling or HEAD-with-body. Deliberately NARROW —
+// "malformed" / "protocol error" are what a black-box fuzz run provokes from a
+// hardened or simply surprised target, and treating those as proxy faults would
+// switch recording off for the very site being attacked.
 func proxyCausedErr(err error) bool {
 	s := strings.ToLower(err.Error())
-	for _, p := range []string{"head request", "http2", "http/2", "protocol error", "protocol_error", "malformed"} {
+	for _, p := range []string{"head request", "http2", "http/2"} {
 		if strings.Contains(s, p) {
 			return true
 		}
@@ -453,6 +781,12 @@ func (t *Traffic) record(f *mproxy.Flow) {
 	// work and must not sit inside the SQLite write lock.
 	reqB := t.spill(f.Request.Body, f.Request.Header.Get("Content-Type"))
 	respB := t.spill(f.Response.Body, ct)
+	tag := t.tagFor(f)
+	// Release the slot: a flow-keyed tag is only needed between its headers being
+	// read and its exchange being recorded.
+	if k := tagKey(f); strings.HasPrefix(k, "p:") || strings.HasPrefix(k, "f:") {
+		t.tags.Delete(k)
+	}
 
 	tx, err := t.db.Begin()
 	if err != nil {
@@ -463,10 +797,10 @@ func (t *Traffic) record(f *mproxy.Flow) {
 
 	// path stays empty for db-resident exchanges; a non-empty path marks a legacy
 	// row whose bodies still live in the old on-disk tree (see Get).
-	res, err := tx.Exec(`INSERT OR REPLACE INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path)
-VALUES(?,?,?,?,?,?,?,?,?,?,'')`,
+	res, err := tx.Exec(`INSERT OR REPLACE INTO exchanges(id,ts,host,method,url_template,url,status,content_type,req_len,resp_len,path,task_id,intent_id)
+VALUES(?,?,?,?,?,?,?,?,?,?,'',?,?)`,
 		id, now.Unix(), host, method, tmpl, url, f.Response.StatusCode, ct,
-		len(f.Request.Body), len(f.Response.Body))
+		len(f.Request.Body), len(f.Response.Body), tag.TaskID, tag.IntentID)
 	if err != nil {
 		log.Printf("[traffic] 记录 %s 失败（写索引）：%v", url, err)
 		return
@@ -760,6 +1094,8 @@ type ExchangeMeta struct {
 	ContentType string `json:"content_type"`
 	RespLen     int    `json:"resp_len"`
 	Path        string `json:"path"`
+	TaskID      int64  `json:"task_id"`
+	IntentID    int64  `json:"intent_id"`
 }
 
 // Search returns paged exchange metadata (never bodies).
@@ -767,7 +1103,7 @@ func (t *Traffic) Search(host string, page, size int) ([]ExchangeMeta, error) {
 	if size <= 0 || size > 500 {
 		size = 100
 	}
-	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges`
+	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path,task_id,intent_id FROM exchanges`
 	args := []any{}
 	if host != "" {
 		q += ` WHERE host=?`
@@ -783,7 +1119,7 @@ func (t *Traffic) Search(host string, page, size int) ([]ExchangeMeta, error) {
 	var out []ExchangeMeta
 	for rows.Next() {
 		var m ExchangeMeta
-		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path); err != nil {
+		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path, &m.TaskID, &m.IntentID); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -1041,6 +1377,12 @@ func (t *Traffic) Count() (int, error) {
 // than deleted by host. Returns rows deleted.
 func (t *Traffic) DeleteHost(host string) (int64, error) {
 	like := "%" + host + "%"
+	// The passthrough marks belong to this host's interception failures, so they
+	// go with it: a deleted host must come back fully MITM'd when it reappears
+	// (e.g. a rebuilt target on the same address), not tunneled for the rest of
+	// the TTL.
+	t.pass.Delete(host)
+	t.pass.Delete(hostOnly(host))
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
 	// Resolved before the rows go away: with a substring match, the index is the
@@ -1093,6 +1435,16 @@ func (t *Traffic) DeleteHost(host string) (int64, error) {
 // Returns the number of exchanges deleted and how many bytes of index the
 // compaction handed back.
 func (t *Traffic) DeleteAll() (deleted int64, reclaimed int64, err error) {
+	// Clearing everything clears the passthrough marks and connection tags with
+	// it (see DeleteHost).
+	t.pass.Range(func(k, _ any) bool {
+		t.pass.Delete(k)
+		return true
+	})
+	t.tags.Range(func(k, _ any) bool {
+		t.tags.Delete(k)
+		return true
+	})
 	t.wmu.Lock()
 	defer t.wmu.Unlock()
 	before := t.indexBytes()
@@ -1434,6 +1786,11 @@ func (t *Traffic) StageDeleteHostsExactForArchive(hosts []string, archiveID, tas
 }
 
 func (t *Traffic) stageDeleteHostsExact(hosts []string, archiveID, taskID int64) (*HostDeleteStage, error) {
+	// Same rule as DeleteHost: a deleted host's interception failures go with it.
+	for _, h := range hosts {
+		t.pass.Delete(h)
+		t.pass.Delete(hostOnly(h))
+	}
 	t.wmu.Lock()
 	stage := &HostDeleteStage{traffic: t}
 	fail := func(cause error) (*HostDeleteStage, error) {
@@ -1903,10 +2260,22 @@ func (t *Traffic) legacyBlobRefs(refs map[string]struct{}) error {
 	})
 }
 
-// query returns one page of exchange metadata filtered by host and/or a url
-// substring. Default page size is intentionally small (3) to keep tool results
-// lightweight and capped at 10; page is 0-based (page*limit offset).
-func (t *Traffic) query(host, contains, bodyContains string, page, limit int) ([]ExchangeMeta, error) {
+// queryFilter is everything traffic_search can constrain a page by. Zero values
+// mean "no constraint"; TaskID/IntentID 0 (the default) mean "any owner", since 0
+// is also the value historical (unattributed) exchanges carry.
+type queryFilter struct {
+	Host         string
+	Contains     string
+	BodyContains string
+	TaskID       int64
+	IntentID     int64
+}
+
+// query returns one page of exchange metadata filtered by host, a url substring,
+// full-text body match and/or run attribution. Default page size is intentionally
+// small (3) to keep tool results lightweight and capped at 10; page is 0-based
+// (page*limit offset).
+func (t *Traffic) query(f queryFilter, page, limit int) ([]ExchangeMeta, error) {
 	if limit <= 0 {
 		limit = 3
 	}
@@ -1916,12 +2285,27 @@ func (t *Traffic) query(host, contains, bodyContains string, page, limit int) ([
 	if page < 0 {
 		page = 0
 	}
-	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path FROM exchanges WHERE 1=1`
+	q := `SELECT id,ts,host,method,url_template,url,status,content_type,resp_len,path,task_id,intent_id FROM exchanges WHERE 1=1`
 	args := []any{}
+	host, contains, bodyContains := f.Host, f.Contains, f.BodyContains
+	if f.TaskID != 0 {
+		q += ` AND task_id=?`
+		args = append(args, f.TaskID)
+	}
+	if f.IntentID != 0 {
+		q += ` AND intent_id=?`
+		args = append(args, f.IntentID)
+	}
 	if host != "" {
 		hostName, port, err := normalizeSearchHost(host)
 		if err != nil {
 			return nil, err
+		}
+		// Agents paste whole URLs ("https://example.com:443/api"); the path is part
+		// of what they asked for, so it narrows the search like `contains` instead
+		// of being silently dropped.
+		if p := urlPathOf(host); p != "" && contains == "" {
+			contains = p
 		}
 		q += ` AND host=?`
 		args = append(args, hostName)
@@ -1930,12 +2314,19 @@ func (t *Traffic) query(host, contains, bodyContains string, page, limit int) ([
 			// so constrain the original URL authority as a compatibility fallback.
 			// New and old captures therefore share the same search contract.
 			authority := net.JoinHostPort(hostName, port)
-			q += ` AND (url LIKE ? OR url LIKE ? OR url LIKE ?)`
-			args = append(args,
-				"%://"+authority+"/%",
-				"%://"+authority+"?%",
-				"%://"+authority,
-			)
+			alts := []string{"%://" + authority + "/%", "%://" + authority + "?%", "%://" + authority}
+			// A default port is usually omitted from the recorded URL
+			// (https://example.com/api, not https://example.com:443/api), so a
+			// search naming :443/:80 must also accept the bare authority. Without
+			// this the most natural query an agent writes matches nothing.
+			if isDefaultPort(hostName, port) {
+				bare := "%://" + hostName + "/%"
+				alts = append(alts, bare, "%://"+hostName+"?%", "%://"+hostName)
+			}
+			q += ` AND (` + strings.Repeat(`url LIKE ? OR `, len(alts)-1) + `url LIKE ?)`
+			for _, a := range alts {
+				args = append(args, a)
+			}
 		}
 	}
 	if contains != "" {
@@ -1963,12 +2354,42 @@ func (t *Traffic) query(host, contains, bodyContains string, page, limit int) ([
 	var out []ExchangeMeta
 	for rows.Next() {
 		var m ExchangeMeta
-		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path); err != nil {
+		if err := rows.Scan(&m.ID, &m.TS, &m.Host, &m.Method, &m.URLTemplate, &m.URL, &m.Status, &m.ContentType, &m.RespLen, &m.Path, &m.TaskID, &m.IntentID); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// urlPathOf returns the path of a full URL host argument, or "" when the
+// argument is a bare host/host:port.
+func urlPathOf(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if !strings.Contains(raw, "://") {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	if p := strings.TrimSpace(u.Path); p != "" && p != "/" {
+		return p
+	}
+	return ""
+}
+
+// isDefaultPort reports whether port is the scheme's implicit port for host, so
+// the search must also match a URL that omits it.
+func isDefaultPort(host, port string) bool {
+	switch port {
+	case "443", "80":
+		// An explicitly non-default pairing (http on 443) is legal, so the
+		// bare-authority alternative is offered for both — a superset of matches
+		// is harmless here because the host filter still pins the target.
+		return true
+	}
+	return false
 }
 
 // normalizeSearchHost accepts the forms agents commonly have at hand while
@@ -2026,23 +2447,38 @@ func (t *Traffic) Tools() []actool.CoreTool {
 				"body_contains": map[string]any{"type": "string", "description": "正文全文搜索（可选，至少 3 个字符），匹配请求/响应的头与正文，如 'password' / 'root:x:0' / '内网测试'"},
 				"limit":         map[string]any{"type": "integer", "description": "每页条数，默认 3，最大 10"},
 				"page":          map[string]any{"type": "integer", "description": "页码，从 0 开始，默认 0（按 ts 倒序分页）"},
+				"task_id":       map[string]any{"type": "integer", "description": "按任务过滤（可选，0=不限）；worker 默认只看本次运行所属任务的流量"},
+				"intent_id":     map[string]any{"type": "integer", "description": "按意图过滤（可选，0=不限）；定位某一次运行抓到的流量"},
 			},
 			"required": []any{"host"},
 		},
 		ReadOnly:    ro,
 		Permissions: allow,
-		Run: func(_ context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
+		Run: func(ctx context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
 			var a struct {
 				Host, Contains string
 				BodyContains   string `json:"body_contains"`
 				Limit          int
 				Page           int
+				TaskID         int64 `json:"task_id"`
+				IntentID       int64 `json:"intent_id"`
 			}
 			_ = json.Unmarshal(in, &a)
 			if strings.TrimSpace(a.Host) == "" {
 				return actool.Errorf("host 为必填参数：请指定裸主机、主机:端口或完整 URL，避免全库扫描。"), nil
 			}
-			rows, err := t.query(a.Host, a.Contains, a.BodyContains, a.Page, a.Limit)
+			if scope, ok := SearchScopeFrom(ctx); ok && a.TaskID == 0 {
+				// A worker run defaults to its own task's capture: every task shares
+				// one proxy port, so without this filter an agent reads another
+				// task's concurrent traffic and re-derives conclusions it never
+				// observed. Task-level (not intent-level) because WebFetch and other
+				// in-process clients reach the proxy without the worker's credential.
+				a.TaskID = scope.TaskID
+			}
+			rows, err := t.query(queryFilter{
+				Host: a.Host, Contains: a.Contains, BodyContains: a.BodyContains,
+				TaskID: a.TaskID, IntentID: a.IntentID,
+			}, a.Page, a.Limit)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
@@ -2051,15 +2487,17 @@ func (t *Traffic) Tools() []actool.CoreTool {
 			}
 			// 精简为最小索引：仅保留定位所需字段 + 响应码/长度，不带任何响应内容。
 			type liteRow struct {
-				ID      string `json:"id"`
-				Method  string `json:"method"`
-				URL     string `json:"url"`
-				Status  int    `json:"status"`
-				RespLen int    `json:"resp_len"`
+				ID       string `json:"id"`
+				Method   string `json:"method"`
+				URL      string `json:"url"`
+				Status   int    `json:"status"`
+				RespLen  int    `json:"resp_len"`
+				TaskID   int64  `json:"task_id,omitempty"`
+				IntentID int64  `json:"intent_id,omitempty"`
 			}
 			lite := make([]liteRow, 0, len(rows))
 			for _, r := range rows {
-				lite = append(lite, liteRow{ID: r.ID, Method: r.Method, URL: r.URL, Status: r.Status, RespLen: r.RespLen})
+				lite = append(lite, liteRow{ID: r.ID, Method: r.Method, URL: r.URL, Status: r.Status, RespLen: r.RespLen, TaskID: r.TaskID, IntentID: r.IntentID})
 			}
 			b, _ := json.Marshal(lite)
 			return actool.Text(string(b)), nil
@@ -2067,23 +2505,36 @@ func (t *Traffic) Tools() []actool.CoreTool {
 	})
 
 	get := actool.Build(actool.Spec{
-		Name:        "traffic_get",
-		Description: "按 id 取一条已抓流量的请求/响应原文（过大会截断）。配合 traffic_search 用，避免重复 curl。",
+		Name: "traffic_get",
+		Description: fmt.Sprintf("按 id 取一条已抓流量的请求/响应原文。配合 traffic_search 用，避免重复 curl。"+
+			"响应正文超过 %d 字节时按 offset/length 分段返回，结果头部带 [offset=… total=…] 提示，用 offset=上一段 offset+长度 续读全文"+
+			"（内联正文最大 %d KB，超过部分用 traffic_blob）。", trafficGetDefault, maxInlineBody/1024),
 		Schema: map[string]any{
-			"type":       "object",
-			"properties": map[string]any{"id": map[string]any{"type": "string", "description": "traffic_search 返回的 id"}},
-			"required":   []any{"id"},
+			"type": "object",
+			"properties": map[string]any{
+				"id":     map[string]any{"type": "string", "description": "traffic_search 返回的 id"},
+				"offset": map[string]any{"type": "integer", "description": "响应正文起始字节偏移，默认 0"},
+				"length": map[string]any{"type": "integer", "description": fmt.Sprintf("本次读取的正文字节数，默认 %d，最大 %d", trafficGetDefault, trafficGetMax)},
+			},
+			"required": []any{"id"},
 		},
 		ReadOnly:    ro,
 		Permissions: allow,
 		Run: func(_ context.Context, in json.RawMessage, _ *actool.ToolContext) (actool.Result, error) {
-			var a struct{ ID string }
+			var a struct {
+				ID     string `json:"id"`
+				Offset int    `json:"offset"`
+				Length int    `json:"length"`
+			}
 			_ = json.Unmarshal(in, &a)
 			req, resp, err := t.Get(a.ID)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
-			return actool.Text("=== REQUEST ===\n" + clip(req, 2500) + "\n\n=== RESPONSE ===\n" + clip(resp, 4000)), nil
+			respHead, respBody := splitHTTPMessage(resp)
+			body, page := pageBody(respBody, a.Offset, a.Length)
+			out := "=== REQUEST ===\n" + clip(req, 2500) + "\n\n=== RESPONSE ===\n" + respHead + "\n" + page + body
+			return actool.Text(out), nil
 		},
 	})
 
@@ -2134,9 +2585,60 @@ func (t *Traffic) Tools() []actool.CoreTool {
 // over the nil receiver but are never invoked on this instance, so it is safe.
 func SeedToolMetas() []actool.CoreTool { return (&Traffic{}).Tools() }
 
+// traffic_get paging: the default slice covers the 4KB～256KB responses that used
+// to be cut off with no way to continue; the cap bounds one call's context cost.
+const (
+	trafficGetDefault = 4000
+	trafficGetMax     = 16384
+)
+
+// splitHTTPMessage splits a raw HTTP message into its head (status/request line
+// plus headers, without the trailing blank line) and its body.
+func splitHTTPMessage(raw string) (head, body string) {
+	if i := strings.Index(raw, "\r\n\r\n"); i >= 0 {
+		return raw[:i], raw[i+4:]
+	}
+	if i := strings.Index(raw, "\n\n"); i >= 0 {
+		return raw[:i], raw[i+2:]
+	}
+	return raw, ""
+}
+
+// pageBody slices body at [offset, offset+length) and describes the window. The
+// hint is always emitted when the body does not fit in one read, so the model
+// sees how to continue instead of assuming the response simply ended.
+func pageBody(body string, offset, length int) (string, string) {
+	if length <= 0 || length > trafficGetMax {
+		length = trafficGetDefault
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	total := len(body)
+	if total <= length && offset == 0 {
+		// Fits in one read: no paging ceremony.
+		return body, ""
+	}
+	if offset >= total {
+		return "", fmt.Sprintf("[offset=%d total=%d] 偏移已超出正文长度（正文共 %d 字节）。\n", offset, total, total)
+	}
+	end := offset + length
+	if end > total {
+		end = total
+	}
+	seg := body[offset:end]
+	hint := fmt.Sprintf("[offset=%d total=%d 本段=%d 字节]", offset, total, len(seg))
+	if end < total {
+		hint += fmt.Sprintf(" 后续用 offset=%d&length=%d 继续读。", end, length)
+	} else {
+		hint += " 已读到正文末尾。"
+	}
+	return seg, hint + "\n"
+}
+
 func clip(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max] + fmt.Sprintf("\n... [截断，共 %d 字节；完整在流量文件树] ...", len(s))
+	return s[:max] + fmt.Sprintf("\n... [本段截断，共 %d 字节；用 traffic_get 的 offset/length 分段续读，超大正文用 traffic_blob] ...", len(s))
 }

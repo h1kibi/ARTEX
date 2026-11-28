@@ -56,6 +56,41 @@ func applySchemaWithRetry(ctx context.Context, execer schemaExecer, sleep func(t
 	}
 }
 
+// migrateSideSessionConstraint widens the side_question_sessions CHECK once. A
+// conversation turn bound to a task carries both identities (the task scope
+// authorises evidence, the conversation owns the btw history); the original
+// constraint required task_id to be NULL on conversation rows, so every such
+// checkpoint was rejected and retried until the process stopped. The migration
+// lives in Go rather than in schema.sql because a DO block inside the schema
+// Exec did not take effect on existing databases.
+func migrateSideSessionConstraint(ctx context.Context, conn *sql.Conn) error {
+	// Scope by relation: a connection may carry a non-default search_path (test
+	// schemas do), and a same-named constraint in another schema must not be read
+	// as this table's constraint. to_regclass resolves the name exactly the way the
+	// DDL below will.
+	var def string
+	err := conn.QueryRowContext(ctx, `SELECT pg_get_constraintdef(c.oid)
+FROM pg_constraint c
+WHERE c.conrelid = to_regclass('side_question_sessions')
+  AND c.conname = 'side_question_sessions_check'`).Scan(&def)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(def, "task_id IS NULL") {
+		return nil
+	}
+	if _, err := conn.ExecContext(ctx, `ALTER TABLE side_question_sessions DROP CONSTRAINT side_question_sessions_check`); err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `ALTER TABLE side_question_sessions ADD CONSTRAINT side_question_sessions_check
+    CHECK ((conversation_id IS NOT NULL AND exploration_id IS NULL AND intent_id IS NULL)
+        OR (conversation_id IS NULL AND task_id IS NOT NULL AND exploration_id IS NOT NULL))`)
+	return err
+}
+
 // withSchemaMigrationLock pins the session-level lock to one checked-out
 // connection. Running pg_advisory_lock through *sql.DB is incorrect because a
 // later schema or unlock call may use a different pooled PostgreSQL session.
@@ -159,6 +194,9 @@ func Open(dsn string) (*DB, error) {
 	err = withSchemaMigrationLock(context.Background(), sqlDB, func(conn *sql.Conn) error {
 		if err := applySchemaWithRetry(context.Background(), conn, time.Sleep); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
+		}
+		if err := migrateSideSessionConstraint(context.Background(), conn); err != nil {
+			return fmt.Errorf("migrate side question sessions: %w", err)
 		}
 		if err := d.seedBuiltins(); err != nil {
 			return fmt.Errorf("seed builtins: %w", err)
@@ -321,12 +359,16 @@ ON CONFLICT DO NOTHING`, r.kind, r.pattern, r.note); err != nil {
 // builtinSkillVisibility maps a shipped skill's directory name → the built-in
 // agent keys that should see it by default. The skill FILES themselves live on the
 // filesystem (SkillDir, loaded by norma at runtime); DB only carries this visibility
-// binding. Skills omitted here (e.g. playwright-cli, scopesentry) ship invisible by
-// default — the user turns them on per-agent when needed. scopesentry additionally
-// declares `mcps: ScopeSentry`, which only takes effect once it's made visible and
-// that MCP is enabled/configured.
+// binding. Skills omitted here (scopesentry) ship invisible by default — the user
+// turns them on per-agent when needed. scopesentry declares `mcps: ScopeSentry`,
+// which only takes effect once it's made visible and that MCP is enabled.
+//
+// playwright-cli is visible to the executing roles: without it a worker that meets
+// an SPA login wall has no browser-driving guidance at all, and the browser MCP it
+// unlocks was never reachable from the role that actually needs it.
 var builtinSkillVisibility = map[string][]string{
-	"api-recon": {"auto", "pentest", "worker"},
+	"api-recon":      {"auto", "pentest", "worker"},
+	"playwright-cli": {"worker", "pentest", "auto"},
 }
 
 // seedBuiltinSkillVisibility binds the shipped built-in skills to their default

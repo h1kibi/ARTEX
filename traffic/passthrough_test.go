@@ -25,7 +25,13 @@ func TestProxyCausedErr(t *testing.T) {
 	proxy := []string{
 		"protocol error: received DATA on a HEAD request",
 		"http2: server sent GOAWAY",
+	}
+	// Deliberately NOT proxy-caused any more: a black-box fuzz run provokes these
+	// from the target, and treating them as proxy faults switched recording off for
+	// the site under test.
+	fuzzReply := []string{
 		"malformed HTTP response",
+		"protocol error: bogus frame",
 	}
 	target := []string{ // target-side failures must NOT trigger passthrough
 		"dial tcp 1.2.3.4:443: connect: connection refused",
@@ -37,7 +43,7 @@ func TestProxyCausedErr(t *testing.T) {
 			t.Errorf("expected proxy-caused: %q", s)
 		}
 	}
-	for _, s := range target {
+	for _, s := range append(target, fuzzReply...) {
 		if proxyCausedErr(errors.New(s)) {
 			t.Errorf("expected NOT proxy-caused: %q", s)
 		}

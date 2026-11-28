@@ -465,7 +465,7 @@ func TestAddFindingFollowUpIntent(t *testing.T) {
 		t.Fatalf("follow-up intent metadata: %+v", node)
 	}
 	if route := ParseIntentRoute(node); route.RouteID != intentID || route.PathPhase != "validation" ||
-		route.Budget.MaxToolCalls != DefaultRouteMaxToolCalls || route.Budget.MaxInputTokens != DefaultRouteMaxInputTokens {
+		NormalizeEffort(route.Effort) != EffortStandard {
 		t.Fatalf("follow-up route metadata: %+v", route)
 	}
 	var anchorCount, edgeCount int
