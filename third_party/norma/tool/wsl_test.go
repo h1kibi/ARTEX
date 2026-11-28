@@ -331,7 +331,11 @@ func TestWSLPTYSession(t *testing.T) {
 		t.Skip("the WSL PTY bridge is Windows-only")
 	}
 	if !ptySupported() {
-		t.Skip("no WSL distro available")
+		t.Skip("interactive shell disabled")
+	}
+	distro := defaultWSLDistro()
+	if distro == "" {
+		t.Skip("no WSL distro installed")
 	}
 	m, err := NewManager("test-wsl-pty")
 	if err != nil {
@@ -341,7 +345,7 @@ func TestWSLPTYSession(t *testing.T) {
 	defer CloseWSLKeepalives()
 
 	// `tty` prints a device path only when attached to a terminal.
-	s, err := m.openSession(`tty; echo marker-$((1+1))`, "", nil, 24, 80, "hands-free", nil)
+	s, err := m.openSession(`tty; echo marker-$((1+1))`, "", []string{WSLDistroEnv + "=" + distro}, 24, 80, "hands-free", nil)
 	if err != nil {
 		t.Fatalf("openSession: %v", err)
 	}

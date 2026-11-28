@@ -237,6 +237,9 @@ CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
 
 **常用参数**：`./start.sh -addr :8787 -proxy :8788`（`-addr` 前端+API，`-proxy` 流量录制代理）。启动脚本会把参数原样透传给 `artex`。
 
+**执行环境（Windows）**：未显式配置 `wsl_distro` 或 `ARTEX_WSL_DISTRO` 时默认使用本机 PowerShell（优先 `pwsh.exe`），统一配置无 BOM UTF-8 编码、静默进度条、去 `curl`/`wget` 别名与进程树超时清理；需要 Linux 工具链时可通过 `config.json` 的 `"wsl_distro"` 或 `ARTEX_WSL_DISTRO=<distro>` 显式指定发行版（支持按需 `wsl -d <distro>` 调用）。
+
+**内置 OAST**：服务开机自动启动 HTTP 与 DNS 带外回调监听（`oast_generate` / `oast_poll`），或通过 `config.json` 的 `oast` 字段指向外部 `interactsh` 服务。
 ### 反向代理部署（HTTPS / 只开放 443）
 
 前端和 API/SSE 都由同一个后端端口（默认 `:8787`）提供，实时活动流默认走**同源**地址，因此**无需配置 `NEXT_PUBLIC_SSE_BASE`**，公网只开放 443、把 8787 留在内网即可。
@@ -297,14 +300,16 @@ server {
 
 ## 系统技术架构
 
-ARTEX 是一套 **LLM 多 agent 驱动的自主渗透系统**：Go 单体后端（内嵌 Next.js 前端）+ PostgreSQL，agent 能力由 [`norma`](https://github.com/Autumn-27/norma) SDK 提供（`agentcore` / `tool` / `permission` / `harness` / `memory` / `transcript`）。核心是**双图架构**，以及围绕它的两条自主性机制：**worker 间过程级信息交换**与 **planner 多轮共享 todolist 稳定攻击链路**。
+ARTEX 是一套 **LLM 多 agent 驱动的自主渗透系统**：Go 单体后端（内嵌 Next.js 前端）+ PostgreSQL，agent 能力由 [`norma`](https://github.com/Autumn-27/norma) SDK 提供（`agentcore` / `tool` / `permission` / `harness` / `memory` / `transcript`）。
+
+系统底层以**共享资产图 + 任务独立探索图 + 证据存储**为基础模型，并在其上构建 **Route Graph / Information Graph / Evidence Layer** 三个正交视图；围绕图模型提供**按角色投影裁剪**、**`effort` 分档与路线双层止损**、**进程内 `http_request` + 本机/WSL 自适应执行**、**非 HTTP 工具输出自动核验**、**worker 间过程级信息交换**与 **planner 多轮共享 todolist 稳定攻击链路**。
 
 ### 总体分层
 
 ```mermaid
 flowchart TB
   subgraph FE["前端 Next.js（go:embed 内嵌单二进制）"]
-    UI["仪表盘 · 任务 · 资产 · 覆盖图 · 流量 · 工作空间 · 系统配置"]
+    UI["仪表盘 · 任务 · 发现 · 复测 · 资产 · 覆盖图 · 情报三图 · 流量 · 工作空间 · 系统配置"]
   end
   subgraph SRV["server（Go net/http）"]
     API["REST /api/*　JWT 鉴权　SSE"]
@@ -312,21 +317,22 @@ flowchart TB
     MGR["Manager　任务/引擎/store 生命周期"]
   end
   subgraph AG["agent（norma SDK）"]
-    GO["goals　目标分解 + 提取范围"]
-    PL["planner　规划者（唯一意图生成者）"]
-    WK["worker　执行者 ×N"]
+    GO["goals　目标分解 + 提取约束/范围"]
+    PL["planner　规划者（12KB 战略索引视图）"]
+    WK["worker ×N（4KB 战术切片 + http_request / Bash）"]
     MA["mainagent　人在环路"]
+    RT["retester / reporter　复测与报告"]
   end
   subgraph DB["PostgreSQL"]
     AGRAPH["资产图　assets / companies / task_scope"]
-    EGRAPH["探索图　exploration_nodes / anchors / activity"]
+    EGRAPH["探索图　exploration_nodes / edges / anchors / activity"]
   end
   subgraph SUB["支撑子系统"]
-    PROXY["流量记录代理　MITM + CA 留痕"]
-    GUARD["guard / intercept　工具审批门"]
-    ENR["enrich　DNS / HTTP 异步补全"]
-    EXT["MCP · skills · memory · report"]
-    WD["Watchdog　运行看护"]
+    PROXY["流量记录代理　MITM + CA + 标签染色"]
+    OAST["内置 OAST　HTTP / DNS 带外回调"]
+    GUARD["guard / intercept　工具审批与拦截门"]
+    TRIAGE["Auto-Triager　流量 / OAST / 工具输出核验"]
+    ENR["enrich / skills / MCP / Watchdog"]
   end
 
   UI -->|HTTP| API
@@ -338,34 +344,30 @@ flowchart TB
   PL --> DB
   WK --> DB
   MA --> DB
-  GO --> DB
-  WK -->|"Bash / HTTP 全程留痕"| PROXY
+  WK -->|"Bash / http_request / WebFetch"| PROXY
+  WK --> OAST
   WK --> GUARD
+  WK --> TRIAGE
   WK --> ENR
-  ENG --> WD
-  WD -->|"终止 intent"| ENG
-  WD --> DB
-  PL -.-> EXT
-  WK -.-> EXT
-  MA -.-> EXT
+  ENG --> ENR
+  PL -.-> ENR
 ```
 
 | 层 | 职责 |
 | --- | --- |
-| **前端** | Next.js 静态导出，`go:embed` 内嵌进单二进制；可视化任务/资产/探索链路/覆盖图，人在环路对话 |
-| **server** | `net/http` 路由 + JWT 鉴权 + SSE；`Manager` 托管任务、引擎、DB store 的生命周期 |
-| **engine** | 每任务一个 `plannerLoop` + N 个 worker goroutine；意图领取、超时/暂停/drain |
-| **agent** | goals / planner / worker / mainagent，`ToolSet` 把双图暴露成 LLM 工具 |
-| **db** | 双图的 Postgres 存储实现（pgx）；schema 随 `go:embed` 每次启动幂等建表 |
-| **支撑** | 记录型 MITM 代理、审批门、异步补全、MCP/技能/记忆/报告、Watchdog 运行看护 |
+| **前端** | Next.js 静态导出，`go:embed` 内嵌进单二进制；可视化任务/资产/探索链路/覆盖图/Route-Information-Evidence 三图、漏洞复测与人在环路对话 |
+| **server** | `net/http` 路由 + JWT 鉴权 + SSE；`Manager` 托管任务、引擎、OAST、流量与 DB store 的生命周期 |
+| **engine** | 每任务一个 `plannerLoop` + N 个 worker goroutine；意图领取、`effort` 轮数与周期映射、超时/暂停/Settlement 收尾 |
+| **agent** | goals / planner / worker / mainagent / retester / reporter，`ToolSet` 暴露图工具与进程内 `http_request` |
+| **db** | 资产图与探索图的 Postgres 存储实现（pgx 原生类型绑定）；`RouteHealth` 聚合、冷节点摘要与启动幂等迁移 |
+| **支撑** | `:8788` 记录型 MITM 代理（`(task_id, intent_id)` 染色）、内置 HTTP/DNS OAST、审批拦截门、三通道漏洞自动核验、异步资产补全、Watchdog 看护 |
 
-### 双图架构：探索图 + 资产图
+### 双图内核与三图正交视图
 
-系统把「**目标是什么**」和「**测到了什么程度**」拆成两张相互独立、又通过锚点相连的图：
+系统底层保持两张物理关联图，并在其上暴露三个正交只读逻辑视图：
 
-- **资产图（Asset Graph，全局共享）**：跨任务同一份的资产真值库。节点为 `root_domain / subdomain / ip / service / app / endpoint`，归属公司；域名→子域→服务→端点的父子关系与去重 key 全部由程序计算，agent 只提交原始信息。
-- **探索图（Exploration Graph，每任务独立）**：一次任务的“思考与推进”过程。节点为 `goal（目标）/ intent（意图）/ fact（事实）/ finding（漏洞）/ hint（提示）`，靠 `spawns / derived_from / yields / proves` 等边连成**血缘链**，回答“哪个方向派生自哪些事实、产出了什么”。
-- **两图靠锚点相连**：`exploration_anchors(node_id, asset_id)` 把意图/事实/漏洞锚定到具体资产上——于是既能从“探索方向”看它打的是哪些资产，也能从“某个资产”反查它在本任务被哪些意图测过、得出过哪些事实。这也支撑了**资产测试覆盖度**与**资产覆盖图**（范围内资产 + 已测高亮）。
+- **资产图（Asset Graph，全局共享）**：跨任务同一份的资产真值库。节点为 `root_domain / subdomain / ip / service / app / endpoint`，归属公司；父子关系与去重键由程序计算，支持 `ScopeSentry` 同步、`task_scope` 范围锚定与 `untested_targets_sample` 未测缺口统计。
+- **探索图（Exploration Graph，每任务独立）**：记录一次任务的推理与执行轨迹。节点为 `goal / intent / fact / finding / hint / digest`，通过 `spawns / derived_from / yields / proves` 形成有向血缘链，`exploration_anchors(node_id, asset_id)` 将节点与资产绑定。
 
 ```mermaid
 flowchart LR
@@ -373,7 +375,7 @@ flowchart LR
     direction TB
     G["goal 目标"]
     I1["intent 意图 A"]
-    F1["fact 事实"]
+    F1["fact 事实 / checkpoint"]
     I2["intent 意图 B"]
     FD["finding 漏洞"]
     G -->|spawns| I1
@@ -395,19 +397,29 @@ flowchart LR
   FD -. anchor .-> EP
 ```
 
-> 分工：**planner** 读探索图态势、判目标、只在有未覆盖的新方向时派**意图**进 frontier；**worker** 领**一条意图**、用真实工具执行、把新资产/事实/漏洞写回两图后即停。资产图是共享事实，探索图是每任务的推进链。
+围绕模型写入与引擎消费的边界，三图视图按「模型极简写入、引擎深度消费」组织：
 
-#### 逻辑视图：Route / Information / Evidence
+1. **Route Graph（投入与止损账本）**：
+   - 新意图的 `route_id` 等于自身 ID，`continuation_of`（支持整数或 `"#id"` 字符串写法，并自动过滤误传的 `checkpoint` 父节点）继承同一路线与最新 `checkpoint`；`checkpoint` 原子记录已确认结论、未决假设、已尝试动作 `attempted_actions`、建议动作 `next_actions` 与累计消耗。
+   - **运行档位 `effort` 取代模型数字预算**：`add_intent` 暴露 `probe`（35 轮 / 0 个 Watchdog 自主周期）、`standard`（80 轮 / 1 周期，默认）与 `deep`（130 轮 / 2 周期），由引擎与 Watchdog 确定性换算单棒轮数与放行周期，不再依赖模型手算 Token。
+   - **路线双层止损与重激活**：`db.RouteHealth` 单次 SQL 聚合 `total_runs`、`consecutive_dry_runs`、`runs_since_finding`、`worker_seconds` 与 `autonomy_status`（`active` / `suspended_dry` / `parked_stagnant`）。纯自治路线在接续同一路线时依次接受两道门禁：**两振无高价值产出挂起**（`suspended_dry`）与 **4 棒无新漏洞（或 2 棒满 40 分钟）且任务仍有未测目标时冷却让位**（`parked_stagnant`）；解锁仅接受跨路线凭据/提权事实或共享目标资产的新外部证据，人工参与路线无条件豁免。
+2. **Information Graph（认知结论与极简写回）**：
+   - `fact_type` 支持 `observation` / `claim` / `hypothesis` / `finding_candidate`（历史节点保留 `decision` 与 `legacy_unknown` 读取兼容），通过 `sensitivity` 与 `inheritance_policy` 控制跨任务继承隔离。
+   - `record_fact` 仅 `summary` 必填，省略 `fact_type` 默认写入 `observation`，附属字段缺省时自动补齐或平滑降级；省略 `intent_id` 依次回退至批量默认值、`ownerNode` 与 `RunInfo.IntentID`，`100%` 自动建立 `intent --yields--> fact` 边与最近 `tool_result` 来源关联。
+   - 入口统一工具（`agent/input_norm.go`）在边界一次完成字符串化 JSON 数组解包、`#id` / `node:id` 宽松编号解析与 `artifact:` 工作目录相对路径归一化。
+3. **Evidence Layer 与三通道自动核验**：
+   - 原始证据由 `:8788` 录制流量（`traffic:<id>`）、内置 OAST 带外回调（`oast:<id>`）、任务目录文件（`artifact:<path>`）与 PostgreSQL `activity` 执行台账（`activity:<id>`）保存。
+   - **Auto-Triager 确定性门禁**：写入时拒绝纯版本号、登录页 200 与无证据推测；后台核验钩子按「绑定流量快照（`golang.org/x/net/html` 识别并排除纯登录表单）→ 内置 `oast:` 回调 → 真实 `activity` `tool_result` 与任务产物原文子串匹配」三条路径晋升 `confirmed`，仅文字编造的漏洞维持 `verifying` 且不得用于 `prove_goal`。
 
-在现有双图之上提供三个只读逻辑视图，不复制正文：
+任务详情的「情报」页统一展示路线列表（含 `routeAutonomy` 状态徽章、工时与距上次漏洞棒数）、信息节点与证据可用性；`GET /api/tasks/{id}/routes`、`/information`、`/evidence` 返回对应投影。
 
-- **Route Graph**：意图 payload 带 `route_id / phase / objective / success_condition / budget`。新意图的 `route_id` 等于自身 id；`continuation_of` 继承同一 route、剩余预算和最近 checkpoint。Checkpoint 是 `fact_type=checkpoint` 的 fact，记录确认 claim、未解决 hypothesis、证据引用、已尝试动作、下一步和累计预算。续跑 Worker 启动时会把前序 Checkpoint 的结论、已尝试动作和下一步直接内联进系统提示，不需要重新探测上一阶段已排除的路径。
-- **预算与状态不变量**：预算是**整条路线累计**，不是单 Run。新路线省略 budget 时默认 `max_tool_calls=240`、`max_input_tokens=1200000`。接续时 `add_intent` 从最新 checkpoint 读取已用量：若某维度已耗尽，必须显式传更大的 `budget` 才允许继续，否则直接拒绝。Run 结束写回 checkpoint 后，即使 Watchdog 关闭，累计预算耗尽也会把意图标记为 `exhausted`——不再依赖 Fast Path 才能止损。Route 状态只由意图状态投影：`running` 才是「进行中」，`open` 为待执行，`paused/stopped/superseded` 分别展示，不新增并行状态机。
-- **Checkpoint 原子性**：checkpoint fact、`intent -> checkpoint` 边、前一 checkpoint 血缘和意图的 `checkpoint_fact_id/route_budget_used` 在同一事务提交，规划者和重试 Run 不会读到半套状态。
-- **Information Graph**：fact payload 的 `fact_type` 区分 `observation / claim / hypothesis / decision / finding_candidate`；历史 fact 没有该字段时读取为 `legacy_unknown`。确认漏洞仍只写入 `findings` 表。`/information` 的总数与分类计数由 SQL 对全图统计，分页只截断列表并返回 `truncated`；`include_sources=1` 合并来源任务，按有效期、敏感性和继承策略过滤。
-- **Evidence Layer**：checkpoint、claim、finding 只保存 `traffic:<id>`、`artifact:<path>`、`activity:<id>` 等引用和摘要，原始材料仍由流量记录、`evidence.Store`、activity detail 和工作目录保存。写入时校验 `activity/node/finding` 是否存在；`artifact` 必须是当前任务工作目录内真实存在的文件。查询视图展示引用可用性、finding 的流量绑定数量与快照版本、继承来源；`report_finding(traffic_refs=...)` 绑定的流量会合并进 `/evidence`，即使节点 payload 没有 `evidence_refs`。
+### 按角色差异化视图投影与执行底座
 
-任务详情的「情报」页分别展示路线、信息类型和证据引用；`GET /api/tasks/{id}/routes`、`/information`、`/evidence` 返回同样的查询视图。资产覆盖图抽屉会显示该资产关联的路线。
+- **Planner 宏观战略索引（硬上限 `12 KB`）**：`Planner.Plan` 与 `graph_overview` 共用 `plannerOverviewData()`（`agent/tools_overview.go`），保留全部 `goals`、人工 `hints`、`open/running` 前沿队列与 `finding_list`，同时将 `routes` 压缩为单行账本并附带 `untested_targets_sample`（未测资产样本）、`reusable_credentials`（可复用凭据）与 `variant_targets`（同指纹兄弟资产），超过 `12,288` 字节时按预设优先级确定性裁剪。
+- **Worker 单点战术切片（上限 `4 KB`）**：`Worker` 启动时仅注入前序 `checkpoint` 交接摘要、`renderWorkerTacticalContext` 构造的目标/提示/锚定资产局部事实/可复用凭据切片，与全量无关路线隔离；有效压缩窗钳制在 `96,000` Token（单步工具内联上限 `12,000` 字符）。
+- **原生执行与进程内 `http_request`**：
+  - Windows 默认运行于宿主本机 PowerShell（优先 `pwsh.exe`），初始化无 BOM UTF-8 与移除 `curl`/`wget` 别名；前台命令超时直接清理整棵子进程树而不遗留后台进程；需要 Linux 环境时支持 `config.json` 显式配置 WSL 发行版并按需映射路径。
+  - 新增进程内 `http_request` 工具（`agent/http_tool.go`），按 TLS 校验策略与 CA 修改时间池化复用标准 `http.Transport`（Keep-Alive 连接池），请求 context 携带 `(task_id, intent_id)` 染色代理地址，Cookie 通过任务级 Netscape `cookies.txt` 与 `curl -b/-c` 互通，超长响应写入任务产物目录并回传 `artifact_path`，全链路受 `Guard` 拦截规则与范围门禁管控。
 
 ### 引擎与意图生命周期（一次探索的闭环）
 
@@ -420,22 +432,21 @@ sequenceDiagram
   participant P as planner
   participant FR as frontier 意图队列
   participant W as worker
-  participant PX as 记录代理
+  participant PX as 记录代理 / OAST
   participant DB as 双图 + activity
 
   EV-->>P: 唤醒
-  P->>DB: 读态势(graph_overview 预取 + coverage/scope)
-  P->>FR: 派 0..N 个意图(带 asset_ids)
-  Note over P,FR: 大多数唤醒派 0 个——无新方向即结束
+  P->>DB: 读取 12KB 战略索引(routes / 未测样本 / 凭据 / 变体)
+  P->>FR: 派 0..N 个意图(effort + asset_ids + 接续止损门禁)
+  Note over P,FR: 无新方向或满载时产 0 个意图
   W->>FR: claimNext 领一条意图
-  W->>DB: 取意图 asset_ids 的原始资产作为初始信息
-  W->>PX: 真实工具执行(Kali / Bash / HTTP)
-  PX-->>W: 响应(全程留痕 + CA 验证)
-  W->>DB: 写回 fact / asset / finding + 每步 activity
+  W->>DB: 获取 4KB 战术切片 + 路线 checkpoint + 目标资产
+  W->>PX: http_request / Bash(本机或WSL) / shell_open / OAST
+  PX-->>W: 响应(代理染色留痕 + Cookie 持久化 + CA 验证)
+  W->>DB: record_fact(自动血缘) / insert_assets / report_finding(后台核验)
   DB-->>EV: 图变更
   EV-->>P: 再次唤醒(闭环)
 ```
-
 ### 运行看护（Watchdog）
 
 Watchdog 是独立于 planner/worker 的**运行看护层**：它不决定攻击方向，也不替代 Engine 的生命周期，只回答一个问题——**这个正在运行的 intent 是否还在有效推进？**
@@ -468,7 +479,7 @@ Fast Path 默认节奏：
 
 #### 周期状态机
 
-`watchdog_max_auto_cycles`（默认 `2`，范围 1–4）是一个 run 内 Watchdog 可以**自主放行**的绿灯周期总数 `N`。有效写入会把当前计时周期重置为 C0，但不会恢复已消耗的自主预算；人工批准也不消耗该预算：
+`watchdog_max_auto_cycles`（系统默认兜底 `2`，范围 0–4）与意图 `effort` 共同决定一个 run 内 Watchdog 可以**自主放行**的绿灯周期总数 `N`（`probe` 为 `0`，`standard` 为 `1`，`deep` 为 `2`）。有效写入会把当前计时周期重置为 C0，但不会恢复已消耗的自主预算；人工批准也不消耗该预算：
 
 | 当前 run 已自主推进次数 | 绿灯 | 用户同意 | 用户拒绝 | 用户静默 |
 | --- | --- | --- | --- | --- |
@@ -503,7 +514,7 @@ Fast Path 默认节奏：
 | `watchdog_enabled` | `false` | 总开关，默认关闭 |
 | `watchdog_pressure_after_sec` | `480` | 当前周期内的压力提示 |
 | `watchdog_slow_path_after_sec` | `600` | 当前周期内的 Slow Path 入队 |
-| `watchdog_max_auto_cycles` | `2` | 自主放行周期数，范围 1–4 |
+| `watchdog_max_auto_cycles` | `2` | 未指定 `effort` 时的默认自主放行周期数，范围 0–4 |
 | `watchdog_agent_key` | `watchdog` | Slow Path / 仲裁使用的只读 Agent |
 | `watchdog_agent_retry_sec` | `300` | 不可用自动重试间隔 |
 | Worker Agent 的 `run_seconds` | `1200` | **唯一周期长度来源**；Watchdog 开启时它表示单周期长度，SDK 不再把它当固定总时长。可在「Agent 管理」修改 |
